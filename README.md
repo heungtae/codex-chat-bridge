@@ -4,6 +4,8 @@
 
 This is intended for "no core source change" integration: run this bridge locally, then override `model_provider` to point Codex at the bridge.
 
+Detailed guide: `USAGE.md`
+
 ## What it does
 
 - Accepts `POST /v1/responses`
