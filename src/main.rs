@@ -41,22 +41,45 @@ use uuid::Uuid;
     about = "Responses-to-Chat completions bridge"
 )]
 struct Args {
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
+    #[arg(long, value_name = "FILE", default_value = "conf.toml")]
+    config: PathBuf,
+
+    #[arg(long)]
+    host: Option<String>,
 
     #[arg(long)]
     port: Option<u16>,
 
-    #[arg(long, default_value = "https://api.openai.com/v1/chat/completions")]
-    upstream_url: String,
+    #[arg(long)]
+    upstream_url: Option<String>,
 
-    #[arg(long, default_value = "OPENAI_API_KEY")]
-    api_key_env: String,
+    #[arg(long)]
+    api_key_env: Option<String>,
 
     #[arg(long, value_name = "FILE")]
     server_info: Option<PathBuf>,
 
     #[arg(long)]
+    http_shutdown: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FileConfig {
+    host: Option<String>,
+    port: Option<u16>,
+    upstream_url: Option<String>,
+    api_key_env: Option<String>,
+    server_info: Option<PathBuf>,
+    http_shutdown: Option<bool>,
+}
+
+#[derive(Debug, Clone)]
+struct ResolvedConfig {
+    host: String,
+    port: Option<u16>,
+    upstream_url: String,
+    api_key_env: String,
+    server_info: Option<PathBuf>,
     http_shutdown: bool,
 }
 
@@ -165,11 +188,13 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
+    let file_config = load_file_config(&args.config)?;
+    let config = resolve_config(args, file_config);
 
-    let api_key = std::env::var(&args.api_key_env)
+    let api_key = std::env::var(&config.api_key_env)
         .ok()
         .filter(|v| !v.trim().is_empty())
-        .ok_or_else(|| anyhow!("missing or empty env var: {}", args.api_key_env))?;
+        .ok_or_else(|| anyhow!("missing or empty env var: {}", config.api_key_env))?;
 
     let client = Client::builder()
         .build()
@@ -177,9 +202,9 @@ async fn main() -> Result<()> {
 
     let state = Arc::new(AppState {
         client,
-        upstream_url: args.upstream_url,
+        upstream_url: config.upstream_url.clone(),
         api_key,
-        http_shutdown: args.http_shutdown,
+        http_shutdown: config.http_shutdown,
     });
 
     let app = Router::new()
@@ -188,13 +213,13 @@ async fn main() -> Result<()> {
         .route("/shutdown", get(shutdown))
         .with_state(state);
 
-    let bind_addr = format!("{}:{}", args.host, args.port.unwrap_or(0));
+    let bind_addr = format!("{}:{}", config.host, config.port.unwrap_or(0));
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .with_context(|| format!("binding {bind_addr}"))?;
     let local_addr = listener.local_addr().context("reading local_addr")?;
 
-    if let Some(path) = args.server_info.as_ref() {
+    if let Some(path) = config.server_info.as_ref() {
         write_server_info(path, local_addr.port())?;
     }
 
@@ -203,6 +228,41 @@ async fn main() -> Result<()> {
         .await
         .context("serving axum app")?;
     Ok(())
+}
+
+fn load_file_config(path: &Path) -> Result<Option<FileConfig>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("reading config file {}", path.display()))?;
+    let parsed: FileConfig = toml::from_str(&raw)
+        .with_context(|| format!("parsing config file {}", path.display()))?;
+    info!("loaded config file {}", path.display());
+    Ok(Some(parsed))
+}
+
+fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig {
+    let file_config = file_config.unwrap_or_default();
+
+    ResolvedConfig {
+        host: args
+            .host
+            .or(file_config.host)
+            .unwrap_or_else(|| "127.0.0.1".to_string()),
+        port: args.port.or(file_config.port),
+        upstream_url: args
+            .upstream_url
+            .or(file_config.upstream_url)
+            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string()),
+        api_key_env: args
+            .api_key_env
+            .or(file_config.api_key_env)
+            .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
+        server_info: args.server_info.or(file_config.server_info),
+        http_shutdown: args.http_shutdown || file_config.http_shutdown.unwrap_or(false),
+    }
 }
 
 fn write_server_info(path: &Path, port: u16) -> Result<()> {
@@ -1052,5 +1112,61 @@ mod tests {
             .find("event: response.output_text.delta")
             .expect("delta event");
         assert!(added_idx < delta_idx);
+    }
+
+    #[test]
+    fn resolve_config_prefers_cli_over_file_and_defaults() {
+        let args = Args {
+            config: PathBuf::from("conf.toml"),
+            host: Some("0.0.0.0".to_string()),
+            port: Some(9999),
+            upstream_url: None,
+            api_key_env: Some("CLI_API_KEY".to_string()),
+            server_info: None,
+            http_shutdown: true,
+        };
+        let file = FileConfig {
+            host: Some("127.0.0.1".to_string()),
+            port: Some(8787),
+            upstream_url: Some("https://example.com/v1/chat/completions".to_string()),
+            api_key_env: Some("FILE_API_KEY".to_string()),
+            server_info: Some(PathBuf::from("/tmp/server.json")),
+            http_shutdown: Some(false),
+        };
+
+        let resolved = resolve_config(args, Some(file));
+        assert_eq!(resolved.host, "0.0.0.0");
+        assert_eq!(resolved.port, Some(9999));
+        assert_eq!(
+            resolved.upstream_url,
+            "https://example.com/v1/chat/completions"
+        );
+        assert_eq!(resolved.api_key_env, "CLI_API_KEY");
+        assert_eq!(resolved.server_info, Some(PathBuf::from("/tmp/server.json")));
+        assert!(resolved.http_shutdown);
+    }
+
+    #[test]
+    fn resolve_config_uses_defaults_when_missing() {
+        let args = Args {
+            config: PathBuf::from("conf.toml"),
+            host: None,
+            port: None,
+            upstream_url: None,
+            api_key_env: None,
+            server_info: None,
+            http_shutdown: false,
+        };
+
+        let resolved = resolve_config(args, None);
+        assert_eq!(resolved.host, "127.0.0.1");
+        assert_eq!(resolved.port, None);
+        assert_eq!(
+            resolved.upstream_url,
+            "https://api.openai.com/v1/chat/completions"
+        );
+        assert_eq!(resolved.api_key_env, "OPENAI_API_KEY");
+        assert_eq!(resolved.server_info, None);
+        assert!(!resolved.http_shutdown);
     }
 }

@@ -39,10 +39,19 @@ npm install @heungtae/codex-chat-bridge --registry <private-registry>
 npx @heungtae/codex-chat-bridge --port 8787 --api-key-env OPENAI_API_KEY
 ```
 
+By default, the bridge also reads `conf.toml` in the current directory.
+CLI flags override file values.
+
 Or run the binary directly via Cargo:
 
 ```bash
 cargo run --bin codex-chat-bridge -- --port 8787 --api-key-env OPENAI_API_KEY
+```
+
+Use a custom config file path:
+
+```bash
+npx @heungtae/codex-chat-bridge --config /path/to/conf.toml
 ```
 
 ## Codex override example

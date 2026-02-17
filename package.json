@@ -17,6 +17,7 @@
     "bin/",
     "scripts/",
     "src/",
+    "conf.toml",
     "Cargo.toml",
     "Cargo.lock",
     "README.md",
