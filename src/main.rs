@@ -25,6 +25,7 @@ use serde::Serialize;
 use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Write;
@@ -66,6 +67,14 @@ struct Args {
 
     #[arg(long)]
     http_shutdown: bool,
+
+    #[arg(
+        long = "drop-tool-type",
+        value_name = "TYPE",
+        action = clap::ArgAction::Append,
+        help = "drop tool entries whose `type` matches this value; can be repeated"
+    )]
+    drop_tool_types: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -76,6 +85,7 @@ struct FileConfig {
     api_key_env: Option<String>,
     server_info: Option<PathBuf>,
     http_shutdown: Option<bool>,
+    drop_tool_types: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -86,6 +96,7 @@ struct ResolvedConfig {
     api_key_env: String,
     server_info: Option<PathBuf>,
     http_shutdown: bool,
+    drop_tool_types: Vec<String>,
 }
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configuration
@@ -98,6 +109,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # api_key_env = "OPENAI_API_KEY"
 # server_info = "/tmp/codex-chat-bridge-info.json"
 # http_shutdown = false
+# drop_tool_types = ["web_search", "web_search_preview"]
 "#;
 
 #[derive(Clone)]
@@ -106,6 +118,7 @@ struct AppState {
     upstream_url: String,
     api_key: String,
     http_shutdown: bool,
+    drop_tool_types: HashSet<String>,
 }
 
 #[derive(Serialize)]
@@ -224,6 +237,7 @@ async fn main() -> Result<()> {
         upstream_url: config.upstream_url.clone(),
         api_key,
         http_shutdown: config.http_shutdown,
+        drop_tool_types: config.drop_tool_types.into_iter().collect(),
     });
 
     let app = Router::new()
@@ -293,6 +307,9 @@ fn ensure_default_config_file(path: &Path) -> Result<()> {
 
 fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig {
     let file_config = file_config.unwrap_or_default();
+    let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
+    drop_tool_types.extend(args.drop_tool_types);
+    drop_tool_types.retain(|v| !v.trim().is_empty());
 
     ResolvedConfig {
         host: args
@@ -310,6 +327,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
             .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
         server_info: args.server_info.or(file_config.server_info),
         http_shutdown: args.http_shutdown || file_config.http_shutdown.unwrap_or(false),
+        drop_tool_types,
     }
 }
 
@@ -363,7 +381,8 @@ async fn handle_responses(
         }
     };
 
-    let bridge_request = match map_responses_to_chat_request(&request_value) {
+    let bridge_request = match map_responses_to_chat_request(&request_value, &state.drop_tool_types)
+    {
         Ok(v) => v,
         Err(err) => return sse_error_response("invalid_request", &err.to_string()),
     };
@@ -660,7 +679,10 @@ fn sse_error_response(code: &str, message: &str) -> Response {
         .into_response()
 }
 
-fn map_responses_to_chat_request(request: &Value) -> Result<BridgeRequest> {
+fn map_responses_to_chat_request(
+    request: &Value,
+    drop_tool_types: &HashSet<String>,
+) -> Result<BridgeRequest> {
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -773,7 +795,7 @@ fn map_responses_to_chat_request(request: &Value) -> Result<BridgeRequest> {
         }
     }
 
-    let chat_tools = normalize_chat_tools(tools);
+    let chat_tools = normalize_chat_tools(tools, drop_tool_types);
     let chat_tool_choice = normalize_tool_choice(tool_choice);
 
     let response_id = format!("resp_bridge_{}", Uuid::now_v7());
@@ -828,11 +850,16 @@ fn function_output_to_text(value: &Value) -> String {
     }
 }
 
-fn normalize_chat_tools(tools: Vec<Value>) -> Vec<Value> {
+fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<String>) -> Vec<Value> {
     tools
         .into_iter()
         .filter_map(|tool| {
-            if tool.get("type").and_then(Value::as_str) != Some("function") {
+            let tool_type = tool.get("type").and_then(Value::as_str);
+            if tool_type.is_some_and(|t| drop_tool_types.contains(t)) {
+                return None;
+            }
+
+            if tool_type != Some("function") {
                 return Some(tool);
             }
 
@@ -958,7 +985,7 @@ mod tests {
             "parallel_tool_calls": true
         });
 
-        let req = map_responses_to_chat_request(&input).expect("should map");
+        let req = map_responses_to_chat_request(&input, &HashSet::new()).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -1011,7 +1038,7 @@ mod tests {
     #[test]
     fn normalize_chat_tools_passes_non_function_tool() {
         let tools = vec![json!({"type": "web_search_preview"})];
-        let out = normalize_chat_tools(tools);
+        let out = normalize_chat_tools(tools, &HashSet::new());
         assert_eq!(out, vec![json!({"type": "web_search_preview"})]);
     }
 
@@ -1039,7 +1066,7 @@ mod tests {
             "tools": []
         });
 
-        let req = map_responses_to_chat_request(&input).expect("should map");
+        let req = map_responses_to_chat_request(&input, &HashSet::new()).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -1059,14 +1086,14 @@ mod tests {
             "tool_choice": 123
         });
 
-        let req = map_responses_to_chat_request(&input).expect("should map");
+        let req = map_responses_to_chat_request(&input, &HashSet::new()).expect("should map");
         assert_eq!(req.chat_request["tool_choice"], "auto");
     }
 
     #[test]
     fn map_requires_input_array() {
         let input = json!({"model":"gpt-4.1"});
-        let err = map_responses_to_chat_request(&input).expect_err("must fail");
+        let err = map_responses_to_chat_request(&input, &HashSet::new()).expect_err("must fail");
         assert!(err.to_string().contains("missing `input` array"));
     }
 
@@ -1086,7 +1113,7 @@ mod tests {
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": []
         });
-        let req = map_responses_to_chat_request(&input).expect("ok");
+        let req = map_responses_to_chat_request(&input, &HashSet::new()).expect("ok");
         let obj = req.chat_request.as_object().expect("object");
         assert!(!obj.contains_key("tools"));
         assert!(!obj.contains_key("tool_choice"));
@@ -1111,7 +1138,7 @@ mod tests {
             "type": "function",
             "function": {"name":"f", "parameters": {"type":"object"}}
         })];
-        let out = normalize_chat_tools(tools.clone());
+        let out = normalize_chat_tools(tools.clone(), &HashSet::new());
         assert_eq!(out, tools);
     }
 
@@ -1135,9 +1162,22 @@ mod tests {
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": []
         });
-        let req = map_responses_to_chat_request(&input).expect("ok");
+        let req = map_responses_to_chat_request(&input, &HashSet::new()).expect("ok");
         let messages = req.chat_request["messages"].as_array().expect("array");
         assert_eq!(messages[0]["role"], "system");
+    }
+
+    #[test]
+    fn normalize_chat_tools_drops_configured_tool_types() {
+        let tools = vec![
+            json!({"type": "web_search_preview"}),
+            json!({"type": "function", "name": "f", "parameters": {"type":"object"}}),
+        ];
+        let mut drop = HashSet::new();
+        drop.insert("web_search_preview".to_string());
+        let out = normalize_chat_tools(tools, &drop);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function");
     }
 
     #[tokio::test]
@@ -1172,6 +1212,7 @@ mod tests {
             api_key_env: Some("CLI_API_KEY".to_string()),
             server_info: None,
             http_shutdown: true,
+            drop_tool_types: vec![],
         };
         let file = FileConfig {
             host: Some("127.0.0.1".to_string()),
@@ -1180,6 +1221,7 @@ mod tests {
             api_key_env: Some("FILE_API_KEY".to_string()),
             server_info: Some(PathBuf::from("/tmp/server.json")),
             http_shutdown: Some(false),
+            drop_tool_types: None,
         };
 
         let resolved = resolve_config(args, Some(file));
@@ -1204,6 +1246,7 @@ mod tests {
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
+            drop_tool_types: vec![],
         };
 
         let resolved = resolve_config(args, None);
