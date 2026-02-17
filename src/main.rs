@@ -1,27 +1,45 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::Context;
+use anyhow::Result;
+use anyhow::anyhow;
 use async_stream::stream;
 use axum::Router;
-use axum::body::{Body, Bytes};
+use axum::body::Body;
+use axum::body::Bytes;
 use axum::extract::State;
-use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
-use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
-use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::http::HeaderMap;
+use axum::http::HeaderName;
+use axum::http::HeaderValue;
+use axum::http::StatusCode;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::header::CONTENT_TYPE;
+use axum::response::IntoResponse;
+use axum::response::Response;
+use axum::routing::get;
+use axum::routing::post;
 use clap::Parser;
-use futures::{Stream, StreamExt};
+use futures::Stream;
+use futures::StreamExt;
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde::Deserialize;
+use serde::Serialize;
+use serde_json::Value;
+use serde_json::json;
 use std::collections::BTreeMap;
-use std::fs::{self, File};
+use std::fs::File;
+use std::fs::{self};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tracing::{info, warn};
+use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 #[derive(Debug, Clone, Parser)]
-#[command(name = "codex-chat-bridge", about = "Responses-to-Chat completions bridge")]
+#[command(
+    name = "codex-chat-bridge",
+    about = "Responses-to-Chat completions bridge"
+)]
 struct Args {
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
@@ -154,7 +172,6 @@ async fn main() -> Result<()> {
         .ok_or_else(|| anyhow!("missing or empty env var: {}", args.api_key_env))?;
 
     let client = Client::builder()
-        .timeout(None)
         .build()
         .context("building reqwest client")?;
 
@@ -182,7 +199,9 @@ async fn main() -> Result<()> {
     }
 
     info!("codex-chat-bridge listening on {}", local_addr);
-    axum::serve(listener, app).await.context("serving axum app")?;
+    axum::serve(listener, app)
+        .await
+        .context("serving axum app")?;
     Ok(())
 }
 
@@ -221,7 +240,11 @@ async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, "shutting down").into_response()
 }
 
-async fn handle_responses(State(state): State<Arc<AppState>>, headers: HeaderMap, body: String) -> Response {
+async fn handle_responses(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
     let request_value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(err) => {
@@ -276,10 +299,8 @@ async fn handle_responses(State(state): State<Arc<AppState>>, headers: HeaderMap
         return sse_error_response("upstream_error", &message);
     }
 
-    let response_stream = translate_upstream_stream(
-        upstream_response.bytes_stream(),
-        bridge_request.response_id,
-    );
+    let response_stream =
+        translate_upstream_stream(upstream_response.bytes_stream(), bridge_request.response_id);
 
     let body = Body::from_stream(response_stream);
     (
@@ -308,6 +329,7 @@ where
         let mut upstream_stream = Box::pin(upstream_stream);
         let mut parser = SseParser::default();
         let mut acc = StreamAccumulator::default();
+        let mut assistant_item_added = false;
 
         yield Ok(sse_event(
             "response.created",
@@ -358,6 +380,25 @@ where
                                 if let Some(content) = delta.content
                                     && !content.is_empty()
                                 {
+                                    if !assistant_item_added {
+                                        yield Ok(sse_event(
+                                            "response.output_item.added",
+                                            &json!({
+                                                "type": "response.output_item.added",
+                                                "item": {
+                                                    "type": "message",
+                                                    "role": "assistant",
+                                                    "content": [
+                                                        {
+                                                            "type": "output_text",
+                                                            "text": "",
+                                                        }
+                                                    ]
+                                                }
+                                            }),
+                                        ));
+                                        assistant_item_added = true;
+                                    }
                                     acc.assistant_text.push_str(&content);
                                     yield Ok(sse_event(
                                         "response.output_text.delta",
@@ -555,20 +596,15 @@ fn map_responses_to_chat_request(request: &Value) -> Result<BridgeRequest> {
     }
 
     for item in input_items {
-        let item_type = item
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
 
         match item_type {
             "message" => {
-                let role = item
-                    .get("role")
-                    .and_then(Value::as_str)
-                    .unwrap_or("user");
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
                 let content = item
                     .get("content")
                     .and_then(Value::as_array)
+                    .map(Vec::as_slice)
                     .map_or_else(String::new, flatten_content_items);
 
                 if !content.trim().is_empty() {
@@ -664,10 +700,7 @@ fn map_responses_to_chat_request(request: &Value) -> Result<BridgeRequest> {
 fn flatten_content_items(items: &[Value]) -> String {
     let mut parts = Vec::new();
     for item in items {
-        let item_type = item
-            .get("type")
-            .and_then(Value::as_str)
-            .unwrap_or_default();
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
         if matches!(item_type, "input_text" | "output_text")
             && let Some(text) = item.get("text").and_then(Value::as_str)
             && !text.is_empty()
@@ -791,6 +824,7 @@ impl SseParser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::stream;
 
     #[test]
     fn maps_responses_request_to_chat_request_with_function_tool() {
@@ -829,7 +863,13 @@ mod tests {
             .get("tools")
             .and_then(Value::as_array)
             .expect("tools array");
-        assert_eq!(tools[0].get("function").and_then(Value::as_object).is_some(), true);
+        assert_eq!(
+            tools[0]
+                .get("function")
+                .and_then(Value::as_object)
+                .is_some(),
+            true
+        );
     }
 
     #[test]
@@ -990,5 +1030,27 @@ mod tests {
         let req = map_responses_to_chat_request(&input).expect("ok");
         let messages = req.chat_request["messages"].as_array().expect("array");
         assert_eq!(messages[0]["role"], "system");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_output_item_added_before_text_delta() {
+        let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+             data: [DONE]\n\n",
+        ))]);
+        let mut output = Box::pin(translate_upstream_stream(upstream, "resp_1".to_string()));
+        let mut payload = String::new();
+
+        while let Some(event) = output.next().await {
+            payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+        }
+
+        let added_idx = payload
+            .find("event: response.output_item.added")
+            .expect("added event");
+        let delta_idx = payload
+            .find("event: response.output_text.delta")
+            .expect("delta event");
+        assert!(added_idx < delta_idx);
     }
 }

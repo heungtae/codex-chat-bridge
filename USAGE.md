@@ -194,3 +194,138 @@ codex exec \
   -c 'model_provider="chat-bridge"' \
   '작업을 수행해줘'
 ```
+
+## 13. Ollama `gpt-oss:20b` 기준 Configuration (전체)
+
+이 섹션은 `Ollama + gpt-oss:20b`를 `codex-chat-bridge`로 연결할 때 필요한 설정을 한 번에 정리한 것입니다.
+
+전제:
+- Ollama OpenAI 호환 엔드포인트 사용: `http://127.0.0.1:11434/v1/chat/completions`
+- 모델: `gpt-oss:20b`
+- Codex는 브리지에 `responses`로 요청하고, 브리지가 Ollama `chat/completions`로 변환
+
+### 13.1 Ollama 준비
+
+```bash
+ollama pull gpt-oss:20b
+ollama serve
+```
+
+확인:
+
+```bash
+curl --silent http://127.0.0.1:11434/api/tags | jq '.models[].name' | grep 'gpt-oss:20b'
+```
+
+### 13.2 환경변수 설정
+
+`codex-chat-bridge`는 API 키 문자열이 비어 있지 않아야 하므로, Ollama에서는 더미 값을 사용합니다.
+
+```bash
+export OLLAMA_API_KEY=ollama
+```
+
+### 13.3 브리지 실행 설정 (전체 옵션 예시)
+
+```bash
+cargo run -p codex-chat-bridge -- \
+  --host 127.0.0.1 \
+  --port 8787 \
+  --api-key-env OLLAMA_API_KEY \
+  --upstream-url http://127.0.0.1:11434/v1/chat/completions \
+  --server-info /tmp/codex-chat-bridge-info.json \
+  --http-shutdown
+```
+
+옵션 설명:
+
+| 옵션 | 예시 값 | 설명 |
+|---|---|---|
+| `--host` | `127.0.0.1` | 브리지 바인딩 주소 |
+| `--port` | `8787` | 브리지 포트 |
+| `--api-key-env` | `OLLAMA_API_KEY` | 브리지가 읽을 API 키 환경변수 이름 (Ollama에서는 더미 가능) |
+| `--upstream-url` | `http://127.0.0.1:11434/v1/chat/completions` | 실제 업스트림 chat endpoint |
+| `--server-info` | `/tmp/codex-chat-bridge-info.json` | 실행 포트/프로세스 정보 파일 |
+| `--http-shutdown` | enabled | `GET /shutdown` 허용 |
+
+### 13.4 Codex 실행 설정 (CLI 오버라이드 방식)
+
+`model`은 `gpt-oss:20b`로 지정해야 합니다.
+
+```bash
+export OLLAMA_API_KEY=ollama
+
+codex exec \
+  --model gpt-oss:20b \
+  -c 'model_providers.chat-bridge-ollama={name="Chat Bridge Ollama",base_url="http://127.0.0.1:8787/v1",env_key="OLLAMA_API_KEY",wire_api="responses"}' \
+  -c 'model_provider="chat-bridge-ollama"' \
+  '현재 디렉터리 프로젝트 구조를 요약해줘'
+```
+
+### 13.5 Codex 영구 설정 (`~/.codex/config.toml`)
+
+매번 `-c`를 넣기 싫다면 아래처럼 고정할 수 있습니다.
+
+```toml
+[model_providers.chat-bridge-ollama]
+name = "Chat Bridge Ollama"
+base_url = "http://127.0.0.1:8787/v1"
+env_key = "OLLAMA_API_KEY"
+wire_api = "responses"
+
+model_provider = "chat-bridge-ollama"
+model = "gpt-oss:20b"
+```
+
+이후 실행:
+
+```bash
+export OLLAMA_API_KEY=ollama
+codex
+```
+
+### 13.6 Configuration 전체 항목 설명
+
+#### A) 브리지(`codex-chat-bridge`) 설정 항목
+
+| 항목 | 필요 여부 | 설명 |
+|---|---|---|
+| `host` | 선택 | 브리지 수신 IP |
+| `port` | 선택 | 브리지 수신 포트 (미지정 시 랜덤) |
+| `upstream_url` | 필수(실질) | 변환 후 요청을 보낼 chat endpoint |
+| `api_key_env` | 필수 | 브리지가 읽는 토큰 환경변수 이름 |
+| `server_info` | 선택 | 포트/PID 파일 출력 |
+| `http_shutdown` | 선택 | HTTP 종료 엔드포인트 허용 |
+
+#### B) Codex provider 설정 항목 (`model_providers.<id>`)
+
+| 항목 | 필요 여부 | 설명 |
+|---|---|---|
+| `name` | 권장 | 표시용 provider 이름 |
+| `base_url` | 필수 | Codex가 호출할 Responses base URL (`http://127.0.0.1:8787/v1`) |
+| `env_key` | 필수 | Codex가 provider 인증 토큰을 읽을 환경변수 |
+| `wire_api` | 필수 | 반드시 `"responses"` |
+
+#### C) Codex 런타임 선택 항목
+
+| 항목 | 필요 여부 | 설명 |
+|---|---|---|
+| `model_provider` | 필수 | 위에서 정의한 provider id 선택 |
+| `model` | 필수(실질) | Ollama 모델명 (`gpt-oss:20b`) |
+
+### 13.7 연결 검증 체크리스트
+
+1. 브리지 헬스체크:
+
+```bash
+curl --fail --silent --show-error http://127.0.0.1:8787/healthz
+```
+
+2. Codex 실행 시 provider/model 확인:
+- provider: `chat-bridge-ollama`
+- model: `gpt-oss:20b`
+
+3. 실패 시 우선 점검:
+- Ollama가 `11434`에서 실행 중인지
+- 브리지 `--upstream-url` 경로가 정확한지
+- `OLLAMA_API_KEY`가 빈 문자열이 아닌지

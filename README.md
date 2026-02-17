@@ -12,6 +12,7 @@ Detailed guide: `USAGE.md`
 - Translates request payload into `POST /v1/chat/completions`
 - Streams upstream Chat Completions chunks back as Responses-style SSE events:
   - `response.created`
+  - `response.output_item.added` (assistant message start)
   - `response.output_text.delta`
   - `response.output_item.done` (assistant message and function calls)
   - `response.completed`
