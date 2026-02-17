@@ -60,8 +60,9 @@ npx @heungtae/codex-chat-bridge -- \
   --api-key-env OPENAI_API_KEY
 ```
 
-기본적으로 현재 디렉터리의 `conf.toml`을 자동으로 읽습니다.
-우선순위는 `CLI 옵션 > conf.toml > 내장 기본값`입니다.
+기본적으로 `~/.config/codex-chat-bridge/conf.toml`을 사용합니다.
+파일이 없으면 기본 템플릿으로 자동 생성됩니다.
+우선순위는 `CLI 옵션 > 설정 파일 > 내장 기본값`입니다.
 
 또는 Cargo 직접 실행:
 
@@ -78,7 +79,7 @@ npx @heungtae/codex-chat-bridge --config /path/to/conf.toml
 ```
 
 옵션 설명:
-- `--config <FILE>`: 설정 파일 경로 (기본값: `conf.toml`)
+- `--config <FILE>`: 설정 파일 경로 (기본값: `~/.config/codex-chat-bridge/conf.toml`)
 - `--port`: 브리지 포트 (기본: 랜덤 포트)
 - `--api-key-env`: 업스트림 호출에 쓸 API 키 환경변수 이름
 - `--upstream-url`: 기본값 `https://api.openai.com/v1/chat/completions`

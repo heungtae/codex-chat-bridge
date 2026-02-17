@@ -14,11 +14,10 @@ Node.js 20+ and Rust/Cargo are required because npm installation compiles the Ru
 npm install @heungtae/codex-chat-bridge
 ```
 
-Private registry publish/install is also supported:
+Install globally if you want the `codex-chat-bridge` command on PATH:
 
 ```bash
-npm publish --registry <private-registry> --access restricted
-npm install @heungtae/codex-chat-bridge --registry <private-registry>
+npm install -g @heungtae/codex-chat-bridge
 ```
 
 ## What it does
@@ -39,7 +38,8 @@ npm install @heungtae/codex-chat-bridge --registry <private-registry>
 npx @heungtae/codex-chat-bridge --port 8787 --api-key-env OPENAI_API_KEY
 ```
 
-By default, the bridge also reads `conf.toml` in the current directory.
+By default, the bridge uses `~/.config/codex-chat-bridge/conf.toml`.
+If the file does not exist, it is created automatically with commented defaults.
 CLI flags override file values.
 
 Or run the binary directly via Cargo:

@@ -41,8 +41,12 @@ use uuid::Uuid;
     about = "Responses-to-Chat completions bridge"
 )]
 struct Args {
-    #[arg(long, value_name = "FILE", default_value = "conf.toml")]
-    config: PathBuf,
+    #[arg(
+        long,
+        value_name = "FILE",
+        help = "config file path (default: ~/.config/codex-chat-bridge/conf.toml)"
+    )]
+    config: Option<PathBuf>,
 
     #[arg(long)]
     host: Option<String>,
@@ -82,6 +86,18 @@ struct ResolvedConfig {
     server_info: Option<PathBuf>,
     http_shutdown: bool,
 }
+
+const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configuration
+#
+# Priority: CLI flags > config file > built-in defaults
+
+# host = "127.0.0.1"
+# port = 8787
+# upstream_url = "https://api.openai.com/v1/chat/completions"
+# api_key_env = "OPENAI_API_KEY"
+# server_info = "/tmp/codex-chat-bridge-info.json"
+# http_shutdown = false
+"#;
 
 #[derive(Clone)]
 struct AppState {
@@ -188,7 +204,9 @@ async fn main() -> Result<()> {
         .init();
 
     let args = Args::parse();
-    let file_config = load_file_config(&args.config)?;
+    let config_path = resolve_config_path(args.config.clone())?;
+    ensure_default_config_file(&config_path)?;
+    let file_config = load_file_config(&config_path)?;
     let config = resolve_config(args, file_config);
 
     let api_key = std::env::var(&config.api_key_env)
@@ -241,6 +259,35 @@ fn load_file_config(path: &Path) -> Result<Option<FileConfig>> {
         .with_context(|| format!("parsing config file {}", path.display()))?;
     info!("loaded config file {}", path.display());
     Ok(Some(parsed))
+}
+
+fn resolve_config_path(cli_path: Option<PathBuf>) -> Result<PathBuf> {
+    if let Some(path) = cli_path {
+        return Ok(path);
+    }
+
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| anyhow!("HOME environment variable is not set"))?;
+    Ok(PathBuf::from(home)
+        .join(".config")
+        .join("codex-chat-bridge")
+        .join("conf.toml"))
+}
+
+fn ensure_default_config_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        return Ok(());
+    }
+
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("creating config directory {}", parent.display()))?;
+    }
+
+    fs::write(path, DEFAULT_CONFIG_TEMPLATE)
+        .with_context(|| format!("creating default config file {}", path.display()))?;
+    info!("created default config file {}", path.display());
+    Ok(())
 }
 
 fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig {
@@ -1117,7 +1164,7 @@ mod tests {
     #[test]
     fn resolve_config_prefers_cli_over_file_and_defaults() {
         let args = Args {
-            config: PathBuf::from("conf.toml"),
+            config: None,
             host: Some("0.0.0.0".to_string()),
             port: Some(9999),
             upstream_url: None,
@@ -1149,7 +1196,7 @@ mod tests {
     #[test]
     fn resolve_config_uses_defaults_when_missing() {
         let args = Args {
-            config: PathBuf::from("conf.toml"),
+            config: None,
             host: None,
             port: None,
             upstream_url: None,
@@ -1168,5 +1215,11 @@ mod tests {
         assert_eq!(resolved.api_key_env, "OPENAI_API_KEY");
         assert_eq!(resolved.server_info, None);
         assert!(!resolved.http_shutdown);
+    }
+
+    #[test]
+    fn resolve_config_path_prefers_cli_value() {
+        let path = resolve_config_path(Some(PathBuf::from("/tmp/custom.toml"))).expect("ok");
+        assert_eq!(path, PathBuf::from("/tmp/custom.toml"));
     }
 }
