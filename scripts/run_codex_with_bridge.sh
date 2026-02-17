@@ -9,8 +9,8 @@ fi
 PROMPT="$1"
 shift || true
 
-API_KEY_ENV="${API_KEY_ENV:-OPENROUTER_API_KEY}"
-UPSTREAM_URL="${UPSTREAM_URL:-https://openrouter.ai/api/v1/chat/completions}"
+API_KEY_ENV="${API_KEY_ENV:-OPENAI_API_KEY}"
+UPSTREAM_URL="${UPSTREAM_URL:-https://api.openai.com/v1/chat/completions}"
 BRIDGE_PORT="${BRIDGE_PORT:-8787}"
 SERVER_INFO="${SERVER_INFO:-/tmp/codex-chat-bridge-info.json}"
 CODEX_BRIDGE_RUST_LOG="${CODEX_BRIDGE_RUST_LOG:-${RUST_LOG:-info,codex_core::rollout::list=off}}"
@@ -42,6 +42,4 @@ done
 RUST_LOG="${CODEX_BRIDGE_RUST_LOG}" codex exec \
   -c "model_providers.chat-bridge={name='Chat Bridge',base_url='http://127.0.0.1:${BRIDGE_PORT}/v1',env_key='${API_KEY_ENV}',wire_api='responses'}" \
   -c 'model_provider="chat-bridge"' \
-  -c 'model="arcee-ai/trinity-large-preview:free"' \
-  -c 'web_search="disabled"' \
   "$PROMPT" "$@"

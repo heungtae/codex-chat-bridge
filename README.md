@@ -26,7 +26,7 @@ npm install -g @heungtae/codex-chat-bridge
 - Translates request payload into `POST /v1/chat/completions`
 - Streams upstream Chat Completions chunks back as Responses-style SSE events:
   - `response.created`
-  - `response.output_item.added` (assistant message start)
+  - `response.output_item.added` (assistant text starts; only emitted when text delta exists)
   - `response.output_text.delta`
   - `response.output_item.done` (assistant message and function calls)
   - `response.completed`
@@ -72,6 +72,11 @@ Use `scripts/run_codex_with_bridge.sh` to run the bridge and `codex exec` togeth
 ```bash
 scripts/run_codex_with_bridge.sh "Summarize this repo."
 ```
+
+Defaults:
+- `API_KEY_ENV=OPENAI_API_KEY`
+- `UPSTREAM_URL=https://api.openai.com/v1/chat/completions`
+- The script does not force `model`; pass it as extra args when needed (for example: `--model gpt-4.1`).
 
 ## Package Scripts
 

@@ -9,7 +9,13 @@ npm install @heungtae/codex-chat-bridge
 npx @heungtae/codex-chat-bridge --help
 ```
 
-private registry 배포:
+공개 npm 배포(현재 기본값):
+
+```bash
+npm publish --access public
+```
+
+private registry 배포(선택):
 
 ```bash
 npm publish --registry <private-registry> --access restricted
@@ -133,6 +139,11 @@ codex exec '간단한 테스트를 해줘'
 ```bash
 scripts/run_codex_with_bridge.sh "이 저장소 구조를 설명해줘"
 ```
+
+기본값:
+- `API_KEY_ENV=OPENAI_API_KEY`
+- `UPSTREAM_URL=https://api.openai.com/v1/chat/completions`
+- 래퍼 스크립트는 `model`을 강제하지 않음 (필요 시 추가 인자로 전달)
 
 추가 인자 전달:
 

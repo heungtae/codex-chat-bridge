@@ -38,7 +38,8 @@ use uuid::Uuid;
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "codex-chat-bridge",
-    about = "Responses-to-Chat completions bridge"
+    about = "Responses-to-Chat completions bridge",
+    version
 )]
 struct Args {
     #[arg(
