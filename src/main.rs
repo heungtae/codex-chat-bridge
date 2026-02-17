@@ -744,6 +744,40 @@ fn map_responses_to_chat_request(
                     }));
                 }
             }
+            "function_call" => {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    warn!("ignoring function_call item with empty name");
+                    continue;
+                }
+
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                let arguments = item
+                    .get("arguments")
+                    .map(function_arguments_to_text)
+                    .unwrap_or_else(|| "{}".to_string());
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }]
+                }));
+            }
             "function_call_output" => {
                 let call_id = item
                     .get("call_id")
@@ -846,6 +880,13 @@ fn function_output_to_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Array(items) => flatten_content_items(items),
+        other => other.to_string(),
+    }
+}
+
+fn function_arguments_to_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
         other => other.to_string(),
     }
 }
@@ -1075,6 +1116,37 @@ mod tests {
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn map_supports_function_call_to_assistant_tool_call() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "function_call",
+                    "call_id": "call_1",
+                    "name": "get_weather",
+                    "arguments": "{\"city\":\"seoul\"}"
+                }
+            ],
+            "tools": []
+        });
+
+        let req = map_responses_to_chat_request(&input, &HashSet::new()).expect("should map");
+        let messages = req
+            .chat_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_1");
+        assert_eq!(messages[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["name"],
+            "get_weather"
+        );
     }
 
     #[test]
