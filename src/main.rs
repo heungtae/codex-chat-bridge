@@ -68,6 +68,9 @@ struct Args {
     #[arg(long)]
     http_shutdown: bool,
 
+    #[arg(long, help = "enable verbose bridge logs (request/response payloads)")]
+    verbose_logging: bool,
+
     #[arg(
         long = "drop-tool-type",
         value_name = "TYPE",
@@ -85,6 +88,7 @@ struct FileConfig {
     api_key_env: Option<String>,
     server_info: Option<PathBuf>,
     http_shutdown: Option<bool>,
+    verbose_logging: Option<bool>,
     drop_tool_types: Option<Vec<String>>,
 }
 
@@ -96,6 +100,7 @@ struct ResolvedConfig {
     api_key_env: String,
     server_info: Option<PathBuf>,
     http_shutdown: bool,
+    verbose_logging: bool,
     drop_tool_types: Vec<String>,
 }
 
@@ -109,6 +114,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # api_key_env = "OPENAI_API_KEY"
 # server_info = "/tmp/codex-chat-bridge-info.json"
 # http_shutdown = false
+# verbose_logging = false
 # drop_tool_types = ["web_search", "web_search_preview"]
 "#;
 
@@ -118,6 +124,7 @@ struct AppState {
     upstream_url: String,
     api_key: String,
     http_shutdown: bool,
+    verbose_logging: bool,
     drop_tool_types: HashSet<String>,
 }
 
@@ -237,6 +244,7 @@ async fn main() -> Result<()> {
         upstream_url: config.upstream_url.clone(),
         api_key,
         http_shutdown: config.http_shutdown,
+        verbose_logging: config.verbose_logging,
         drop_tool_types: config.drop_tool_types.into_iter().collect(),
     });
 
@@ -327,6 +335,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
             .unwrap_or_else(|| "OPENAI_API_KEY".to_string()),
         server_info: args.server_info.or(file_config.server_info),
         http_shutdown: args.http_shutdown || file_config.http_shutdown.unwrap_or(false),
+        verbose_logging: args.verbose_logging || file_config.verbose_logging.unwrap_or(false),
         drop_tool_types,
     }
 }
@@ -371,6 +380,10 @@ async fn handle_responses(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    if state.verbose_logging {
+        info!("responses request body: {body}");
+    }
+
     let request_value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(err) => {
@@ -386,6 +399,10 @@ async fn handle_responses(
         Ok(v) => v,
         Err(err) => return sse_error_response("invalid_request", &err.to_string()),
     };
+
+    if state.verbose_logging {
+        info!("mapped chat request payload: {}", bridge_request.chat_request);
+    }
 
     let mut upstream_request = state
         .client
@@ -416,12 +433,23 @@ async fn handle_responses(
         }
     };
 
+    if state.verbose_logging {
+        info!(
+            "upstream response status: {} {}",
+            upstream_response.status().as_u16(),
+            upstream_response.status()
+        );
+    }
+
     if !upstream_response.status().is_success() {
         let status = upstream_response.status();
         let body = upstream_response
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
+        if state.verbose_logging {
+            info!("upstream error body: {body}");
+        }
         let message = format!("upstream returned {status}: {body}");
         return sse_error_response("upstream_error", &message);
     }
@@ -1284,6 +1312,7 @@ mod tests {
             api_key_env: Some("CLI_API_KEY".to_string()),
             server_info: None,
             http_shutdown: true,
+            verbose_logging: false,
             drop_tool_types: vec![],
         };
         let file = FileConfig {
@@ -1293,6 +1322,7 @@ mod tests {
             api_key_env: Some("FILE_API_KEY".to_string()),
             server_info: Some(PathBuf::from("/tmp/server.json")),
             http_shutdown: Some(false),
+            verbose_logging: Some(true),
             drop_tool_types: None,
         };
 
@@ -1306,6 +1336,7 @@ mod tests {
         assert_eq!(resolved.api_key_env, "CLI_API_KEY");
         assert_eq!(resolved.server_info, Some(PathBuf::from("/tmp/server.json")));
         assert!(resolved.http_shutdown);
+        assert!(resolved.verbose_logging);
     }
 
     #[test]
@@ -1318,6 +1349,7 @@ mod tests {
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
+            verbose_logging: false,
             drop_tool_types: vec![],
         };
 
@@ -1331,6 +1363,7 @@ mod tests {
         assert_eq!(resolved.api_key_env, "OPENAI_API_KEY");
         assert_eq!(resolved.server_info, None);
         assert!(!resolved.http_shutdown);
+        assert!(!resolved.verbose_logging);
     }
 
     #[test]

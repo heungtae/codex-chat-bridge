@@ -1,6 +1,6 @@
 {
   "name": "@heungtae/codex-chat-bridge",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Responses-to-chat/completions bridge for Codex workflows",
   "license": "Apache-2.0",
   "type": "commonjs",
