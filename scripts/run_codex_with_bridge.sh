@@ -25,7 +25,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-cargo run -p codex-chat-bridge -- \
+cargo run --bin codex-chat-bridge -- \
   --port "${BRIDGE_PORT}" \
   --api-key-env "${API_KEY_ENV}" \
   --upstream-url "${UPSTREAM_URL}" \

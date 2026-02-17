@@ -34,10 +34,10 @@ echo "${OPENAI_API_KEY:+set}"
 
 ## 4. 브리지 실행
 
-프로젝트 루트(`codex/codex-rs`) 기준:
+프로젝트 루트(`chat-bridge`) 기준:
 
 ```bash
-cargo run -p codex-chat-bridge -- \
+cargo run --bin codex-chat-bridge -- \
   --port 8787 \
   --api-key-env OPENAI_API_KEY
 ```
@@ -94,13 +94,13 @@ codex exec '간단한 테스트를 해줘'
 브리지 기동/종료 + Codex 실행을 한 번에 처리:
 
 ```bash
-codex-rs/chat-bridge/scripts/run_codex_with_bridge.sh "이 저장소 구조를 설명해줘"
+scripts/run_codex_with_bridge.sh "이 저장소 구조를 설명해줘"
 ```
 
 추가 인자 전달:
 
 ```bash
-codex-rs/chat-bridge/scripts/run_codex_with_bridge.sh \
+scripts/run_codex_with_bridge.sh \
   "테스트 코드 생성해줘" \
   --model gpt-4.1
 ```
@@ -134,7 +134,7 @@ model_provider = "chat-bridge"
 `--upstream-url`을 명시적으로 지정해 예상 엔드포인트로만 트래픽이 가게 만듭니다.
 
 ```bash
-cargo run -p codex-chat-bridge -- \
+cargo run --bin codex-chat-bridge -- \
   --port 8787 \
   --api-key-env OPENAI_API_KEY \
   --upstream-url https://api.openai.com/v1/chat/completions
@@ -183,7 +183,7 @@ cargo run -p codex-chat-bridge -- \
 1. 브리지 실행
 
 ```bash
-cargo run -p codex-chat-bridge -- --port 8787 --api-key-env OPENAI_API_KEY
+cargo run --bin codex-chat-bridge -- --port 8787 --api-key-env OPENAI_API_KEY
 ```
 
 2. Codex를 브리지 provider로 실행
@@ -228,7 +228,7 @@ export OLLAMA_API_KEY=ollama
 ### 13.3 브리지 실행 설정 (전체 옵션 예시)
 
 ```bash
-cargo run -p codex-chat-bridge -- \
+cargo run --bin codex-chat-bridge -- \
   --host 127.0.0.1 \
   --port 8787 \
   --api-key-env OLLAMA_API_KEY \

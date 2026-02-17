@@ -21,7 +21,7 @@ Detailed guide: `USAGE.md`
 ## Run
 
 ```bash
-cargo run -p codex-chat-bridge -- --port 8787 --api-key-env OPENAI_API_KEY
+cargo run --bin codex-chat-bridge -- --port 8787 --api-key-env OPENAI_API_KEY
 ```
 
 ## Codex override example
@@ -40,7 +40,7 @@ You can also set `OPENAI_BASE_URL=http://127.0.0.1:8787/v1` and keep `model_prov
 Use `scripts/run_codex_with_bridge.sh` to run the bridge and `codex exec` together:
 
 ```bash
-chat-bridge/scripts/run_codex_with_bridge.sh "Summarize this repo."
+scripts/run_codex_with_bridge.sh "Summarize this repo."
 ```
 
 ## Endpoints
