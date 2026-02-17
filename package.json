@@ -1,0 +1,31 @@
+{
+  "name": "@heungtae/codex-chat-bridge",
+  "version": "0.1.0",
+  "description": "Responses-to-chat/completions bridge for Codex workflows",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "bin": {
+    "codex-chat-bridge": "bin/codex-chat-bridge.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "access": "restricted"
+  },
+  "files": [
+    "bin/",
+    "scripts/",
+    "src/",
+    "Cargo.toml",
+    "Cargo.lock",
+    "README.md",
+    "USAGE.md"
+  ],
+  "scripts": {
+    "build:bridge": "cargo build --release --bin codex-chat-bridge",
+    "postinstall": "node scripts/postinstall-build.cjs",
+    "start": "node bin/codex-chat-bridge.js",
+    "pack:check": "npm pack --dry-run"
+  }
+}

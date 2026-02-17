@@ -6,6 +6,21 @@ This is intended for "no core source change" integration: run this bridge locall
 
 Detailed guide: `USAGE.md`
 
+## Install with npm
+
+Node.js 20+ and Rust/Cargo are required because npm installation compiles the Rust binary locally.
+
+```bash
+npm install @heungtae/codex-chat-bridge
+```
+
+Private registry publish/install is also supported:
+
+```bash
+npm publish --registry <private-registry> --access restricted
+npm install @heungtae/codex-chat-bridge --registry <private-registry>
+```
+
 ## What it does
 
 - Accepts `POST /v1/responses`
@@ -19,6 +34,12 @@ Detailed guide: `USAGE.md`
   - `response.failed` (for upstream/network errors)
 
 ## Run
+
+```bash
+npx @heungtae/codex-chat-bridge --port 8787 --api-key-env OPENAI_API_KEY
+```
+
+Or run the binary directly via Cargo:
 
 ```bash
 cargo run --bin codex-chat-bridge -- --port 8787 --api-key-env OPENAI_API_KEY
@@ -41,6 +62,13 @@ Use `scripts/run_codex_with_bridge.sh` to run the bridge and `codex exec` togeth
 
 ```bash
 scripts/run_codex_with_bridge.sh "Summarize this repo."
+```
+
+## Package Scripts
+
+```bash
+npm run build:bridge
+npm run pack:check
 ```
 
 ## Endpoints

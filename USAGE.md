@@ -1,5 +1,20 @@
 # codex-chat-bridge 사용 및 설정 가이드
 
+## 0. npm 배포/설치 빠른 시작
+
+패키지명: `@heungtae/codex-chat-bridge`
+
+```bash
+npm install @heungtae/codex-chat-bridge
+npx @heungtae/codex-chat-bridge --help
+```
+
+private registry 배포:
+
+```bash
+npm publish --registry <private-registry> --access restricted
+```
+
 ## 1. 개요
 
 `codex-chat-bridge`는 Codex가 내부적으로 `responses` API를 쓰는 구조를 유지하면서, 실제 업스트림 호출은 `chat/completions`로 보내도록 중간 변환해주는 로컬 브리지입니다.
@@ -20,6 +35,8 @@
 ## 3. 사전 준비
 
 필수:
+- Node.js 20+
+- npm
 - Rust/Cargo 설치
 - `OPENAI_API_KEY`(또는 원하는 이름의 API 키 환경변수)
 - Codex CLI 사용 가능 상태
@@ -27,6 +44,7 @@
 확인:
 
 ```bash
+npm --version
 cargo --version
 codex --version
 echo "${OPENAI_API_KEY:+set}"
@@ -35,6 +53,14 @@ echo "${OPENAI_API_KEY:+set}"
 ## 4. 브리지 실행
 
 프로젝트 루트(`chat-bridge`) 기준:
+
+```bash
+npx @heungtae/codex-chat-bridge -- \
+  --port 8787 \
+  --api-key-env OPENAI_API_KEY
+```
+
+또는 Cargo 직접 실행:
 
 ```bash
 cargo run --bin codex-chat-bridge -- \
@@ -103,6 +129,13 @@ scripts/run_codex_with_bridge.sh "이 저장소 구조를 설명해줘"
 scripts/run_codex_with_bridge.sh \
   "테스트 코드 생성해줘" \
   --model gpt-4.1
+```
+
+### 6.3 npm 스크립트 사용
+
+```bash
+npm run build:bridge
+npm run pack:check
 ```
 
 ## 7. 영구 설정 (선택)
