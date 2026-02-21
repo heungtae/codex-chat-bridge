@@ -27,5 +27,8 @@
     "postinstall": "node scripts/postinstall-build.cjs",
     "start": "node bin/codex-chat-bridge.js",
     "pack:check": "npm pack --dry-run"
+  },
+  "dependencies": {
+    "@heungtae/codex-chat-bridge": "^0.1.7"
   }
 }
