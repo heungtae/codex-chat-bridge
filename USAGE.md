@@ -23,12 +23,12 @@ npm publish --registry <private-registry> --access restricted
 
 ## 1. 개요
 
-`codex-chat-bridge`는 Codex가 내부적으로 `responses` API를 쓰는 구조를 유지하면서, 실제 업스트림 호출은 `chat/completions`로 보내도록 중간 변환해주는 로컬 브리지입니다.
+`codex-chat-bridge`는 `responses`/`chat` 요청을 받아 request filtering 후 업스트림(`chat/completions` 또는 `responses`)으로 전달하고, 결과를 `responses` 형식으로 반환하는 로컬 브리지입니다.
 
 핵심 동작:
-- Codex -> `POST /v1/responses` (브리지)
-- 브리지 -> `POST /v1/chat/completions` (업스트림)
-- 브리지 -> Responses 스타일 SSE 이벤트로 재변환 후 Codex에 전달
+- 클라이언트 -> `POST /v1/responses` 또는 `POST /v1/chat/completions` (브리지)
+- 브리지 -> 필터 적용(`drop_tool_types`) 후 업스트림 호출
+- 브리지 -> `responses` 형식으로 반환 (`stream=true`면 SSE, `stream=false`면 JSON)
 
 ## 2. 언제 필요한가
 
@@ -88,7 +88,8 @@ npx @heungtae/codex-chat-bridge --config /path/to/conf.toml
 - `--config <FILE>`: 설정 파일 경로 (기본값: `~/.config/codex-chat-bridge/conf.toml`)
 - `--port`: 브리지 포트 (기본: 랜덤 포트)
 - `--api-key-env`: 업스트림 호출에 쓸 API 키 환경변수 이름
-- `--upstream-url`: 기본값 `https://api.openai.com/v1/chat/completions`
+- `--upstream-url`: 업스트림 endpoint URL
+- `--upstream-wire <chat|responses>`: 업스트림 wire 선택 (기본: `chat`)
 - `--server-info <FILE>`: 시작 시 포트/프로세스 정보 JSON 저장
 - `--http-shutdown`: `GET /shutdown` 허용
 
@@ -176,7 +177,7 @@ model_provider = "chat-bridge"
 
 주의:
 - Codex는 여전히 `responses` wire를 사용합니다.
-- `wire_api = "chat"`는 지원되지 않습니다.
+- 브리지는 `/v1/chat/completions` 입력도 수용하지만 출력은 `responses` 형식으로 통일됩니다.
 
 ## 8. 동작 검증 방법
 

@@ -17,6 +17,7 @@ use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
 use clap::Parser;
+use clap::ValueEnum;
 use futures::Stream;
 use futures::StreamExt;
 use reqwest::Client;
@@ -35,6 +36,19 @@ use std::sync::Arc;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
+
+#[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+enum WireApi {
+    Chat,
+    Responses,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IncomingApi {
+    Responses,
+    Chat,
+}
 
 #[derive(Debug, Clone, Parser)]
 #[command(
@@ -58,6 +72,9 @@ struct Args {
 
     #[arg(long)]
     upstream_url: Option<String>,
+
+    #[arg(long, value_enum)]
+    upstream_wire: Option<WireApi>,
 
     #[arg(long)]
     api_key_env: Option<String>,
@@ -85,6 +102,7 @@ struct FileConfig {
     host: Option<String>,
     port: Option<u16>,
     upstream_url: Option<String>,
+    upstream_wire: Option<WireApi>,
     api_key_env: Option<String>,
     server_info: Option<PathBuf>,
     http_shutdown: Option<bool>,
@@ -97,6 +115,7 @@ struct ResolvedConfig {
     host: String,
     port: Option<u16>,
     upstream_url: String,
+    upstream_wire: WireApi,
     api_key_env: String,
     server_info: Option<PathBuf>,
     http_shutdown: bool,
@@ -111,6 +130,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # host = "127.0.0.1"
 # port = 8787
 # upstream_url = "https://api.openai.com/v1/chat/completions"
+# upstream_wire = "chat" # chat | responses
 # api_key_env = "OPENAI_API_KEY"
 # server_info = "/tmp/codex-chat-bridge-info.json"
 # http_shutdown = false
@@ -122,6 +142,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 struct AppState {
     client: Client,
     upstream_url: String,
+    upstream_wire: WireApi,
     api_key: String,
     http_shutdown: bool,
     verbose_logging: bool,
@@ -137,7 +158,6 @@ struct ServerInfo {
 #[derive(Debug)]
 struct BridgeRequest {
     chat_request: Value,
-    response_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -242,6 +262,7 @@ async fn main() -> Result<()> {
     let state = Arc::new(AppState {
         client,
         upstream_url: config.upstream_url.clone(),
+        upstream_wire: config.upstream_wire,
         api_key,
         http_shutdown: config.http_shutdown,
         verbose_logging: config.verbose_logging,
@@ -250,6 +271,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/v1/responses", post(handle_responses))
+        .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/healthz", get(healthz))
         .route("/shutdown", get(shutdown))
         .with_state(state);
@@ -318,6 +340,10 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
     drop_tool_types.extend(args.drop_tool_types);
     drop_tool_types.retain(|v| !v.trim().is_empty());
+    let upstream_wire = args
+        .upstream_wire
+        .or(file_config.upstream_wire)
+        .unwrap_or(WireApi::Chat);
 
     ResolvedConfig {
         host: args
@@ -328,7 +354,8 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
         upstream_url: args
             .upstream_url
             .or(file_config.upstream_url)
-            .unwrap_or_else(|| "https://api.openai.com/v1/chat/completions".to_string()),
+            .unwrap_or_else(|| default_upstream_url(upstream_wire)),
+        upstream_wire,
         api_key_env: args
             .api_key_env
             .or(file_config.api_key_env)
@@ -337,6 +364,13 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
         http_shutdown: args.http_shutdown || file_config.http_shutdown.unwrap_or(false),
         verbose_logging: args.verbose_logging || file_config.verbose_logging.unwrap_or(false),
         drop_tool_types,
+    }
+}
+
+fn default_upstream_url(upstream_wire: WireApi) -> String {
+    match upstream_wire {
+        WireApi::Chat => "https://api.openai.com/v1/chat/completions".to_string(),
+        WireApi::Responses => "https://api.openai.com/v1/responses".to_string(),
     }
 }
 
@@ -380,28 +414,54 @@ async fn handle_responses(
     headers: HeaderMap,
     body: String,
 ) -> Response {
+    handle_incoming(state, headers, body, IncomingApi::Responses).await
+}
+
+async fn handle_chat_completions(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    handle_incoming(state, headers, body, IncomingApi::Chat).await
+}
+
+async fn handle_incoming(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: String,
+    incoming_api: IncomingApi,
+) -> Response {
     if state.verbose_logging {
-        info!("responses request body: {body}");
+        info!("incoming request body ({incoming_api:?}): {body}");
     }
 
-    let request_value: Value = match serde_json::from_str(&body) {
+    let mut request_value: Value = match serde_json::from_str(&body) {
         Ok(v) => v,
         Err(err) => {
-            return sse_error_response(
+            return error_response_for_stream(
+                stream_default_for_api(incoming_api),
                 "invalid_request",
                 &format!("failed to parse request JSON: {err}"),
-            );
+            )
         }
     };
 
-    let bridge_request = match map_responses_to_chat_request(&request_value, &state.drop_tool_types)
-    {
-        Ok(v) => v,
-        Err(err) => return sse_error_response("invalid_request", &err.to_string()),
-    };
+    let wants_stream = stream_flag_for_request(incoming_api, &request_value);
+    apply_request_filters(incoming_api, &mut request_value, &state.drop_tool_types);
+
+    let response_id = format!("resp_bridge_{}", Uuid::now_v7());
+    let upstream_payload =
+        match build_upstream_payload(&request_value, incoming_api, state.upstream_wire, wants_stream)
+        {
+            Ok(v) => v,
+            Err(err) => return error_response_for_stream(wants_stream, "invalid_request", &err.to_string()),
+        };
 
     if state.verbose_logging {
-        info!("mapped chat request payload: {}", bridge_request.chat_request);
+        info!(
+            "upstream payload ({:?}->{:?}): {}",
+            incoming_api, state.upstream_wire, upstream_payload
+        );
     }
 
     let mut upstream_request = state
@@ -409,7 +469,7 @@ async fn handle_responses(
         .post(&state.upstream_url)
         .bearer_auth(&state.api_key)
         .header(CONTENT_TYPE, "application/json")
-        .json(&bridge_request.chat_request);
+        .json(&upstream_payload);
 
     for header_name in [
         "openai-organization",
@@ -426,10 +486,11 @@ async fn handle_responses(
     let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
-            return sse_error_response(
+            return error_response_for_stream(
+                wants_stream,
                 "upstream_transport_error",
-                &format!("failed to call upstream chat endpoint: {err}"),
-            );
+                &format!("failed to call upstream endpoint: {err}"),
+            )
         }
     };
 
@@ -451,29 +512,154 @@ async fn handle_responses(
             info!("upstream error body: {body}");
         }
         let message = format!("upstream returned {status}: {body}");
-        return sse_error_response("upstream_error", &message);
+        return error_response_for_stream(wants_stream, "upstream_error", &message);
     }
 
-    let response_stream =
-        translate_upstream_stream(upstream_response.bytes_stream(), bridge_request.response_id);
+    if wants_stream {
+        let body = match state.upstream_wire {
+            WireApi::Chat => Body::from_stream(translate_chat_stream(
+                upstream_response.bytes_stream(),
+                response_id,
+            )),
+            WireApi::Responses => {
+                Body::from_stream(passthrough_responses_stream(upstream_response.bytes_stream()))
+            }
+        };
 
-    let body = Body::from_stream(response_stream);
-    (
-        StatusCode::OK,
-        [
-            (CONTENT_TYPE, HeaderValue::from_static("text/event-stream")),
-            (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
-            (
-                HeaderName::from_static("x-accel-buffering"),
-                HeaderValue::from_static("no"),
-            ),
-        ],
-        body,
-    )
-        .into_response()
+        return (
+            StatusCode::OK,
+            [
+                (CONTENT_TYPE, HeaderValue::from_static("text/event-stream")),
+                (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+                (
+                    HeaderName::from_static("x-accel-buffering"),
+                    HeaderValue::from_static("no"),
+                ),
+            ],
+            body,
+        )
+            .into_response();
+    }
+
+    let upstream_json = match upstream_response.json::<Value>().await {
+        Ok(v) => v,
+        Err(err) => {
+            return json_error_response(
+                "upstream_decode_error",
+                &format!("failed to decode upstream JSON: {err}"),
+            )
+        }
+    };
+
+    let response_json = match state.upstream_wire {
+        WireApi::Chat => chat_json_to_responses_json(upstream_json, response_id),
+        WireApi::Responses => upstream_json,
+    };
+
+    json_success_response(response_json)
 }
 
-fn translate_upstream_stream<S>(
+fn stream_default_for_api(incoming_api: IncomingApi) -> bool {
+    match incoming_api {
+        IncomingApi::Responses => true,
+        IncomingApi::Chat => false,
+    }
+}
+
+fn stream_flag_for_request(incoming_api: IncomingApi, request: &Value) -> bool {
+    request
+        .get("stream")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| stream_default_for_api(incoming_api))
+}
+
+fn apply_request_filters(
+    incoming_api: IncomingApi,
+    request: &mut Value,
+    drop_tool_types: &HashSet<String>,
+) {
+    let Some(obj) = request.as_object_mut() else {
+        return;
+    };
+
+    let Some(tools) = obj.get_mut("tools") else {
+        return;
+    };
+
+    let Some(items) = tools.as_array_mut() else {
+        return;
+    };
+
+    items.retain(|tool| {
+        let tool_type = match incoming_api {
+            IncomingApi::Responses => tool.get("type").and_then(Value::as_str),
+            IncomingApi::Chat => tool.get("type").and_then(Value::as_str),
+        };
+        !tool_type.is_some_and(|t| drop_tool_types.contains(t))
+    });
+
+    if items.is_empty() {
+        obj.remove("tools");
+        obj.remove("tool_choice");
+    }
+}
+
+fn build_upstream_payload(
+    request: &Value,
+    incoming_api: IncomingApi,
+    upstream_wire: WireApi,
+    stream: bool,
+) -> Result<Value> {
+    let mut payload = match (incoming_api, upstream_wire) {
+        (IncomingApi::Responses, WireApi::Responses) => request.clone(),
+        (IncomingApi::Responses, WireApi::Chat) => {
+            map_responses_to_chat_request_with_stream(request, &HashSet::new(), stream)?.chat_request
+        }
+        (IncomingApi::Chat, WireApi::Chat) => request.clone(),
+        (IncomingApi::Chat, WireApi::Responses) => map_chat_to_responses_request(request, stream)?,
+    };
+    set_stream_flag(&mut payload, stream);
+    Ok(payload)
+}
+
+fn set_stream_flag(payload: &mut Value, stream: bool) {
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("stream".to_string(), Value::Bool(stream));
+    }
+}
+
+fn passthrough_responses_stream<S>(
+    upstream_stream: S,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    stream! {
+        let mut upstream_stream = Box::pin(upstream_stream);
+        while let Some(chunk_result) = upstream_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => yield Ok(chunk),
+                Err(err) => {
+                    yield Ok(sse_event(
+                        "response.failed",
+                        &json!({
+                            "type": "response.failed",
+                            "response": {
+                                "error": {
+                                    "code": "upstream_stream_error",
+                                    "message": err.to_string(),
+                                }
+                            }
+                        }),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+fn translate_chat_stream<S>(
     upstream_stream: S,
     response_id: String,
 ) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
@@ -707,9 +893,279 @@ fn sse_error_response(code: &str, message: &str) -> Response {
         .into_response()
 }
 
+fn error_response_for_stream(stream: bool, code: &str, message: &str) -> Response {
+    if stream {
+        sse_error_response(code, message)
+    } else {
+        json_error_response(code, message)
+    }
+}
+
+fn json_success_response(payload: Value) -> Response {
+    let body = serde_json::to_vec(&payload).unwrap_or_else(|_| b"{}".to_vec());
+    (
+        StatusCode::OK,
+        [(CONTENT_TYPE, HeaderValue::from_static("application/json"))],
+        body,
+    )
+        .into_response()
+}
+
+fn json_error_response(code: &str, message: &str) -> Response {
+    json_success_response(json!({
+        "error": {
+            "type": code,
+            "message": message,
+        }
+    }))
+}
+
+fn map_chat_to_responses_request(request: &Value, stream: bool) -> Result<Value> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing `model`"))?;
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing `messages` array"))?;
+
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+
+        if role == "tool" {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let output = message
+                .get("content")
+                .map(function_output_to_text)
+                .unwrap_or_default();
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }));
+            continue;
+        }
+
+        let content = chat_message_content_to_input_items(message.get("content"));
+        if content.is_empty() {
+            continue;
+        }
+
+        input.push(json!({
+            "type": "message",
+            "role": role,
+            "content": content,
+        }));
+    }
+
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|v| normalize_responses_tools(v.clone()))
+        .unwrap_or_default();
+    let tool_choice = request
+        .get("tool_choice")
+        .cloned()
+        .map(normalize_responses_tool_choice)
+        .unwrap_or_else(|| Value::String("auto".to_string()));
+    let parallel_tool_calls = request
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut out = json!({
+        "model": model,
+        "input": input,
+        "stream": stream,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": parallel_tool_calls,
+    });
+
+    if out
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        if let Some(obj) = out.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+    }
+
+    Ok(out)
+}
+
+fn normalize_responses_tools(tools: Vec<Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter_map(|tool| {
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                return Some(tool);
+            }
+
+            if tool.get("function").is_none() {
+                return Some(tool);
+            }
+
+            let function = tool.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?.to_string();
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let parameters = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            }))
+        })
+        .collect()
+}
+
+fn normalize_responses_tool_choice(choice: Value) -> Value {
+    if let Some(obj) = choice.as_object()
+        && obj.get("type").and_then(Value::as_str) == Some("function")
+        && let Some(name) = obj
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "name": name,
+        });
+    }
+    choice
+}
+
+fn chat_message_content_to_input_items(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) => {
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type":"input_text","text":text})]
+            }
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    return Some(json!({"type":"input_text","text":text}));
+                }
+                item.get("content")
+                    .and_then(Value::as_str)
+                    .map(|text| json!({"type":"input_text","text":text}))
+            })
+            .collect(),
+        Some(other) => {
+            let as_text = other.to_string();
+            if as_text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type":"input_text","text":as_text})]
+            }
+        }
+        None => Vec::new(),
+    }
+}
+
+fn chat_json_to_responses_json(chat: Value, response_id: String) -> Value {
+    let mut output_items = Vec::new();
+
+    if let Some(choice) = chat
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    {
+        if let Some(message) = choice.get("message") {
+            let text = message
+                .get("content")
+                .map(function_output_to_text)
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                output_items.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type":"output_text","text": text}],
+                }));
+            }
+
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for tc in tool_calls {
+                    let call_id = tc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                    let function = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_function");
+                    let arguments = function
+                        .get("arguments")
+                        .map(function_arguments_to_text)
+                        .unwrap_or_else(|| "{}".to_string());
+
+                    output_items.push(json!({
+                        "type":"function_call",
+                        "name": name,
+                        "arguments": arguments,
+                        "call_id": call_id,
+                    }));
+                }
+            }
+        }
+    }
+
+    let usage_json = chat.get("usage").map(|usage| {
+        json!({
+            "input_tokens": usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
+            "input_tokens_details": null,
+            "output_tokens": usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
+            "output_tokens_details": null,
+            "total_tokens": usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+        })
+    });
+
+    json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": output_items,
+        "usage": usage_json,
+    })
+}
+
 fn map_responses_to_chat_request(
     request: &Value,
     drop_tool_types: &HashSet<String>,
+) -> Result<BridgeRequest> {
+    map_responses_to_chat_request_with_stream(request, drop_tool_types, true)
+}
+
+fn map_responses_to_chat_request_with_stream(
+    request: &Value,
+    drop_tool_types: &HashSet<String>,
+    stream: bool,
 ) -> Result<BridgeRequest> {
     let model = request
         .get("model")
@@ -860,17 +1316,21 @@ fn map_responses_to_chat_request(
     let chat_tools = normalize_chat_tools(tools, drop_tool_types);
     let chat_tool_choice = normalize_tool_choice(tool_choice);
 
-    let response_id = format!("resp_bridge_{}", Uuid::now_v7());
-
     let mut chat_request = json!({
         "model": model,
         "messages": messages,
-        "stream": true,
+        "stream": stream,
         "stream_options": { "include_usage": true },
         "tools": chat_tools,
         "tool_choice": chat_tool_choice,
         "parallel_tool_calls": parallel_tool_calls,
     });
+
+    if !stream
+        && let Some(obj) = chat_request.as_object_mut()
+    {
+        obj.remove("stream_options");
+    }
 
     if chat_request
         .get("tools")
@@ -883,10 +1343,7 @@ fn map_responses_to_chat_request(
         }
     }
 
-    Ok(BridgeRequest {
-        chat_request,
-        response_id,
-    })
+    Ok(BridgeRequest { chat_request })
 }
 
 fn flatten_content_items(items: &[Value]) -> String {
@@ -1286,7 +1743,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
              data: [DONE]\n\n",
         ))]);
-        let mut output = Box::pin(translate_upstream_stream(upstream, "resp_1".to_string()));
+        let mut output = Box::pin(translate_chat_stream(upstream, "resp_1".to_string()));
         let mut payload = String::new();
 
         while let Some(event) = output.next().await {
@@ -1309,6 +1766,7 @@ mod tests {
             host: Some("0.0.0.0".to_string()),
             port: Some(9999),
             upstream_url: None,
+            upstream_wire: None,
             api_key_env: Some("CLI_API_KEY".to_string()),
             server_info: None,
             http_shutdown: true,
@@ -1319,6 +1777,7 @@ mod tests {
             host: Some("127.0.0.1".to_string()),
             port: Some(8787),
             upstream_url: Some("https://example.com/v1/chat/completions".to_string()),
+            upstream_wire: None,
             api_key_env: Some("FILE_API_KEY".to_string()),
             server_info: Some(PathBuf::from("/tmp/server.json")),
             http_shutdown: Some(false),
@@ -1346,6 +1805,7 @@ mod tests {
             host: None,
             port: None,
             upstream_url: None,
+            upstream_wire: None,
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
@@ -1370,5 +1830,61 @@ mod tests {
     fn resolve_config_path_prefers_cli_value() {
         let path = resolve_config_path(Some(PathBuf::from("/tmp/custom.toml"))).expect("ok");
         assert_eq!(path, PathBuf::from("/tmp/custom.toml"));
+    }
+
+    #[test]
+    fn resolve_config_defaults_upstream_url_by_wire() {
+        let args = Args {
+            config: None,
+            host: None,
+            port: None,
+            upstream_url: None,
+            upstream_wire: Some(WireApi::Responses),
+            api_key_env: None,
+            server_info: None,
+            http_shutdown: false,
+            verbose_logging: false,
+            drop_tool_types: vec![],
+        };
+
+        let resolved = resolve_config(args, None);
+        assert_eq!(resolved.upstream_wire, WireApi::Responses);
+        assert_eq!(resolved.upstream_url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn apply_request_filters_drops_tool_type_for_chat_input() {
+        let mut request = json!({
+            "model": "gpt-4.1",
+            "tools": [
+                {"type":"web_search_preview"},
+                {"type":"function","function":{"name":"f","parameters":{"type":"object"}}}
+            ],
+            "tool_choice": "auto"
+        });
+        let mut drop = HashSet::new();
+        drop.insert("web_search_preview".to_string());
+
+        apply_request_filters(IncomingApi::Chat, &mut request, &drop);
+        let tools = request["tools"].as_array().expect("tools");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], "function");
+    }
+
+    #[test]
+    fn map_chat_to_responses_request_converts_messages() {
+        let chat = json!({
+            "model": "gpt-4.1",
+            "messages": [
+                {"role":"user","content":"hello"}
+            ],
+            "stream": false
+        });
+
+        let out = map_chat_to_responses_request(&chat, false).expect("ok");
+        assert_eq!(out["model"], "gpt-4.1");
+        assert_eq!(out["stream"], false);
+        assert_eq!(out["input"][0]["type"], "message");
+        assert_eq!(out["input"][0]["content"][0]["text"], "hello");
     }
 }

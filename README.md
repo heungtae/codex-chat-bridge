@@ -1,6 +1,6 @@
 # codex-chat-bridge
 
-`codex-chat-bridge` lets Codex keep using the Responses wire API while forwarding requests to an OpenAI-compatible `/v1/chat/completions` upstream.
+`codex-chat-bridge` accepts Responses/Chat requests, applies request filtering, and forwards them to an OpenAI-compatible upstream (`/v1/chat/completions` or `/v1/responses`).
 
 This is intended for "no core source change" integration: run this bridge locally, then override `model_provider` to point Codex at the bridge.
 
@@ -22,9 +22,11 @@ npm install -g @heungtae/codex-chat-bridge
 
 ## What it does
 
-- Accepts `POST /v1/responses`
-- Translates request payload into `POST /v1/chat/completions`
-- Streams upstream Chat Completions chunks back as Responses-style SSE events:
+- Accepts `POST /v1/responses` and `POST /v1/chat/completions`
+- Filters request payloads (`drop_tool_types`) before upstream forwarding
+- Supports selectable upstream wire via `--upstream-wire chat|responses`
+- Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
+- For chat upstream streaming, emits Responses-style SSE events:
   - `response.created`
   - `response.output_item.added` (assistant text starts; only emitted when text delta exists)
   - `response.output_text.delta`
@@ -76,6 +78,7 @@ scripts/run_codex_with_bridge.sh "Summarize this repo."
 Defaults:
 - `API_KEY_ENV=OPENAI_API_KEY`
 - `UPSTREAM_URL=https://api.openai.com/v1/chat/completions`
+- `UPSTREAM_WIRE=chat`
 - The script does not force `model`; pass it as extra args when needed (for example: `--model gpt-4.1`).
 
 ## Package Scripts
@@ -88,5 +91,6 @@ npm run pack:check
 ## Endpoints
 
 - `POST /v1/responses`
+- `POST /v1/chat/completions`
 - `GET /healthz`
 - `GET /shutdown` (only when `--http-shutdown` is enabled)
