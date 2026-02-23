@@ -6,9 +6,32 @@ This is intended for "no core source change" integration: run this bridge locall
 
 Detailed guide: `USAGE.md`
 
-## Install with npm
+## Prerequisites (before `npm install`)
 
-Node.js 20+ and Rust/Cargo are required because npm installation compiles the Rust binary locally.
+`npm install` runs a `postinstall` step that compiles the Rust binary locally (`cargo build --release`).
+Prepare the following first:
+
+- Node.js `20+`
+- npm
+- Rust toolchain (`rustup`, `rustc`, `cargo`) on `PATH`
+- Network access to npm and crates.io (or your internal mirrors/registries)
+
+Quick checks:
+
+```bash
+node --version
+npm --version
+rustc --version
+cargo --version
+```
+
+Runtime-only setup (not required for install): set your upstream API key environment variable before running the bridge, for example:
+
+```bash
+export OPENAI_API_KEY=<your-api-key>
+```
+
+## Install with npm
 
 ```bash
 npm install @heungtae/codex-chat-bridge
