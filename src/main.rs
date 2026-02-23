@@ -50,6 +50,14 @@ enum IncomingApi {
     Chat,
 }
 
+const FORWARDED_UPSTREAM_HEADERS: [&str; 5] = [
+    "openai-organization",
+    "openai-project",
+    "x-openai-subagent",
+    "x-codex-turn-state",
+    "x-codex-turn-metadata",
+];
+
 #[derive(Debug, Clone, Parser)]
 #[command(
     name = "codex-chat-bridge",
@@ -458,6 +466,20 @@ async fn handle_incoming(
         };
 
     if state.verbose_logging {
+        if let Some(messages) = upstream_messages_for_logging(state.upstream_wire, &upstream_payload) {
+            info!(
+                "upstream messages ({:?}->{:?}): {}",
+                incoming_api, state.upstream_wire, messages
+            );
+        }
+
+        info!(
+            "upstream headers ({:?}->{:?}): {}",
+            incoming_api,
+            state.upstream_wire,
+            upstream_headers_for_logging(&headers, &state.api_key)
+        );
+
         info!(
             "upstream payload ({:?}->{:?}): {}",
             incoming_api, state.upstream_wire, upstream_payload
@@ -471,13 +493,7 @@ async fn handle_incoming(
         .header(CONTENT_TYPE, "application/json")
         .json(&upstream_payload);
 
-    for header_name in [
-        "openai-organization",
-        "openai-project",
-        "x-openai-subagent",
-        "x-codex-turn-state",
-        "x-codex-turn-metadata",
-    ] {
+    for header_name in FORWARDED_UPSTREAM_HEADERS {
         if let Some(value) = headers.get(header_name) {
             upstream_request = upstream_request.header(header_name, value.clone());
         }
@@ -625,6 +641,55 @@ fn build_upstream_payload(
 fn set_stream_flag(payload: &mut Value, stream: bool) {
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("stream".to_string(), Value::Bool(stream));
+    }
+}
+
+fn upstream_messages_for_logging(upstream_wire: WireApi, payload: &Value) -> Option<Value> {
+    match upstream_wire {
+        WireApi::Chat => payload.get("messages").cloned(),
+        WireApi::Responses => payload
+            .get("input")
+            .and_then(Value::as_array)
+            .map(|items| {
+                let messages = items
+                    .iter()
+                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+                    .cloned()
+                    .collect();
+                Value::Array(messages)
+            }),
+    }
+}
+
+fn upstream_headers_for_logging(headers: &HeaderMap, api_key: &str) -> Value {
+    let mut out = serde_json::Map::new();
+    out.insert(
+        "authorization".to_string(),
+        Value::String(format!("Bearer {}", redact_for_logging(api_key))),
+    );
+    out.insert(
+        CONTENT_TYPE.as_str().to_string(),
+        Value::String("application/json".to_string()),
+    );
+
+    for header_name in FORWARDED_UPSTREAM_HEADERS {
+        if let Some(value) = headers.get(header_name) {
+            let header_value = value
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|_| "<non-utf8>".to_string());
+            out.insert(header_name.to_string(), Value::String(header_value));
+        }
+    }
+
+    Value::Object(out)
+}
+
+fn redact_for_logging(secret: &str) -> &'static str {
+    if secret.is_empty() {
+        "<empty>"
+    } else {
+        "<redacted>"
     }
 }
 
@@ -1886,5 +1951,60 @@ mod tests {
         assert_eq!(out["stream"], false);
         assert_eq!(out["input"][0]["type"], "message");
         assert_eq!(out["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn upstream_messages_for_logging_reads_chat_messages() {
+        let payload = json!({
+            "model": "gpt-4.1",
+            "messages": [
+                {"role":"user","content":"hi"},
+                {"role":"assistant","content":"hello"}
+            ]
+        });
+
+        let out = upstream_messages_for_logging(WireApi::Chat, &payload).expect("messages");
+        let messages = out.as_array().expect("array");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn upstream_messages_for_logging_filters_responses_input_items() {
+        let payload = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]},
+                {"type":"function_call_output","call_id":"call_1","output":"ok"}
+            ]
+        });
+
+        let out = upstream_messages_for_logging(WireApi::Responses, &payload).expect("messages");
+        let messages = out.as_array().expect("array");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["type"], "message");
+        assert_eq!(messages[0]["role"], "user");
+    }
+
+    #[test]
+    fn upstream_headers_for_logging_includes_forwarded_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("openai-organization", HeaderValue::from_static("org_123"));
+        headers.insert("x-openai-subagent", HeaderValue::from_static("subagent_1"));
+
+        let out = upstream_headers_for_logging(&headers, "sk-test");
+        assert_eq!(out["authorization"], "Bearer <redacted>");
+        assert_eq!(out["content-type"], "application/json");
+        assert_eq!(out["openai-organization"], "org_123");
+        assert_eq!(out["x-openai-subagent"], "subagent_1");
+    }
+
+    #[test]
+    fn upstream_headers_for_logging_marks_empty_api_key() {
+        let headers = HeaderMap::new();
+
+        let out = upstream_headers_for_logging(&headers, "");
+        assert_eq!(out["authorization"], "Bearer <empty>");
+        assert_eq!(out["content-type"], "application/json");
     }
 }
