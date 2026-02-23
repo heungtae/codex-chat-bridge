@@ -23,9 +23,11 @@
     "USAGE.md"
   ],
   "scripts": {
-    "build:bridge": "cargo build --release --bin codex-chat-bridge",
+    "sync:version": "node scripts/sync-version-from-cargo.cjs",
+    "build:bridge": "npm run sync:version && cargo build --release --bin codex-chat-bridge",
     "postinstall": "node scripts/postinstall-build.cjs",
     "start": "node bin/codex-chat-bridge.js",
+    "prepack": "npm run sync:version",
     "pack:check": "npm pack --dry-run"
   },
   "dependencies": {
