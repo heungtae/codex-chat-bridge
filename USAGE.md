@@ -90,6 +90,7 @@ npx @heungtae/codex-chat-bridge --config /path/to/conf.toml
 - `--api-key-env`: 업스트림 호출에 쓸 API 키 환경변수 이름
 - `--upstream-url`: 업스트림 endpoint URL
 - `--upstream-wire <chat|responses>`: 업스트림 wire 선택 (기본: `chat`)
+- `--upstream-http-header <NAME=VALUE>`: 업스트림 고정 헤더 추가 (반복 가능)
 - `--server-info <FILE>`: 시작 시 포트/프로세스 정보 JSON 저장
 - `--http-shutdown`: `GET /shutdown` 허용
 
@@ -349,6 +350,7 @@ codex
 | `host` | 선택 | 브리지 수신 IP |
 | `port` | 선택 | 브리지 수신 포트 (미지정 시 랜덤) |
 | `upstream_url` | 필수(실질) | 변환 후 요청을 보낼 chat endpoint |
+| `upstream_http_headers` | 선택 | 업스트림 요청에 항상 추가할 헤더 맵 (`{ "x-key" = "value" }`, alias: `http_headers`) |
 | `api_key_env` | 필수 | 브리지가 읽는 토큰 환경변수 이름 |
 | `server_info` | 선택 | 포트/PID 파일 출력 |
 | `http_shutdown` | 선택 | HTTP 종료 엔드포인트 허용 |

@@ -50,6 +50,12 @@ enum IncomingApi {
     Chat,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UpstreamHeader {
+    name: String,
+    value: String,
+}
+
 const FORWARDED_UPSTREAM_HEADERS: [&str; 5] = [
     "openai-organization",
     "openai-project",
@@ -84,6 +90,15 @@ struct Args {
     #[arg(long, value_enum)]
     upstream_wire: Option<WireApi>,
 
+    #[arg(
+        long = "upstream-http-header",
+        value_name = "NAME=VALUE",
+        action = clap::ArgAction::Append,
+        value_parser = parse_upstream_http_header_arg,
+        help = "add static header sent to upstream requests; can be repeated"
+    )]
+    upstream_http_headers: Vec<UpstreamHeader>,
+
     #[arg(long)]
     api_key_env: Option<String>,
 
@@ -111,6 +126,8 @@ struct FileConfig {
     port: Option<u16>,
     upstream_url: Option<String>,
     upstream_wire: Option<WireApi>,
+    #[serde(alias = "http_headers")]
+    upstream_http_headers: Option<BTreeMap<String, String>>,
     api_key_env: Option<String>,
     server_info: Option<PathBuf>,
     http_shutdown: Option<bool>,
@@ -124,6 +141,7 @@ struct ResolvedConfig {
     port: Option<u16>,
     upstream_url: String,
     upstream_wire: WireApi,
+    upstream_http_headers: Vec<UpstreamHeader>,
     api_key_env: String,
     server_info: Option<PathBuf>,
     http_shutdown: bool,
@@ -139,6 +157,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # port = 8787
 # upstream_url = "https://api.openai.com/v1/chat/completions"
 # upstream_wire = "chat" # chat | responses
+# upstream_http_headers = { "openai-organization" = "org_123", "x-custom-header" = "value" }
 # api_key_env = "OPENAI_API_KEY"
 # server_info = "/tmp/codex-chat-bridge-info.json"
 # http_shutdown = false
@@ -151,6 +170,7 @@ struct AppState {
     client: Client,
     upstream_url: String,
     upstream_wire: WireApi,
+    upstream_http_headers: Vec<UpstreamHeader>,
     api_key: String,
     http_shutdown: bool,
     verbose_logging: bool,
@@ -256,7 +276,7 @@ async fn main() -> Result<()> {
     let config_path = resolve_config_path(args.config.clone())?;
     ensure_default_config_file(&config_path)?;
     let file_config = load_file_config(&config_path)?;
-    let config = resolve_config(args, file_config);
+    let config = resolve_config(args, file_config)?;
 
     let api_key = std::env::var(&config.api_key_env)
         .ok()
@@ -271,6 +291,7 @@ async fn main() -> Result<()> {
         client,
         upstream_url: config.upstream_url.clone(),
         upstream_wire: config.upstream_wire,
+        upstream_http_headers: config.upstream_http_headers,
         api_key,
         http_shutdown: config.http_shutdown,
         verbose_logging: config.verbose_logging,
@@ -343,7 +364,7 @@ fn ensure_default_config_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig {
+fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<ResolvedConfig> {
     let file_config = file_config.unwrap_or_default();
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
     drop_tool_types.extend(args.drop_tool_types);
@@ -352,8 +373,18 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
         .upstream_wire
         .or(file_config.upstream_wire)
         .unwrap_or(WireApi::Chat);
+    let mut upstream_http_headers = Vec::new();
+    for (name, value) in file_config.upstream_http_headers.unwrap_or_default() {
+        upsert_upstream_http_header(
+            &mut upstream_http_headers,
+            validate_upstream_http_header(name, value)?,
+        );
+    }
+    for header in args.upstream_http_headers {
+        upsert_upstream_http_header(&mut upstream_http_headers, header);
+    }
 
-    ResolvedConfig {
+    Ok(ResolvedConfig {
         host: args
             .host
             .or(file_config.host)
@@ -364,6 +395,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
             .or(file_config.upstream_url)
             .unwrap_or_else(|| default_upstream_url(upstream_wire)),
         upstream_wire,
+        upstream_http_headers,
         api_key_env: args
             .api_key_env
             .or(file_config.api_key_env)
@@ -372,6 +404,42 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> ResolvedConfig
         http_shutdown: args.http_shutdown || file_config.http_shutdown.unwrap_or(false),
         verbose_logging: args.verbose_logging || file_config.verbose_logging.unwrap_or(false),
         drop_tool_types,
+    })
+}
+
+fn parse_upstream_http_header_arg(raw: &str) -> std::result::Result<UpstreamHeader, String> {
+    let (name, value) = raw
+        .split_once('=')
+        .ok_or_else(|| "expected NAME=VALUE format".to_string())?;
+    validate_upstream_http_header(name.to_string(), value.to_string()).map_err(|e| e.to_string())
+}
+
+fn validate_upstream_http_header(name: String, value: String) -> Result<UpstreamHeader> {
+    let name = name.trim();
+    if name.is_empty() {
+        return Err(anyhow!("upstream header name must not be empty"));
+    }
+    HeaderName::from_bytes(name.as_bytes())
+        .map_err(|err| anyhow!("invalid upstream header name `{name}`: {err}"))?;
+
+    let value = value.trim().to_string();
+    HeaderValue::from_str(&value)
+        .map_err(|err| anyhow!("invalid upstream header value for `{name}`: {err}"))?;
+
+    Ok(UpstreamHeader {
+        name: name.to_string(),
+        value,
+    })
+}
+
+fn upsert_upstream_http_header(headers: &mut Vec<UpstreamHeader>, new_header: UpstreamHeader) {
+    if let Some(existing) = headers
+        .iter_mut()
+        .find(|h| h.name.eq_ignore_ascii_case(&new_header.name))
+    {
+        *existing = new_header;
+    } else {
+        headers.push(new_header);
     }
 }
 
@@ -477,7 +545,7 @@ async fn handle_incoming(
             "upstream headers ({:?}->{:?}): {}",
             incoming_api,
             state.upstream_wire,
-            upstream_headers_for_logging(&headers, &state.api_key)
+            upstream_headers_for_logging(&headers, &state.api_key, &state.upstream_http_headers)
         );
 
         info!(
@@ -497,6 +565,9 @@ async fn handle_incoming(
         if let Some(value) = headers.get(header_name) {
             upstream_request = upstream_request.header(header_name, value.clone());
         }
+    }
+    for header in &state.upstream_http_headers {
+        upstream_request = upstream_request.header(&header.name, &header.value);
     }
 
     let upstream_response = match upstream_request.send().await {
@@ -661,7 +732,11 @@ fn upstream_messages_for_logging(upstream_wire: WireApi, payload: &Value) -> Opt
     }
 }
 
-fn upstream_headers_for_logging(headers: &HeaderMap, api_key: &str) -> Value {
+fn upstream_headers_for_logging(
+    headers: &HeaderMap,
+    api_key: &str,
+    upstream_http_headers: &[UpstreamHeader],
+) -> Value {
     let mut out = serde_json::Map::new();
     out.insert(
         "authorization".to_string(),
@@ -681,8 +756,24 @@ fn upstream_headers_for_logging(headers: &HeaderMap, api_key: &str) -> Value {
             out.insert(header_name.to_string(), Value::String(header_value));
         }
     }
+    for header in upstream_http_headers {
+        let header_name = header.name.to_ascii_lowercase();
+        let header_value = if is_sensitive_upstream_header(&header_name) {
+            redact_for_logging(&header.value).to_string()
+        } else {
+            header.value.clone()
+        };
+        out.insert(header_name, Value::String(header_value));
+    }
 
     Value::Object(out)
+}
+
+fn is_sensitive_upstream_header(name: &str) -> bool {
+    name.eq_ignore_ascii_case("authorization")
+        || name.eq_ignore_ascii_case("proxy-authorization")
+        || name.eq_ignore_ascii_case("x-api-key")
+        || name.eq_ignore_ascii_case("api-key")
 }
 
 fn redact_for_logging(secret: &str) -> &'static str {
@@ -1832,6 +1923,8 @@ mod tests {
             port: Some(9999),
             upstream_url: None,
             upstream_wire: None,
+            upstream_http_headers: vec![parse_upstream_http_header_arg("x-trace-id=cli")
+                .expect("valid header")],
             api_key_env: Some("CLI_API_KEY".to_string()),
             server_info: None,
             http_shutdown: true,
@@ -1843,6 +1936,10 @@ mod tests {
             port: Some(8787),
             upstream_url: Some("https://example.com/v1/chat/completions".to_string()),
             upstream_wire: None,
+            upstream_http_headers: Some(BTreeMap::from([(
+                "x-trace-id".to_string(),
+                "file".to_string(),
+            )])),
             api_key_env: Some("FILE_API_KEY".to_string()),
             server_info: Some(PathBuf::from("/tmp/server.json")),
             http_shutdown: Some(false),
@@ -1850,13 +1947,16 @@ mod tests {
             drop_tool_types: None,
         };
 
-        let resolved = resolve_config(args, Some(file));
+        let resolved = resolve_config(args, Some(file)).expect("ok");
         assert_eq!(resolved.host, "0.0.0.0");
         assert_eq!(resolved.port, Some(9999));
         assert_eq!(
             resolved.upstream_url,
             "https://example.com/v1/chat/completions"
         );
+        assert_eq!(resolved.upstream_http_headers.len(), 1);
+        assert_eq!(resolved.upstream_http_headers[0].name, "x-trace-id");
+        assert_eq!(resolved.upstream_http_headers[0].value, "cli");
         assert_eq!(resolved.api_key_env, "CLI_API_KEY");
         assert_eq!(resolved.server_info, Some(PathBuf::from("/tmp/server.json")));
         assert!(resolved.http_shutdown);
@@ -1871,6 +1971,7 @@ mod tests {
             port: None,
             upstream_url: None,
             upstream_wire: None,
+            upstream_http_headers: vec![],
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
@@ -1878,7 +1979,7 @@ mod tests {
             drop_tool_types: vec![],
         };
 
-        let resolved = resolve_config(args, None);
+        let resolved = resolve_config(args, None).expect("ok");
         assert_eq!(resolved.host, "127.0.0.1");
         assert_eq!(resolved.port, None);
         assert_eq!(
@@ -1905,6 +2006,7 @@ mod tests {
             port: None,
             upstream_url: None,
             upstream_wire: Some(WireApi::Responses),
+            upstream_http_headers: vec![],
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
@@ -1912,9 +2014,57 @@ mod tests {
             drop_tool_types: vec![],
         };
 
-        let resolved = resolve_config(args, None);
+        let resolved = resolve_config(args, None).expect("ok");
         assert_eq!(resolved.upstream_wire, WireApi::Responses);
         assert_eq!(resolved.upstream_url, "https://api.openai.com/v1/responses");
+    }
+
+    #[test]
+    fn parse_upstream_http_header_arg_rejects_invalid_input() {
+        let err = parse_upstream_http_header_arg("not-valid").expect_err("must fail");
+        assert!(err.contains("NAME=VALUE"));
+    }
+
+    #[test]
+    fn file_config_accepts_http_headers_alias() {
+        let parsed: FileConfig = toml::from_str("http_headers = { \"x-test\" = \"1\" }").expect("ok");
+        let headers = parsed.upstream_http_headers.expect("headers");
+        assert_eq!(headers.get("x-test"), Some(&"1".to_string()));
+    }
+
+    #[test]
+    fn resolve_config_rejects_invalid_file_upstream_http_header_name() {
+        let args = Args {
+            config: None,
+            host: None,
+            port: None,
+            upstream_url: None,
+            upstream_wire: None,
+            upstream_http_headers: vec![],
+            api_key_env: None,
+            server_info: None,
+            http_shutdown: false,
+            verbose_logging: false,
+            drop_tool_types: vec![],
+        };
+        let file = FileConfig {
+            host: None,
+            port: None,
+            upstream_url: None,
+            upstream_wire: None,
+            upstream_http_headers: Some(BTreeMap::from([(
+                "bad header".to_string(),
+                "value".to_string(),
+            )])),
+            api_key_env: None,
+            server_info: None,
+            http_shutdown: None,
+            verbose_logging: None,
+            drop_tool_types: None,
+        };
+
+        let err = resolve_config(args, Some(file)).expect_err("must fail");
+        assert!(err.to_string().contains("invalid upstream header name"));
     }
 
     #[test]
@@ -1991,19 +2141,30 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("openai-organization", HeaderValue::from_static("org_123"));
         headers.insert("x-openai-subagent", HeaderValue::from_static("subagent_1"));
+        let configured_headers = vec![
+            UpstreamHeader {
+                name: "x-custom-header".to_string(),
+                value: "hello".to_string(),
+            },
+            UpstreamHeader {
+                name: "authorization".to_string(),
+                value: "Bearer secret".to_string(),
+            },
+        ];
 
-        let out = upstream_headers_for_logging(&headers, "sk-test");
-        assert_eq!(out["authorization"], "Bearer <redacted>");
+        let out = upstream_headers_for_logging(&headers, "sk-test", &configured_headers);
+        assert_eq!(out["authorization"], "<redacted>");
         assert_eq!(out["content-type"], "application/json");
         assert_eq!(out["openai-organization"], "org_123");
         assert_eq!(out["x-openai-subagent"], "subagent_1");
+        assert_eq!(out["x-custom-header"], "hello");
     }
 
     #[test]
     fn upstream_headers_for_logging_marks_empty_api_key() {
         let headers = HeaderMap::new();
 
-        let out = upstream_headers_for_logging(&headers, "");
+        let out = upstream_headers_for_logging(&headers, "", &[]);
         assert_eq!(out["authorization"], "Bearer <empty>");
         assert_eq!(out["content-type"], "application/json");
     }

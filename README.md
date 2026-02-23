@@ -49,6 +49,7 @@ npm install -g @heungtae/codex-chat-bridge
 
 - Accepts `POST /v1/responses` and `POST /v1/chat/completions`
 - Filters request payloads (`drop_tool_types`) before upstream forwarding
+- Adds static upstream headers via `--upstream-http-header NAME=VALUE` or config map (`upstream_http_headers`, alias: `http_headers`)
 - Supports selectable upstream wire via `--upstream-wire chat|responses`
 - Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
 - For chat upstream streaming, emits Responses-style SSE events:
