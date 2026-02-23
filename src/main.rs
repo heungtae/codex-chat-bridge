@@ -16,6 +16,7 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
+use clap::ArgAction;
 use clap::Parser;
 use clap::ValueEnum;
 use futures::Stream;
@@ -56,7 +57,7 @@ struct UpstreamHeader {
     value: String,
 }
 
-const FORWARDED_UPSTREAM_HEADERS: [&str; 5] = [
+const DEFAULT_FORWARDED_UPSTREAM_HEADERS: [&str; 5] = [
     "openai-organization",
     "openai-project",
     "x-openai-subagent",
@@ -99,6 +100,14 @@ struct Args {
     )]
     upstream_http_headers: Vec<UpstreamHeader>,
 
+    #[arg(
+        long = "forward-incoming-header",
+        value_name = "NAME",
+        action = clap::ArgAction::Append,
+        help = "forward this incoming header onto the upstream request; can be repeated"
+    )]
+    forward_incoming_headers: Vec<String>,
+
     #[arg(long)]
     api_key_env: Option<String>,
 
@@ -128,6 +137,7 @@ struct FileConfig {
     upstream_wire: Option<WireApi>,
     #[serde(alias = "http_headers")]
     upstream_http_headers: Option<BTreeMap<String, String>>,
+    forward_incoming_headers: Option<Vec<String>>,
     api_key_env: Option<String>,
     server_info: Option<PathBuf>,
     http_shutdown: Option<bool>,
@@ -142,6 +152,7 @@ struct ResolvedConfig {
     upstream_url: String,
     upstream_wire: WireApi,
     upstream_http_headers: Vec<UpstreamHeader>,
+    forward_incoming_headers: Vec<String>,
     api_key_env: String,
     server_info: Option<PathBuf>,
     http_shutdown: bool,
@@ -158,6 +169,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # upstream_url = "https://api.openai.com/v1/chat/completions"
 # upstream_wire = "chat" # chat | responses
 # upstream_http_headers = { "openai-organization" = "org_123", "x-custom-header" = "value" }
+# forward_incoming_headers = ["x-codex-turn-state"]
 # api_key_env = "OPENAI_API_KEY"
 # server_info = "/tmp/codex-chat-bridge-info.json"
 # http_shutdown = false
@@ -171,6 +183,7 @@ struct AppState {
     upstream_url: String,
     upstream_wire: WireApi,
     upstream_http_headers: Vec<UpstreamHeader>,
+    forward_incoming_headers: Vec<String>,
     api_key: String,
     http_shutdown: bool,
     verbose_logging: bool,
@@ -292,6 +305,7 @@ async fn main() -> Result<()> {
         upstream_url: config.upstream_url.clone(),
         upstream_wire: config.upstream_wire,
         upstream_http_headers: config.upstream_http_headers,
+        forward_incoming_headers: config.forward_incoming_headers,
         api_key,
         http_shutdown: config.http_shutdown,
         verbose_logging: config.verbose_logging,
@@ -384,6 +398,17 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
         upsert_upstream_http_header(&mut upstream_http_headers, header);
     }
 
+    let mut forward_incoming_headers = DEFAULT_FORWARDED_UPSTREAM_HEADERS
+        .iter()
+        .map(|h| h.to_string())
+        .collect::<Vec<_>>();
+    for header in file_config.forward_incoming_headers.unwrap_or_default() {
+        upsert_forward_incoming_header(&mut forward_incoming_headers, validate_forward_incoming_header(header)?);
+    }
+    for header in args.forward_incoming_headers {
+        upsert_forward_incoming_header(&mut forward_incoming_headers, validate_forward_incoming_header(header)?);
+    }
+
     Ok(ResolvedConfig {
         host: args
             .host
@@ -396,6 +421,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
             .unwrap_or_else(|| default_upstream_url(upstream_wire)),
         upstream_wire,
         upstream_http_headers,
+        forward_incoming_headers,
         api_key_env: args
             .api_key_env
             .or(file_config.api_key_env)
@@ -436,6 +462,29 @@ fn upsert_upstream_http_header(headers: &mut Vec<UpstreamHeader>, new_header: Up
     if let Some(existing) = headers
         .iter_mut()
         .find(|h| h.name.eq_ignore_ascii_case(&new_header.name))
+    {
+        *existing = new_header;
+    } else {
+        headers.push(new_header);
+    }
+}
+
+fn validate_forward_incoming_header(name: String) -> Result<String> {
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("forwarded header name must not be empty"));
+    }
+    let normalized = trimmed.to_ascii_lowercase();
+    HeaderName::from_lowercase(normalized.as_bytes()).with_context(|| {
+        format!("invalid forwarded header name `{}`", trimmed)
+    })?;
+    Ok(normalized)
+}
+
+fn upsert_forward_incoming_header(headers: &mut Vec<String>, new_header: String) {
+    if let Some(existing) = headers
+        .iter_mut()
+        .find(|h| h.eq_ignore_ascii_case(&new_header))
     {
         *existing = new_header;
     } else {
@@ -508,6 +557,10 @@ async fn handle_incoming(
     incoming_api: IncomingApi,
 ) -> Response {
     if state.verbose_logging {
+        info!(
+            "incoming headers ({incoming_api:?}): {}",
+            headers_for_logging(&headers)
+        );
         info!("incoming request body ({incoming_api:?}): {body}");
     }
 
@@ -545,7 +598,12 @@ async fn handle_incoming(
             "upstream headers ({:?}->{:?}): {}",
             incoming_api,
             state.upstream_wire,
-            upstream_headers_for_logging(&headers, &state.api_key, &state.upstream_http_headers)
+            upstream_headers_for_logging(
+                &headers,
+                &state.api_key,
+                &state.upstream_http_headers,
+                &state.forward_incoming_headers,
+            )
         );
 
         info!(
@@ -561,7 +619,7 @@ async fn handle_incoming(
         .header(CONTENT_TYPE, "application/json")
         .json(&upstream_payload);
 
-    for header_name in FORWARDED_UPSTREAM_HEADERS {
+    for header_name in &state.forward_incoming_headers {
         if let Some(value) = headers.get(header_name) {
             upstream_request = upstream_request.header(header_name, value.clone());
         }
@@ -587,6 +645,12 @@ async fn handle_incoming(
             upstream_response.status().as_u16(),
             upstream_response.status()
         );
+        info!(
+            "upstream response headers ({:?}<-{:?}): {}",
+            incoming_api,
+            state.upstream_wire,
+            headers_for_logging(upstream_response.headers())
+        );
     }
 
     if !upstream_response.status().is_success() {
@@ -596,7 +660,7 @@ async fn handle_incoming(
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
         if state.verbose_logging {
-            info!("upstream error body: {body}");
+            info!("upstream response payload error ({:?}<-{:?}): {body}", incoming_api, state.upstream_wire);
         }
         let message = format!("upstream returned {status}: {body}");
         return error_response_for_stream(wants_stream, "upstream_error", &message);
@@ -637,6 +701,12 @@ async fn handle_incoming(
             )
         }
     };
+    if state.verbose_logging {
+        info!(
+            "upstream response payload ({:?}<-{:?}): {}",
+            incoming_api, state.upstream_wire, upstream_json
+        );
+    }
 
     let response_json = match state.upstream_wire {
         WireApi::Chat => chat_json_to_responses_json(upstream_json, response_id),
@@ -736,6 +806,7 @@ fn upstream_headers_for_logging(
     headers: &HeaderMap,
     api_key: &str,
     upstream_http_headers: &[UpstreamHeader],
+    forwarded_headers: &[String],
 ) -> Value {
     let mut out = serde_json::Map::new();
     out.insert(
@@ -747,7 +818,7 @@ fn upstream_headers_for_logging(
         Value::String("application/json".to_string()),
     );
 
-    for header_name in FORWARDED_UPSTREAM_HEADERS {
+    for header_name in forwarded_headers {
         if let Some(value) = headers.get(header_name) {
             let header_value = value
                 .to_str()
@@ -766,6 +837,33 @@ fn upstream_headers_for_logging(
         out.insert(header_name, Value::String(header_value));
     }
 
+    Value::Object(out)
+}
+
+fn headers_for_logging(headers: &HeaderMap) -> Value {
+    let mut out = serde_json::Map::new();
+    for (name, value) in headers {
+        let header_name = name.as_str().to_ascii_lowercase();
+        let header_value = if is_sensitive_upstream_header(&header_name)
+            || header_name.eq_ignore_ascii_case("cookie")
+            || header_name.eq_ignore_ascii_case("set-cookie")
+        {
+            redact_for_logging(
+                value
+                    .to_str()
+                    .ok()
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("x"),
+            )
+            .to_string()
+        } else {
+            value
+                .to_str()
+                .map(str::to_string)
+                .unwrap_or_else(|_| "<non-utf8>".to_string())
+        };
+        out.insert(header_name, Value::String(header_value));
+    }
     Value::Object(out)
 }
 
@@ -2151,8 +2249,17 @@ mod tests {
                 value: "Bearer secret".to_string(),
             },
         ];
+        let forwarded_headers = vec![
+            "openai-organization".to_string(),
+            "x-openai-subagent".to_string(),
+        ];
 
-        let out = upstream_headers_for_logging(&headers, "sk-test", &configured_headers);
+        let out = upstream_headers_for_logging(
+            &headers,
+            "sk-test",
+            &configured_headers,
+            &forwarded_headers,
+        );
         assert_eq!(out["authorization"], "<redacted>");
         assert_eq!(out["content-type"], "application/json");
         assert_eq!(out["openai-organization"], "org_123");
@@ -2164,8 +2271,21 @@ mod tests {
     fn upstream_headers_for_logging_marks_empty_api_key() {
         let headers = HeaderMap::new();
 
-        let out = upstream_headers_for_logging(&headers, "", &[]);
+        let out = upstream_headers_for_logging(&headers, "", &[], &[]);
         assert_eq!(out["authorization"], "Bearer <empty>");
         assert_eq!(out["content-type"], "application/json");
+    }
+
+    #[test]
+    fn headers_for_logging_redacts_sensitive_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", HeaderValue::from_static("Bearer sk-test"));
+        headers.insert("cookie", HeaderValue::from_static("sid=abc"));
+        headers.insert("x-trace-id", HeaderValue::from_static("trace-1"));
+
+        let out = headers_for_logging(&headers);
+        assert_eq!(out["authorization"], "<redacted>");
+        assert_eq!(out["cookie"], "<redacted>");
+        assert_eq!(out["x-trace-id"], "trace-1");
     }
 }

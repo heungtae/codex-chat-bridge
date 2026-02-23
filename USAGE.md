@@ -351,6 +351,7 @@ codex
 | `port` | 선택 | 브리지 수신 포트 (미지정 시 랜덤) |
 | `upstream_url` | 필수(실질) | 변환 후 요청을 보낼 chat endpoint |
 | `upstream_http_headers` | 선택 | 업스트림 요청에 항상 추가할 헤더 맵 (`{ "x-key" = "value" }`, alias: `http_headers`) |
+| `forward_incoming_headers` | 선택 | 업스트림 요청에 복사할 들어오는 헤더 이름 리스트 (기본: `openai-organization`, `openai-project`, `x-openai-subagent`, `x-codex-turn-state`, `x-codex-turn-metadata`) |
 | `api_key_env` | 필수 | 브리지가 읽는 토큰 환경변수 이름 |
 | `server_info` | 선택 | 포트/PID 파일 출력 |
 | `http_shutdown` | 선택 | HTTP 종료 엔드포인트 허용 |
