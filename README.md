@@ -11,9 +11,11 @@ Detailed guide: `USAGE.md`
 `npm install` runs a `postinstall` step that compiles the Rust binary locally (`cargo build --release`).
 Prepare the following first:
 
-- Node.js `20+`
-- npm
+- Node.js `>=20.0.0` (from `package.json` engines)
+- npm `>=10.0.0`
 - Rust toolchain (`rustup`, `rustc`, `cargo`) on `PATH`
+  - `rustc >=1.85.0` (`edition = "2024"` minimum)
+  - `cargo >=1.85.0`
 - Network access to npm and crates.io (or your internal mirrors/registries)
 
 Quick checks:
