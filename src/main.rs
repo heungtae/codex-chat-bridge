@@ -671,10 +671,12 @@ async fn handle_incoming(
             WireApi::Chat => Body::from_stream(translate_chat_stream(
                 upstream_response.bytes_stream(),
                 response_id,
+                state.verbose_logging,
             )),
-            WireApi::Responses => {
-                Body::from_stream(passthrough_responses_stream(upstream_response.bytes_stream()))
-            }
+            WireApi::Responses => Body::from_stream(passthrough_responses_stream(
+                upstream_response.bytes_stream(),
+                state.verbose_logging,
+            )),
         };
 
         return (
@@ -884,6 +886,7 @@ fn redact_for_logging(secret: &str) -> &'static str {
 
 fn passthrough_responses_stream<S>(
     upstream_stream: S,
+    verbose_logging: bool,
 ) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -892,7 +895,15 @@ where
         let mut upstream_stream = Box::pin(upstream_stream);
         while let Some(chunk_result) = upstream_stream.next().await {
             match chunk_result {
-                Ok(chunk) => yield Ok(chunk),
+                Ok(chunk) => {
+                    if verbose_logging {
+                        info!(
+                            "upstream response payload stream chunk (responses): {}",
+                            String::from_utf8_lossy(&chunk)
+                        );
+                    }
+                    yield Ok(chunk)
+                },
                 Err(err) => {
                     yield Ok(sse_event(
                         "response.failed",
@@ -916,6 +927,7 @@ where
 fn translate_chat_stream<S>(
     upstream_stream: S,
     response_id: String,
+    verbose_logging: bool,
 ) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -956,6 +968,13 @@ where
                     return;
                 }
             };
+
+            if verbose_logging {
+                info!(
+                    "upstream response payload stream chunk (chat): {}",
+                    String::from_utf8_lossy(&chunk)
+                );
+            }
 
             let text = String::from_utf8_lossy(&chunk);
             let events = parser.feed(&text);
@@ -1997,7 +2016,7 @@ mod tests {
             "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
              data: [DONE]\n\n",
         ))]);
-        let mut output = Box::pin(translate_chat_stream(upstream, "resp_1".to_string()));
+        let mut output = Box::pin(translate_chat_stream(upstream, "resp_1".to_string(), false));
         let mut payload = String::new();
 
         while let Some(event) = output.next().await {
