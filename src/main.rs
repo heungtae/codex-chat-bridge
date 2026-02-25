@@ -6,6 +6,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::body::Bytes;
 use axum::extract::State;
+use axum::extract::Json;
 use axum::http::HeaderMap;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
@@ -16,7 +17,6 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
-use clap::ArgAction;
 use clap::Parser;
 use clap::ValueEnum;
 use futures::Stream;
@@ -34,11 +34,12 @@ use std::io::Write;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
 
-#[derive(Debug, Clone, Copy, Deserialize, ValueEnum, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, ValueEnum, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 enum WireApi {
     Chat,
@@ -127,6 +128,12 @@ struct Args {
         help = "drop tool entries whose `type` matches this value; can be repeated"
     )]
     drop_tool_types: Vec<String>,
+
+    #[arg(long, help = "use profile from config file")]
+    profile: Option<String>,
+
+    #[arg(long, help = "list available profiles from config file and exit")]
+    list_profiles: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -142,6 +149,17 @@ struct FileConfig {
     server_info: Option<PathBuf>,
     http_shutdown: Option<bool>,
     verbose_logging: Option<bool>,
+    drop_tool_types: Option<Vec<String>>,
+    profiles: Option<BTreeMap<String, ProfileConfig>>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct ProfileConfig {
+    upstream_url: Option<String>,
+    upstream_wire: Option<WireApi>,
+    #[serde(alias = "http_headers")]
+    upstream_http_headers: Option<BTreeMap<String, String>>,
+    forward_incoming_headers: Option<Vec<String>>,
     drop_tool_types: Option<Vec<String>>,
 }
 
@@ -175,19 +193,180 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # http_shutdown = false
 # verbose_logging = false
 # drop_tool_types = ["web_search", "web_search_preview"]
+
+# [profiles.default]
+# upstream_url = "https://api.openai.com/v1/chat/completions"
+# upstream_wire = "chat"
+# upstream_http_headers = {}
+# forward_incoming_headers = []
+# drop_tool_types = []
+
+# [profiles.prod]
+# upstream_url = "https://api.openai.com/v1/chat/completions"
+# upstream_wire = "responses"
+
+# [profiles.dev]
+# upstream_url = "http://localhost:8080/v1/chat/completions"
 "#;
 
 #[derive(Clone)]
 struct AppState {
     client: Client,
+    api_key: String,
+    http_shutdown: bool,
+    verbose_logging: bool,
+    profiles: Arc<RwLock<ProfileManager>>,
+}
+
+#[derive(Clone)]
+struct ProfileManager {
+    current_profile: String,
+    profiles: BTreeMap<String, ProfileConfig>,
     upstream_url: String,
     upstream_wire: WireApi,
     upstream_http_headers: Vec<UpstreamHeader>,
     forward_incoming_headers: Vec<String>,
-    api_key: String,
-    http_shutdown: bool,
-    verbose_logging: bool,
     drop_tool_types: HashSet<String>,
+}
+
+impl ProfileManager {
+    fn new(
+        profiles: BTreeMap<String, ProfileConfig>,
+        initial_profile: String,
+        default_upstream_url: String,
+        default_upstream_wire: WireApi,
+        default_upstream_http_headers: Vec<UpstreamHeader>,
+        default_forward_incoming_headers: Vec<String>,
+        default_drop_tool_types: Vec<String>,
+    ) -> Self {
+        let profile_config = profiles.get(&initial_profile);
+        
+        let upstream_url = profile_config
+            .and_then(|p| p.upstream_url.clone())
+            .unwrap_or(default_upstream_url);
+        
+        let upstream_wire = profile_config
+            .and_then(|p| p.upstream_wire)
+            .unwrap_or(default_upstream_wire);
+        
+        let mut upstream_http_headers = default_upstream_http_headers;
+        if let Some(profile_headers) = profile_config
+            .and_then(|p| p.upstream_http_headers.clone())
+        {
+            for (name, value) in profile_headers {
+                let header = UpstreamHeader {
+                    name: name.clone(),
+                    value,
+                };
+                upsert_upstream_http_header(&mut upstream_http_headers, header);
+            }
+        }
+        
+        let mut forward_incoming_headers = if default_forward_incoming_headers.is_empty() {
+            DEFAULT_FORWARDED_UPSTREAM_HEADERS
+                .iter()
+                .map(|h| h.to_string())
+                .collect::<Vec<_>>()
+        } else {
+            default_forward_incoming_headers
+        };
+        if let Some(profile_forward) = profile_config
+            .and_then(|p| p.forward_incoming_headers.clone())
+        {
+            forward_incoming_headers.clear();
+            for header in profile_forward {
+                if let Ok(validated) = validate_forward_incoming_header(header.clone()) {
+                    forward_incoming_headers.push(validated);
+                }
+            }
+        }
+        
+        let mut drop_tool_types: HashSet<String> = default_drop_tool_types.into_iter().collect();
+        if let Some(profile_drop) = profile_config
+            .and_then(|p| p.drop_tool_types.clone())
+        {
+            drop_tool_types.extend(profile_drop);
+        }
+        
+        Self {
+            current_profile: initial_profile,
+            profiles,
+            upstream_url,
+            upstream_wire,
+            upstream_http_headers,
+            forward_incoming_headers,
+            drop_tool_types,
+        }
+    }
+    
+    fn get_upstream_url(&self) -> String {
+        self.upstream_url.clone()
+    }
+    
+    fn get_upstream_wire(&self) -> WireApi {
+        self.upstream_wire
+    }
+    
+    fn get_upstream_http_headers(&self) -> Vec<UpstreamHeader> {
+        self.upstream_http_headers.clone()
+    }
+    
+    fn get_forward_incoming_headers(&self) -> Vec<String> {
+        self.forward_incoming_headers.clone()
+    }
+    
+    fn get_drop_tool_types(&self) -> HashSet<String> {
+        self.drop_tool_types.clone()
+    }
+    
+    fn get_current_profile(&self) -> String {
+        self.current_profile.clone()
+    }
+    
+    fn get_profile_names(&self) -> Vec<String> {
+        self.profiles.keys().cloned().collect()
+    }
+    
+    async fn set_profile(&mut self, name: &str) -> Result<String> {
+        let profile = self.profiles.get(name)
+            .ok_or_else(|| anyhow!("profile '{}' not found", name))?;
+        
+        if let Some(url) = profile.upstream_url.clone() {
+            self.upstream_url = url;
+        }
+        
+        if let Some(wire) = profile.upstream_wire {
+            self.upstream_wire = wire;
+        }
+        
+        if let Some(profile_headers) = profile.upstream_http_headers.clone() {
+            self.upstream_http_headers.clear();
+            for (name, value) in profile_headers {
+                let header = UpstreamHeader {
+                    name: name.clone(),
+                    value,
+                };
+                self.upstream_http_headers.push(header);
+            }
+        }
+        
+        if let Some(profile_forward) = profile.forward_incoming_headers.clone() {
+            self.forward_incoming_headers.clear();
+            for header in profile_forward {
+                if let Ok(validated) = validate_forward_incoming_header(header.clone()) {
+                    self.forward_incoming_headers.push(validated);
+                }
+            }
+        }
+        
+        if let Some(profile_drop) = profile.drop_tool_types.clone() {
+            self.drop_tool_types.extend(profile_drop);
+        }
+        
+        let old_profile = std::mem::replace(&mut self.current_profile, name.to_string());
+        info!("switched profile from '{}' to '{}'", old_profile, name);
+        Ok(format!("switched profile from '{}' to '{}'", old_profile, name))
+    }
 }
 
 #[derive(Serialize)]
@@ -289,7 +468,42 @@ async fn main() -> Result<()> {
     let config_path = resolve_config_path(args.config.clone())?;
     ensure_default_config_file(&config_path)?;
     let file_config = load_file_config(&config_path)?;
-    let config = resolve_config(args, file_config)?;
+    let config = resolve_config(args.clone(), file_config.clone())?;
+
+    let profiles = file_config
+        .as_ref()
+        .and_then(|fc| fc.profiles.clone())
+        .unwrap_or_default();
+
+    if args.list_profiles {
+        if profiles.is_empty() {
+            println!("No profiles defined in config file.");
+        } else {
+            println!("Available profiles:");
+            for name in profiles.keys() {
+                println!("  - {}", name);
+            }
+        }
+        return Ok(());
+    }
+
+    let initial_profile = args.profile.clone()
+        .or_else(|| file_config.as_ref().and_then(|fc| fc.profiles.as_ref().and_then(|p| {
+            if p.contains_key("default") {
+                Some("default".to_string())
+            } else {
+                p.keys().next().cloned()
+            }
+        })))
+        .unwrap_or_else(|| "default".to_string());
+
+    if !profiles.is_empty() && !profiles.contains_key(&initial_profile) {
+        return Err(anyhow!(
+            "profile '{}' not found. Available profiles: {:?}",
+            initial_profile,
+            profiles.keys().collect::<Vec<_>>()
+        ));
+    }
 
     let api_key = std::env::var(&config.api_key_env)
         .ok()
@@ -300,16 +514,24 @@ async fn main() -> Result<()> {
         .build()
         .context("building reqwest client")?;
 
+    let profile_manager = ProfileManager::new(
+        profiles,
+        initial_profile.clone(),
+        config.upstream_url.clone(),
+        config.upstream_wire,
+        config.upstream_http_headers,
+        config.forward_incoming_headers,
+        config.drop_tool_types,
+    );
+
+    info!("using profile: {}", profile_manager.get_current_profile());
+
     let state = Arc::new(AppState {
         client,
-        upstream_url: config.upstream_url.clone(),
-        upstream_wire: config.upstream_wire,
-        upstream_http_headers: config.upstream_http_headers,
-        forward_incoming_headers: config.forward_incoming_headers,
         api_key,
         http_shutdown: config.http_shutdown,
         verbose_logging: config.verbose_logging,
-        drop_tool_types: config.drop_tool_types.into_iter().collect(),
+        profiles: Arc::new(RwLock::new(profile_manager)),
     });
 
     let app = Router::new()
@@ -317,7 +539,10 @@ async fn main() -> Result<()> {
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/healthz", get(healthz))
         .route("/shutdown", get(shutdown))
-        .with_state(state);
+        .route("/profile", get(get_current_profile))
+        .route("/profile", post(set_profile))
+        .route("/profiles", get(list_profiles))
+        .with_state(state.clone());
 
     let bind_addr = format!("{}:{}", config.host, config.port.unwrap_or(0));
     let listener = tokio::net::TcpListener::bind(&bind_addr)
@@ -534,6 +759,52 @@ async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, "shutting down").into_response()
 }
 
+#[derive(Deserialize)]
+struct SetProfileRequest {
+    name: String,
+}
+
+async fn get_current_profile(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let profiles = state.profiles.read().await;
+    let current = profiles.get_current_profile();
+    let upstream_url = profiles.get_upstream_url();
+    let upstream_wire = profiles.get_upstream_wire();
+    
+    json_success_response(json!({
+        "current_profile": current,
+        "upstream_url": upstream_url,
+        "upstream_wire": upstream_wire,
+    }))
+}
+
+async fn set_profile(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<SetProfileRequest>,
+) -> impl IntoResponse {
+    let mut profiles = state.profiles.write().await;
+    match profiles.set_profile(&req.name).await {
+        Ok(msg) => json_success_response(json!({
+            "status": "ok",
+            "message": msg,
+            "current_profile": profiles.get_current_profile(),
+            "upstream_url": profiles.get_upstream_url(),
+            "upstream_wire": profiles.get_upstream_wire(),
+        })),
+        Err(e) => json_error_response("profile_error", &e.to_string()),
+    }
+}
+
+async fn list_profiles(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let profiles = state.profiles.read().await;
+    let profile_names = profiles.get_profile_names();
+    let current = profiles.get_current_profile();
+    
+    json_success_response(json!({
+        "profiles": profile_names,
+        "current_profile": current,
+    }))
+}
+
 async fn handle_responses(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -556,7 +827,16 @@ async fn handle_incoming(
     body: String,
     incoming_api: IncomingApi,
 ) -> Response {
-    if state.verbose_logging {
+    let profiles = state.profiles.read().await;
+    let upstream_url = profiles.get_upstream_url();
+    let upstream_wire = profiles.get_upstream_wire();
+    let upstream_http_headers = profiles.get_upstream_http_headers();
+    let forward_incoming_headers = profiles.get_forward_incoming_headers();
+    let drop_tool_types = profiles.get_drop_tool_types();
+    let verbose_logging = state.verbose_logging;
+    drop(profiles);
+
+    if verbose_logging {
         info!(
             "incoming headers ({incoming_api:?}): {}",
             headers_for_logging(&headers)
@@ -576,55 +856,55 @@ async fn handle_incoming(
     };
 
     let wants_stream = stream_flag_for_request(incoming_api, &request_value);
-    apply_request_filters(incoming_api, &mut request_value, &state.drop_tool_types);
+    apply_request_filters(incoming_api, &mut request_value, &drop_tool_types);
 
     let response_id = format!("resp_bridge_{}", Uuid::now_v7());
     let upstream_payload =
-        match build_upstream_payload(&request_value, incoming_api, state.upstream_wire, wants_stream)
+        match build_upstream_payload(&request_value, incoming_api, upstream_wire, wants_stream)
         {
             Ok(v) => v,
             Err(err) => return error_response_for_stream(wants_stream, "invalid_request", &err.to_string()),
         };
 
-    if state.verbose_logging {
-        if let Some(messages) = upstream_messages_for_logging(state.upstream_wire, &upstream_payload) {
+    if verbose_logging {
+        if let Some(messages) = upstream_messages_for_logging(upstream_wire, &upstream_payload) {
             info!(
                 "upstream messages ({:?}->{:?}): {}",
-                incoming_api, state.upstream_wire, messages
+                incoming_api, upstream_wire, messages
             );
         }
 
         info!(
             "upstream headers ({:?}->{:?}): {}",
             incoming_api,
-            state.upstream_wire,
+            upstream_wire,
             upstream_headers_for_logging(
                 &headers,
                 &state.api_key,
-                &state.upstream_http_headers,
-                &state.forward_incoming_headers,
+                &upstream_http_headers,
+                &forward_incoming_headers,
             )
         );
 
         info!(
             "upstream payload ({:?}->{:?}): {}",
-            incoming_api, state.upstream_wire, upstream_payload
+            incoming_api, upstream_wire, upstream_payload
         );
     }
 
     let mut upstream_request = state
         .client
-        .post(&state.upstream_url)
+        .post(&upstream_url)
         .bearer_auth(&state.api_key)
         .header(CONTENT_TYPE, "application/json")
         .json(&upstream_payload);
 
-    for header_name in &state.forward_incoming_headers {
+    for header_name in &forward_incoming_headers {
         if let Some(value) = headers.get(header_name) {
             upstream_request = upstream_request.header(header_name, value.clone());
         }
     }
-    for header in &state.upstream_http_headers {
+    for header in &upstream_http_headers {
         upstream_request = upstream_request.header(&header.name, &header.value);
     }
 
@@ -639,7 +919,7 @@ async fn handle_incoming(
         }
     };
 
-    if state.verbose_logging {
+    if verbose_logging {
         info!(
             "upstream response status: {} {}",
             upstream_response.status().as_u16(),
@@ -648,7 +928,7 @@ async fn handle_incoming(
         info!(
             "upstream response headers ({:?}<-{:?}): {}",
             incoming_api,
-            state.upstream_wire,
+            upstream_wire,
             headers_for_logging(upstream_response.headers())
         );
     }
@@ -659,23 +939,23 @@ async fn handle_incoming(
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
-        if state.verbose_logging {
-            info!("upstream response payload error ({:?}<-{:?}): {body}", incoming_api, state.upstream_wire);
+        if verbose_logging {
+            info!("upstream response payload error ({:?}<-{:?}): {body}", incoming_api, upstream_wire);
         }
         let message = format!("upstream returned {status}: {body}");
         return error_response_for_stream(wants_stream, "upstream_error", &message);
     }
 
     if wants_stream {
-        let body = match state.upstream_wire {
+        let body = match upstream_wire {
             WireApi::Chat => Body::from_stream(translate_chat_stream(
                 upstream_response.bytes_stream(),
                 response_id,
-                state.verbose_logging,
+                verbose_logging,
             )),
             WireApi::Responses => Body::from_stream(passthrough_responses_stream(
                 upstream_response.bytes_stream(),
-                state.verbose_logging,
+                verbose_logging,
             )),
         };
 
@@ -703,14 +983,14 @@ async fn handle_incoming(
             )
         }
     };
-    if state.verbose_logging {
+    if verbose_logging {
         info!(
             "upstream response payload ({:?}<-{:?}): {}",
-            incoming_api, state.upstream_wire, upstream_json
+            incoming_api, upstream_wire, upstream_json
         );
     }
 
-    let response_json = match state.upstream_wire {
+    let response_json = match upstream_wire {
         WireApi::Chat => chat_json_to_responses_json(upstream_json, response_id),
         WireApi::Responses => upstream_json,
     };
@@ -2042,11 +2322,14 @@ mod tests {
             upstream_wire: None,
             upstream_http_headers: vec![parse_upstream_http_header_arg("x-trace-id=cli")
                 .expect("valid header")],
+            forward_incoming_headers: vec![],
             api_key_env: Some("CLI_API_KEY".to_string()),
             server_info: None,
             http_shutdown: true,
             verbose_logging: false,
             drop_tool_types: vec![],
+            profile: None,
+            list_profiles: false,
         };
         let file = FileConfig {
             host: Some("127.0.0.1".to_string()),
@@ -2057,11 +2340,13 @@ mod tests {
                 "x-trace-id".to_string(),
                 "file".to_string(),
             )])),
+            forward_incoming_headers: None,
             api_key_env: Some("FILE_API_KEY".to_string()),
             server_info: Some(PathBuf::from("/tmp/server.json")),
             http_shutdown: Some(false),
             verbose_logging: Some(true),
             drop_tool_types: None,
+            profiles: None,
         };
 
         let resolved = resolve_config(args, Some(file)).expect("ok");
@@ -2089,11 +2374,14 @@ mod tests {
             upstream_url: None,
             upstream_wire: None,
             upstream_http_headers: vec![],
+            forward_incoming_headers: vec![],
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
             verbose_logging: false,
             drop_tool_types: vec![],
+            profile: None,
+            list_profiles: false,
         };
 
         let resolved = resolve_config(args, None).expect("ok");
@@ -2124,11 +2412,14 @@ mod tests {
             upstream_url: None,
             upstream_wire: Some(WireApi::Responses),
             upstream_http_headers: vec![],
+            forward_incoming_headers: vec![],
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
             verbose_logging: false,
             drop_tool_types: vec![],
+            profile: None,
+            list_profiles: false,
         };
 
         let resolved = resolve_config(args, None).expect("ok");
@@ -2158,11 +2449,14 @@ mod tests {
             upstream_url: None,
             upstream_wire: None,
             upstream_http_headers: vec![],
+            forward_incoming_headers: vec![],
             api_key_env: None,
             server_info: None,
             http_shutdown: false,
             verbose_logging: false,
             drop_tool_types: vec![],
+            profile: None,
+            list_profiles: false,
         };
         let file = FileConfig {
             host: None,
@@ -2173,11 +2467,13 @@ mod tests {
                 "bad header".to_string(),
                 "value".to_string(),
             )])),
+            forward_incoming_headers: None,
             api_key_env: None,
             server_info: None,
             http_shutdown: None,
             verbose_logging: None,
             drop_tool_types: None,
+            profiles: None,
         };
 
         let err = resolve_config(args, Some(file)).expect_err("must fail");

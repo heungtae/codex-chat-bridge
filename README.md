@@ -61,6 +61,53 @@ npm install -g @heungtae/codex-chat-bridge
   - `response.completed`
   - `response.failed` (for upstream/network errors)
 
+## Profiles
+
+The bridge supports multiple profiles for different upstream configurations. Define profiles in `conf.toml`:
+
+```toml
+[profiles.default]
+upstream_url = "https://api.openai.com/v1/chat/completions"
+upstream_wire = "chat"
+
+[profiles.prod]
+upstream_url = "https://api.openai.com/v1/chat/completions"
+upstream_wire = "responses"
+
+[profiles.dev]
+upstream_url = "http://localhost:8080/v1/chat/completions"
+upstream_wire = "chat"
+```
+
+Available profile options:
+- `upstream_url`: Override upstream URL for this profile
+- `upstream_wire`: Set wire API (`chat` or `responses`)
+- `upstream_http_headers`: Static headers for this profile
+- `forward_incoming_headers`: Forwarded headers for this profile
+- `drop_tool_types`: Tool types to drop for this profile
+
+### CLI Options
+
+- `--profile <name>`: Start with a specific profile
+- `--list-profiles`: List available profiles and exit
+
+### Runtime Profile Management
+
+Switch profiles at runtime via HTTP API:
+
+```bash
+# Get current profile
+curl http://127.0.0.1:8787/profile
+
+# List all profiles
+curl http://127.0.0.1:8787/profiles
+
+# Switch profile
+curl -X POST http://127.0.0.1:8787/profile \
+  -H "Content-Type: application/json" \
+  -d '{"name": "prod"}'
+```
+
 ## Run
 
 ```bash
@@ -70,6 +117,12 @@ npx @heungtae/codex-chat-bridge --port 8787 --api-key-env OPENAI_API_KEY
 By default, the bridge uses `~/.config/codex-chat-bridge/conf.toml`.
 If the file does not exist, it is created automatically with commented defaults.
 CLI flags override file values.
+
+Start with a specific profile:
+
+```bash
+codex-chat-bridge --profile prod
+```
 
 Or run the binary directly via Cargo:
 
@@ -121,3 +174,6 @@ npm run pack:check
 - `POST /v1/chat/completions`
 - `GET /healthz`
 - `GET /shutdown` (only when `--http-shutdown` is enabled)
+- `GET /profile` - Get current profile info
+- `POST /profile` - Switch profile (`{"name": "profile_name"}`)
+- `GET /profiles` - List all available profiles
