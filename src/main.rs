@@ -1952,33 +1952,33 @@ fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<String>) ->
                 return None;
             }
 
-            if tool_type != Some("function") {
-                return Some(tool);
-            }
-
-            if tool.get("function").is_some() {
-                return Some(tool);
-            }
-
-            let name = tool.get("name")?.as_str()?.to_string();
-            let description = tool
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let parameters = tool
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
-
-            Some(json!({
-                "type": "function",
-                "function": {
-                    "name": name,
-                    "description": description,
-                    "parameters": parameters,
+            if tool_type == Some("function") {
+                if tool.get("function").is_some() {
+                    return Some(tool);
                 }
-            }))
+
+                let name = tool.get("name")?.as_str()?.to_string();
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let parameters = tool
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }));
+            }
+
+            None
         })
         .collect()
 }
