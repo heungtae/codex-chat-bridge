@@ -91,6 +91,13 @@ Available profile options:
 - `--profile <name>`: Start with a specific profile
 - `--list-profiles`: List available profiles and exit
 
+When the bridge starts, it logs the active configuration at info level:
+
+```
+INFO codex_chat_bridge: using profile: default
+INFO codex_chat_bridge: config: host=127.0.0.1, port=8787, upstream_url=..., upstream_wire=Chat, ...
+```
+
 ### Runtime Profile Management
 
 Switch profiles at runtime via HTTP API:

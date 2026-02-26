@@ -525,6 +525,20 @@ async fn main() -> Result<()> {
     );
 
     info!("using profile: {}", profile_manager.get_current_profile());
+    info!(
+        "config: host={}, port={}, upstream_url={}, upstream_wire={:?}, upstream_http_headers={:?}, forward_incoming_headers={:?}, api_key_env={}, server_info={:?}, http_shutdown={}, verbose_logging={}, drop_tool_types={:?}",
+        config.host,
+        config.port.unwrap_or(0),
+        profile_manager.get_upstream_url(),
+        profile_manager.get_upstream_wire(),
+        profile_manager.get_upstream_http_headers(),
+        profile_manager.get_forward_incoming_headers(),
+        config.api_key_env,
+        config.server_info,
+        config.http_shutdown,
+        config.verbose_logging,
+        profile_manager.get_drop_tool_types().iter().collect::<Vec<_>>()
+    );
 
     let state = Arc::new(AppState {
         client,
