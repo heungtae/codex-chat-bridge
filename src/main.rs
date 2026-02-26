@@ -129,7 +129,7 @@ struct Args {
     )]
     drop_tool_types: Vec<String>,
 
-    #[arg(long, help = "use profile from config file")]
+    #[arg(long, short = 'p', help = "use profile from config file")]
     profile: Option<String>,
 
     #[arg(long, help = "list available profiles from config file and exit")]
