@@ -59,6 +59,15 @@ npm install -g @heungtae/codex-chat-bridge
   - `response.completed`
   - `response.failed` (for upstream/network errors)
 
+## Recent Updates (v0.2.3)
+
+- For `responses -> chat` upstream forwarding, `tools[].type="custom"` is normalized to `function` only when sending to chat upstream.
+- For chat upstream responses converted back to Responses format:
+  - incoming `custom_tool_call` is returned as `custom_tool_call_output`
+  - incoming `function_call` is returned as `function_call_output`
+  - `call_id` is preserved in both flows
+- Added explicit `custom_tool_call` input handling in the mapper and preserved output mapping behavior for both `custom_tool_call_output` and `function_call_output`.
+
 ## Routers
 
 The bridge supports multiple routers for different upstream configurations. Define routers in `conf.toml`:

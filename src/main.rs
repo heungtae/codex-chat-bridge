@@ -40,6 +40,7 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::RwLock;
+use tracing::debug;
 use tracing::info;
 use tracing::warn;
 use uuid::Uuid;
@@ -642,20 +643,28 @@ struct SseParser {
     current_data_lines: Vec<String>,
 }
 
+fn init_tracing(verbose_logging: bool) {
+    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
+        if verbose_logging {
+            tracing_subscriber::EnvFilter::new("debug")
+        } else {
+            tracing_subscriber::EnvFilter::new("info")
+        }
+    });
+
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
-        )
-        .init();
-
     let args = Args::parse();
     let config_path = resolve_config_path(args.config.clone())?;
     ensure_default_config_file(&config_path)?;
     let file_config = load_file_config(&config_path)?;
     let config = resolve_config(args.clone(), file_config.clone())?;
+    init_tracing(config.verbose_logging);
 
     let routers = file_config
         .as_ref()
@@ -1289,12 +1298,12 @@ async fn handle_incoming(
     );
 
     if verbose_logging {
-        info!(
+        debug!(
             "incoming headers (router={}): {}",
             route_target.router_name,
             headers_for_logging(&headers)
         );
-        info!(
+        debug!(
             "incoming request body (router={}): {body}",
             route_target.router_name
         );
@@ -1311,7 +1320,7 @@ async fn handle_incoming(
         }
     };
     if verbose_logging {
-        info!(
+        debug!(
             "incoming tool types (router={}): {}",
             route_target.router_name,
             tool_types_for_logging(&request_value)
@@ -1344,13 +1353,13 @@ async fn handle_incoming(
         if let Some(messages) =
             upstream_messages_for_logging(route_target.upstream_wire, &upstream_payload)
         {
-            info!(
+            debug!(
                 "upstream messages (router={}, {:?}->{:?}): {}",
                 route_target.router_name, incoming_api, route_target.upstream_wire, messages
             );
         }
 
-        info!(
+        debug!(
             "upstream headers (router={}, {:?}->{:?}): {}",
             route_target.router_name,
             incoming_api,
@@ -1363,11 +1372,11 @@ async fn handle_incoming(
             )
         );
 
-        info!(
+        debug!(
             "upstream payload (router={}, {:?}->{:?}): {}",
             route_target.router_name, incoming_api, route_target.upstream_wire, upstream_payload
         );
-        info!(
+        debug!(
             "upstream tool types (router={}, {:?}->{:?}): {}",
             route_target.router_name,
             incoming_api,
@@ -1404,13 +1413,13 @@ async fn handle_incoming(
     };
 
     if verbose_logging {
-        info!(
+        debug!(
             "upstream response status (router={}): {} {}",
             route_target.router_name,
             upstream_response.status().as_u16(),
             upstream_response.status()
         );
-        info!(
+        debug!(
             "upstream response headers (router={}, {:?}<-{:?}): {}",
             route_target.router_name,
             incoming_api,
@@ -1426,7 +1435,7 @@ async fn handle_incoming(
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
         if verbose_logging {
-            info!(
+            debug!(
                 "upstream response payload error (router={}, {:?}<-{:?}): {body}",
                 route_target.router_name,
                 incoming_api,
@@ -1478,7 +1487,7 @@ async fn handle_incoming(
         }
     };
     if verbose_logging {
-        info!(
+        debug!(
             "upstream response payload (router={}, {:?}<-{:?}): {}",
             route_target.router_name,
             incoming_api,
@@ -1735,7 +1744,7 @@ where
             match chunk_result {
                 Ok(chunk) => {
                     if verbose_logging {
-                        info!(
+                        debug!(
                             "upstream response payload stream chunk (router={}, responses): {}",
                             router_name,
                             String::from_utf8_lossy(&chunk)
@@ -1811,7 +1820,7 @@ where
             };
 
             if verbose_logging {
-                info!(
+                debug!(
                     "upstream response payload stream chunk (router={}, chat): {}",
                     router_name,
                     String::from_utf8_lossy(&chunk)
