@@ -1289,7 +1289,7 @@ async fn handle_incoming(
         None => "/v1/responses".to_string(),
     });
 
-    info!(
+    debug!(
         "request routed: router={}, incoming_route={}, upstream_url={}, upstream_wire={:?}",
         route_target.router_name,
         incoming_route,
