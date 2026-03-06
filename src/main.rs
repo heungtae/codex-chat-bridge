@@ -31,6 +31,7 @@ use serde_json::Value;
 use serde_json::json;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fs::File;
 use std::fs::{self};
@@ -558,6 +559,12 @@ struct ServerInfo {
 #[derive(Debug)]
 struct BridgeRequest {
     chat_request: Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResponsesToolCallKind {
+    Function,
+    Custom,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1314,6 +1321,11 @@ async fn handle_incoming(
     let incoming_api = incoming_api_hint.unwrap_or_else(|| infer_incoming_api(&request_value));
     let wants_stream = stream_flag_for_request(incoming_api, &request_value);
     apply_request_filters(incoming_api, &mut request_value, &route_target.drop_tool_types);
+    let tool_call_kinds_by_name = if incoming_api == IncomingApi::Responses {
+        responses_tool_call_kind_by_name(&request_value)
+    } else {
+        HashMap::new()
+    };
 
     let response_id = format!("resp_bridge_{}", Uuid::now_v7());
     let upstream_payload =
@@ -1432,6 +1444,7 @@ async fn handle_incoming(
                 response_id,
                 route_target.router_name.clone(),
                 verbose_logging,
+                tool_call_kinds_by_name.clone(),
             )),
             WireApi::Responses => Body::from_stream(passthrough_responses_stream(
                 upstream_response.bytes_stream(),
@@ -1475,7 +1488,9 @@ async fn handle_incoming(
     }
 
     let response_json = match route_target.upstream_wire {
-        WireApi::Chat => chat_json_to_responses_json(upstream_json, response_id),
+        WireApi::Chat => {
+            chat_json_to_responses_json(upstream_json, response_id, &tool_call_kinds_by_name)
+        }
         WireApi::Responses => upstream_json,
     };
 
@@ -1577,21 +1592,53 @@ fn upstream_messages_for_logging(upstream_wire: WireApi, payload: &Value) -> Opt
 }
 
 fn tool_types_for_logging(payload: &Value) -> Value {
-    let tool_types = payload
+    let tool_labels = payload
         .get("tools")
         .and_then(Value::as_array)
         .map(|tools| {
             tools
                 .iter()
-                .filter_map(|tool| {
-                    tool.get("type")
-                        .and_then(Value::as_str)
-                        .map(|t| Value::String(t.to_string()))
-                })
+                .map(tool_type_label_for_logging)
+                .map(Value::String)
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    Value::Array(tool_types)
+    Value::Array(tool_labels)
+}
+
+fn tool_type_label_for_logging(tool: &Value) -> String {
+    let Some(obj) = tool.as_object() else {
+        return "<invalid_tool>".to_string();
+    };
+
+    let tool_type = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let function_name = obj
+        .get("function")
+        .and_then(Value::as_object)
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let top_level_name = obj
+        .get("name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+
+    let tool_name = function_name.or(top_level_name);
+
+    match (tool_type, tool_name) {
+        (Some(t), Some(n)) => format!("{t}({n})"),
+        (Some(t), None) => t.to_string(),
+        (None, Some(n)) => format!("<missing_type>({n})"),
+        (None, None) => "<missing_type>".to_string(),
+    }
 }
 
 fn upstream_headers_for_logging(
@@ -1721,6 +1768,7 @@ fn translate_chat_stream<S>(
     response_id: String,
     router_name: String,
     verbose_logging: bool,
+    tool_call_kinds_by_name: HashMap<String, ResponsesToolCallKind>,
 ) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -1878,17 +1926,18 @@ where
             let name = tool_call
                 .name
                 .unwrap_or_else(|| "unknown_function".to_string());
+            let item = responses_tool_call_item(
+                &name,
+                &tool_call.arguments,
+                &call_id,
+                &tool_call_kinds_by_name,
+            );
 
             yield Ok(sse_event(
                 "response.output_item.done",
                 &json!({
                     "type": "response.output_item.done",
-                    "item": {
-                        "type": "function_call",
-                        "name": name,
-                        "arguments": tool_call.arguments,
-                        "call_id": call_id,
-                    }
+                    "item": item,
                 }),
             ));
         }
@@ -2154,7 +2203,65 @@ fn chat_message_content_to_input_items(content: Option<&Value>) -> Vec<Value> {
     }
 }
 
-fn chat_json_to_responses_json(chat: Value, response_id: String) -> Value {
+fn responses_tool_call_kind_by_name(request: &Value) -> HashMap<String, ResponsesToolCallKind> {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let tool_type = tool.get("type").and_then(Value::as_str)?;
+                    let kind = match tool_type {
+                        "function" => ResponsesToolCallKind::Function,
+                        "custom" => ResponsesToolCallKind::Custom,
+                        _ => return None,
+                    };
+                    let name = tool
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .or_else(|| tool.get("name").and_then(Value::as_str))?
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some((name, kind))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn responses_tool_call_item(
+    name: &str,
+    arguments: &str,
+    call_id: &str,
+    tool_call_kinds_by_name: &HashMap<String, ResponsesToolCallKind>,
+) -> Value {
+    match tool_call_kinds_by_name.get(name) {
+        Some(ResponsesToolCallKind::Custom) => json!({
+            "type": "custom_tool_call",
+            "name": name,
+            "input": arguments,
+            "call_id": call_id,
+        }),
+        _ => json!({
+            "type": "function_call",
+            "name": name,
+            "arguments": arguments,
+            "call_id": call_id,
+        }),
+    }
+}
+
+fn chat_json_to_responses_json(
+    chat: Value,
+    response_id: String,
+    tool_call_kinds_by_name: &HashMap<String, ResponsesToolCallKind>,
+) -> Value {
     let mut output_items = Vec::new();
 
     if let Some(choice) = chat
@@ -2192,12 +2299,12 @@ fn chat_json_to_responses_json(chat: Value, response_id: String) -> Value {
                         .map(function_arguments_to_text)
                         .unwrap_or_else(|| "{}".to_string());
 
-                    output_items.push(json!({
-                        "type":"function_call",
-                        "name": name,
-                        "arguments": arguments,
-                        "call_id": call_id,
-                    }));
+                    output_items.push(responses_tool_call_item(
+                        name,
+                        &arguments,
+                        &call_id,
+                        tool_call_kinds_by_name,
+                    ));
                 }
             }
         }
@@ -2322,6 +2429,41 @@ fn map_responses_to_chat_request_with_stream(
                     }]
                 }));
             }
+            "custom_tool_call" => {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    warn!("ignoring custom_tool_call item with empty name");
+                    continue;
+                }
+
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                let arguments = item
+                    .get("input")
+                    .or_else(|| item.get("arguments"))
+                    .map(function_arguments_to_text)
+                    .unwrap_or_default();
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }]
+                }));
+            }
             "function_call_output" => {
                 let call_id = item
                     .get("call_id")
@@ -2344,7 +2486,7 @@ fn map_responses_to_chat_request_with_stream(
                     .unwrap_or_default();
                 let output_text = item
                     .get("output")
-                    .and_then(Value::as_str)
+                    .map(function_output_to_text)
                     .unwrap_or_default();
                 messages.push(json!({
                     "role": "tool",
@@ -2471,6 +2613,38 @@ fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<String>) ->
                 }));
             }
 
+            if tool_type == Some("custom") {
+                if let Some(function) = tool.get("function").cloned() {
+                    let mut converted = tool;
+                    if let Some(obj) = converted.as_object_mut() {
+                        obj.insert("type".to_string(), Value::String("function".to_string()));
+                        obj.insert("function".to_string(), function);
+                    }
+                    return Some(converted);
+                }
+
+                let name = tool.get("name")?.as_str()?.to_string();
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let parameters = tool
+                    .get("parameters")
+                    .cloned()
+                    .or_else(|| tool.get("input_schema").cloned())
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }));
+            }
+
             Some(tool)
         })
         .collect()
@@ -2485,11 +2659,39 @@ fn normalize_tool_choice(tool_choice: Value) -> Value {
         return Value::String("auto".to_string());
     };
 
+    let tool_type = obj.get("type").and_then(Value::as_str);
+
+    if tool_type == Some("custom")
+        && let Some(name) = obj
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            }
+        });
+    }
+
+    if tool_type == Some("custom")
+        && let Some(name) = obj.get("name").and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            }
+        });
+    }
+
     if obj.get("function").is_some() {
         return tool_choice;
     }
 
-    if obj.get("type").and_then(Value::as_str) == Some("function")
+    if tool_type == Some("function")
         && let Some(name) = obj.get("name").and_then(Value::as_str)
     {
         return json!({
@@ -2695,6 +2897,38 @@ mod tests {
     }
 
     #[test]
+    fn map_supports_custom_tool_call_to_assistant_tool_call() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom_1",
+                    "name": "shell",
+                    "input": "echo hello"
+                }
+            ],
+            "tools": []
+        });
+
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("should map");
+        let messages = req
+            .chat_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_custom_1");
+        assert_eq!(messages[0]["tool_calls"][0]["type"], "function");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "shell");
+        assert_eq!(
+            messages[0]["tool_calls"][0]["function"]["arguments"],
+            "echo hello"
+        );
+    }
+
+    #[test]
     fn map_defaults_tool_choice_when_invalid() {
         let input = json!({
             "model": "gpt-4.1",
@@ -2760,9 +2994,40 @@ mod tests {
     }
 
     #[test]
+    fn normalize_chat_tools_converts_custom_tool_to_function() {
+        let tools = vec![json!({
+            "type": "custom",
+            "name": "shell",
+            "description": "run shell",
+            "input_schema": {"type":"object","properties":{"cmd":{"type":"string"}}}
+        })];
+        let out = normalize_chat_tools(tools, &HashSet::new());
+        assert_eq!(
+            out[0],
+            json!({
+                "type": "function",
+                "function": {
+                    "name": "shell",
+                    "description": "run shell",
+                    "parameters": {"type":"object","properties":{"cmd":{"type":"string"}}}
+                }
+            })
+        );
+    }
+
+    #[test]
     fn normalize_tool_choice_preserves_wrapped_choice() {
         let choice = json!({"type":"function", "function":{"name":"do_it"}});
         assert_eq!(normalize_tool_choice(choice.clone()), choice);
+    }
+
+    #[test]
+    fn normalize_tool_choice_converts_custom_name() {
+        let choice = json!({"type":"custom", "name":"shell"});
+        assert_eq!(
+            normalize_tool_choice(choice),
+            json!({"type":"function","function":{"name":"shell"}})
+        );
     }
 
     #[test]
@@ -2797,6 +3062,28 @@ mod tests {
         assert_eq!(out[0]["type"], "function");
     }
 
+    #[test]
+    fn responses_tool_call_item_maps_custom_and_function_types() {
+        let mut kinds = HashMap::new();
+        kinds.insert("shell".to_string(), ResponsesToolCallKind::Custom);
+        kinds.insert("get_weather".to_string(), ResponsesToolCallKind::Function);
+
+        let custom_item = responses_tool_call_item("shell", "ls -al", "call_custom_1", &kinds);
+        assert_eq!(custom_item["type"], "custom_tool_call");
+        assert_eq!(custom_item["call_id"], "call_custom_1");
+        assert_eq!(custom_item["input"], "ls -al");
+
+        let function_item = responses_tool_call_item(
+            "get_weather",
+            "{\"city\":\"seoul\"}",
+            "call_fn_1",
+            &kinds,
+        );
+        assert_eq!(function_item["type"], "function_call");
+        assert_eq!(function_item["call_id"], "call_fn_1");
+        assert_eq!(function_item["arguments"], "{\"city\":\"seoul\"}");
+    }
+
     #[tokio::test]
     async fn stream_emits_output_item_added_before_text_delta() {
         let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
@@ -2808,6 +3095,7 @@ mod tests {
             "resp_1".to_string(),
             "test_router".to_string(),
             false,
+            HashMap::new(),
         ));
         let mut payload = String::new();
 
@@ -2822,6 +3110,56 @@ mod tests {
             .find("event: response.output_text.delta")
             .expect("delta event");
         assert!(added_idx < delta_idx);
+    }
+
+    #[tokio::test]
+    async fn stream_maps_custom_tool_call_and_preserves_call_id() {
+        let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_custom_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"echo hello\"}}]}}]}\n\n\
+             data: [DONE]\n\n",
+        ))]);
+        let mut kinds = HashMap::new();
+        kinds.insert("shell".to_string(), ResponsesToolCallKind::Custom);
+        let mut output = Box::pin(translate_chat_stream(
+            upstream,
+            "resp_1".to_string(),
+            "test_router".to_string(),
+            false,
+            kinds,
+        ));
+        let mut payload = String::new();
+
+        while let Some(event) = output.next().await {
+            payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+        }
+
+        assert!(payload.contains("\"type\":\"custom_tool_call\""));
+        assert!(payload.contains("\"call_id\":\"call_custom_1\""));
+        assert!(payload.contains("\"input\":\"echo hello\""));
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_maps_custom_tool_call_type() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_custom_1",
+                        "function": {
+                            "name": "shell",
+                            "arguments": "echo hello"
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut kinds = HashMap::new();
+        kinds.insert("shell".to_string(), ResponsesToolCallKind::Custom);
+        let out = chat_json_to_responses_json(chat, "resp_1".to_string(), &kinds);
+        let output = out["output"].as_array().expect("output array");
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["call_id"], "call_custom_1");
+        assert_eq!(output[0]["input"], "echo hello");
     }
 
     #[test]
@@ -3165,17 +3503,30 @@ mod tests {
     }
 
     #[test]
-    fn tool_types_for_logging_reads_only_tool_type_values() {
+    fn tool_types_for_logging_includes_type_and_name_labels() {
         let payload = json!({
             "tools": [
                 {"type":"function","name":"f1"},
+                {"type":"function","function":{"name":"f2"}},
+                {"type":"custom","name":"shell"},
                 {"type":"web_search_preview"},
-                {"name":"missing_type"}
+                {"name":"missing_type"},
+                {}
             ]
         });
 
         let out = tool_types_for_logging(&payload);
-        assert_eq!(out, json!(["function", "web_search_preview"]));
+        assert_eq!(
+            out,
+            json!([
+                "function(f1)",
+                "function(f2)",
+                "custom(shell)",
+                "web_search_preview",
+                "<missing_type>(missing_type)",
+                "<missing_type>"
+            ])
+        );
     }
 
     #[test]
