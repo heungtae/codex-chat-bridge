@@ -1,0 +1,677 @@
+use anyhow::{Result, anyhow};
+use serde_json::{Value, json};
+use std::collections::{HashMap, HashSet};
+use tracing::warn;
+use uuid::Uuid;
+
+use crate::{BridgeRequest, ResponsesToolCallKind};
+
+pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Result<Value> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing `model`"))?;
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing `messages` array"))?;
+
+    let mut input = Vec::new();
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+
+        if role == "tool" {
+            let call_id = message
+                .get("tool_call_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let output = message
+                .get("content")
+                .map(function_output_to_text)
+                .unwrap_or_default();
+            input.push(json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            }));
+            continue;
+        }
+
+        let content = chat_message_content_to_input_items(message.get("content"));
+        if content.is_empty() {
+            continue;
+        }
+
+        input.push(json!({
+            "type": "message",
+            "role": role,
+            "content": content,
+        }));
+    }
+
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|v| normalize_responses_tools(v.clone()))
+        .unwrap_or_default();
+    let tool_choice = request
+        .get("tool_choice")
+        .cloned()
+        .map(normalize_responses_tool_choice)
+        .unwrap_or_else(|| Value::String("auto".to_string()));
+    let parallel_tool_calls = request
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut out = json!({
+        "model": model,
+        "input": input,
+        "stream": stream,
+        "tools": tools,
+        "tool_choice": tool_choice,
+        "parallel_tool_calls": parallel_tool_calls,
+    });
+
+    if out
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        if let Some(obj) = out.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+    }
+
+    Ok(out)
+}
+
+pub(crate) fn normalize_responses_tools(tools: Vec<Value>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter_map(|tool| {
+            if tool.get("type").and_then(Value::as_str) != Some("function") {
+                return Some(tool);
+            }
+
+            if tool.get("function").is_none() {
+                return Some(tool);
+            }
+
+            let function = tool.get("function")?;
+            let name = function.get("name").and_then(Value::as_str)?.to_string();
+            let description = function
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let parameters = function
+                .get("parameters")
+                .cloned()
+                .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+
+            Some(json!({
+                "type": "function",
+                "name": name,
+                "description": description,
+                "parameters": parameters,
+            }))
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_responses_tool_choice(choice: Value) -> Value {
+    if let Some(obj) = choice.as_object()
+        && obj.get("type").and_then(Value::as_str) == Some("function")
+        && let Some(name) = obj
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "name": name,
+        });
+    }
+    choice
+}
+
+pub(crate) fn chat_message_content_to_input_items(content: Option<&Value>) -> Vec<Value> {
+    match content {
+        Some(Value::String(text)) => {
+            if text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type":"input_text","text":text})]
+            }
+        }
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| {
+                if let Some(text) = item.get("text").and_then(Value::as_str) {
+                    return Some(json!({"type":"input_text","text":text}));
+                }
+                item.get("content")
+                    .and_then(Value::as_str)
+                    .map(|text| json!({"type":"input_text","text":text}))
+            })
+            .collect(),
+        Some(other) => {
+            let as_text = other.to_string();
+            if as_text.trim().is_empty() {
+                Vec::new()
+            } else {
+                vec![json!({"type":"input_text","text":as_text})]
+            }
+        }
+        None => Vec::new(),
+    }
+}
+
+pub(crate) fn responses_tool_call_kind_by_name(request: &Value) -> HashMap<String, ResponsesToolCallKind> {
+    request
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|tool| {
+                    let tool_type = tool.get("type").and_then(Value::as_str)?;
+                    let kind = match tool_type {
+                        "function" => ResponsesToolCallKind::Function,
+                        "custom" => ResponsesToolCallKind::Custom,
+                        _ => return None,
+                    };
+                    let name = tool
+                        .get("function")
+                        .and_then(Value::as_object)
+                        .and_then(|f| f.get("name"))
+                        .and_then(Value::as_str)
+                        .or_else(|| tool.get("name").and_then(Value::as_str))?
+                        .trim()
+                        .to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some((name, kind))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+pub(crate) fn responses_tool_call_item(
+    name: &str,
+    arguments: &str,
+    call_id: &str,
+    tool_call_kinds_by_name: &HashMap<String, ResponsesToolCallKind>,
+) -> Value {
+    match tool_call_kinds_by_name.get(name) {
+        Some(ResponsesToolCallKind::Custom) => json!({
+            "type": "custom_tool_call",
+            "name": name,
+            "input": arguments,
+            "call_id": call_id,
+        }),
+        _ => json!({
+            "type": "function_call",
+            "name": name,
+            "arguments": arguments,
+            "call_id": call_id,
+        }),
+    }
+}
+
+pub(crate) fn chat_json_to_responses_json(
+    chat: Value,
+    response_id: String,
+    tool_call_kinds_by_name: &HashMap<String, ResponsesToolCallKind>,
+) -> Value {
+    let mut output_items = Vec::new();
+
+    if let Some(choice) = chat
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    {
+        if let Some(message) = choice.get("message") {
+            let text = message
+                .get("content")
+                .map(function_output_to_text)
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                output_items.push(json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type":"output_text","text": text}],
+                }));
+            }
+
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for tc in tool_calls {
+                    let call_id = tc
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                    let function = tc.get("function").cloned().unwrap_or_else(|| json!({}));
+                    let name = function
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_function");
+                    let arguments = function
+                        .get("arguments")
+                        .map(function_arguments_to_text)
+                        .unwrap_or_else(|| "{}".to_string());
+
+                    output_items.push(responses_tool_call_item(
+                        name,
+                        &arguments,
+                        &call_id,
+                        tool_call_kinds_by_name,
+                    ));
+                }
+            }
+        }
+    }
+
+    let usage_json = chat.get("usage").map(|usage| {
+        json!({
+            "input_tokens": usage.get("prompt_tokens").and_then(Value::as_i64).unwrap_or(0),
+            "input_tokens_details": null,
+            "output_tokens": usage.get("completion_tokens").and_then(Value::as_i64).unwrap_or(0),
+            "output_tokens_details": null,
+            "total_tokens": usage.get("total_tokens").and_then(Value::as_i64).unwrap_or(0),
+        })
+    });
+
+    json!({
+        "id": response_id,
+        "object": "response",
+        "status": "completed",
+        "output": output_items,
+        "usage": usage_json,
+    })
+}
+
+pub(crate) fn map_responses_to_chat_request_with_stream(
+    request: &Value,
+    drop_tool_types: &HashSet<String>,
+    stream: bool,
+) -> Result<BridgeRequest> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing `model`"))?
+        .to_string();
+
+    let instructions = request
+        .get("instructions")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+
+    let input_items = request
+        .get("input")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing `input` array"))?;
+
+    let tools = request
+        .get("tools")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+
+    let tool_choice = request
+        .get("tool_choice")
+        .cloned()
+        .unwrap_or_else(|| Value::String("auto".to_string()));
+
+    let parallel_tool_calls = request
+        .get("parallel_tool_calls")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let mut messages = Vec::new();
+
+    if !instructions.trim().is_empty() {
+        messages.push(json!({
+            "role": "system",
+            "content": instructions,
+        }));
+    }
+
+    for item in input_items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+
+        match item_type {
+            "message" => {
+                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let content = item
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .map(Vec::as_slice)
+                    .map_or_else(String::new, flatten_content_items);
+
+                if !content.trim().is_empty() {
+                    messages.push(json!({
+                        "role": role,
+                        "content": content,
+                    }));
+                }
+            }
+            "function_call" => {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    warn!("ignoring function_call item with empty name");
+                    continue;
+                }
+
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                let arguments = item
+                    .get("arguments")
+                    .map(function_arguments_to_text)
+                    .unwrap_or_else(|| "{}".to_string());
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }]
+                }));
+            }
+            "custom_tool_call" => {
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if name.is_empty() {
+                    warn!("ignoring custom_tool_call item with empty name");
+                    continue;
+                }
+
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                let arguments = item
+                    .get("input")
+                    .or_else(|| item.get("arguments"))
+                    .map(function_arguments_to_text)
+                    .unwrap_or_default();
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }]
+                }));
+            }
+            "function_call_output" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let output_text = item
+                    .get("output")
+                    .map(function_output_to_text)
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output_text,
+                }));
+            }
+            "custom_tool_call_output" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let output_text = item
+                    .get("output")
+                    .map(function_output_to_text)
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output_text,
+                }));
+            }
+            "mcp_tool_call_output" => {
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let output_text = item
+                    .get("result")
+                    .map(|v| v.to_string())
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output_text,
+                }));
+            }
+            _ => {
+                warn!("ignoring unsupported input item type: {item_type}");
+            }
+        }
+    }
+
+    let chat_tools = normalize_chat_tools(tools, drop_tool_types);
+    let chat_tool_choice = normalize_tool_choice(tool_choice);
+
+    let mut chat_request = json!({
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+        "stream_options": { "include_usage": true },
+        "tools": chat_tools,
+        "tool_choice": chat_tool_choice,
+        "parallel_tool_calls": parallel_tool_calls,
+    });
+
+    if !stream
+        && let Some(obj) = chat_request.as_object_mut()
+    {
+        obj.remove("stream_options");
+    }
+
+    if chat_request
+        .get("tools")
+        .and_then(Value::as_array)
+        .is_some_and(Vec::is_empty)
+    {
+        if let Some(obj) = chat_request.as_object_mut() {
+            obj.remove("tools");
+            obj.remove("tool_choice");
+        }
+    }
+
+    Ok(BridgeRequest { chat_request })
+}
+
+pub(crate) fn flatten_content_items(items: &[Value]) -> String {
+    let mut parts = Vec::new();
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+        if matches!(item_type, "input_text" | "output_text")
+            && let Some(text) = item.get("text").and_then(Value::as_str)
+            && !text.is_empty()
+        {
+            parts.push(text.to_string());
+        }
+    }
+
+    parts.join("\n")
+}
+
+pub(crate) fn function_output_to_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        Value::Array(items) => flatten_content_items(items),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn function_arguments_to_text(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<String>) -> Vec<Value> {
+    tools
+        .into_iter()
+        .filter_map(|tool| {
+            let tool_type = tool.get("type").and_then(Value::as_str);
+            if tool_type.is_some_and(|t| drop_tool_types.contains(t)) {
+                return None;
+            }
+
+            if tool_type == Some("function") {
+                if tool.get("function").is_some() {
+                    return Some(tool);
+                }
+
+                let name = tool.get("name")?.as_str()?.to_string();
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let parameters = tool
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }));
+            }
+
+            if tool_type == Some("custom") {
+                if let Some(function) = tool.get("function").cloned() {
+                    let mut converted = tool;
+                    if let Some(obj) = converted.as_object_mut() {
+                        obj.insert("type".to_string(), Value::String("function".to_string()));
+                        obj.insert("function".to_string(), function);
+                    }
+                    return Some(converted);
+                }
+
+                let name = tool.get("name")?.as_str()?.to_string();
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let parameters = tool
+                    .get("parameters")
+                    .cloned()
+                    .or_else(|| tool.get("input_schema").cloned())
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }));
+            }
+
+            Some(tool)
+        })
+        .collect()
+}
+
+pub(crate) fn normalize_tool_choice(tool_choice: Value) -> Value {
+    if let Some(s) = tool_choice.as_str() {
+        return Value::String(s.to_string());
+    }
+
+    let Some(obj) = tool_choice.as_object() else {
+        return Value::String("auto".to_string());
+    };
+
+    let tool_type = obj.get("type").and_then(Value::as_str);
+
+    if tool_type == Some("custom")
+        && let Some(name) = obj
+            .get("function")
+            .and_then(Value::as_object)
+            .and_then(|f| f.get("name"))
+            .and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            }
+        });
+    }
+
+    if tool_type == Some("custom")
+        && let Some(name) = obj.get("name").and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            }
+        });
+    }
+
+    if obj.get("function").is_some() {
+        return tool_choice;
+    }
+
+    if tool_type == Some("function")
+        && let Some(name) = obj.get("name").and_then(Value::as_str)
+    {
+        return json!({
+            "type": "function",
+            "function": {
+                "name": name,
+            }
+        });
+    }
+
+    Value::String("auto".to_string())
+}
+
