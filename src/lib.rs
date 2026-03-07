@@ -1789,12 +1789,18 @@ fn validate_capability_gate(
         return Ok(());
     }
 
-    for field in ["reasoning", "include", "text", "service_tier"] {
-        if request_has_non_empty_field(request, field) {
-            return Err(anyhow!(
-                "responses->chat bridge does not support `{field}` yet; disable it or route to native responses upstream"
-            ));
-        }
+    if let Some(value) = request.get("max_output_tokens")
+        && !value.is_null()
+        && !value.is_number()
+    {
+        return Err(anyhow!("`max_output_tokens` must be a number when provided"));
+    }
+
+    if let Some(value) = request.get("metadata")
+        && !value.is_null()
+        && !value.is_object()
+    {
+        return Err(anyhow!("`metadata` must be an object when provided"));
     }
 
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
@@ -1817,21 +1823,6 @@ fn validate_capability_gate(
     }
 
     Ok(())
-}
-
-fn request_has_non_empty_field(request: &Value, field: &str) -> bool {
-    let Some(value) = request.get(field) else {
-        return false;
-    };
-
-    match value {
-        Value::Null => false,
-        Value::String(v) => !v.trim().is_empty(),
-        Value::Array(v) => !v.is_empty(),
-        Value::Object(v) => !v.is_empty(),
-        Value::Bool(v) => *v,
-        Value::Number(_) => true,
-    }
 }
 
 fn previous_response_id_for_request(request: &Value) -> Option<&str> {

@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -377,6 +377,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
         .unwrap_or(true);
 
     let mut messages = Vec::new();
+    let mut pending_tool_call_ids = VecDeque::new();
 
     if !instructions.trim().is_empty() {
         messages.push(json!({
@@ -439,6 +440,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                         }
                     }]
                 }));
+                pending_tool_call_ids.push_back(call_id);
             }
             "custom_tool_call" => {
                 let name = item
@@ -474,12 +476,10 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                         }
                     }]
                 }));
+                pending_tool_call_ids.push_back(call_id);
             }
             "function_call_output" => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let call_id = resolve_tool_output_call_id(item, &mut pending_tool_call_ids)?;
                 let output_text = item
                     .get("output")
                     .map(function_output_to_text)
@@ -495,10 +495,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     warn!("ignoring unsupported input item type: {item_type}");
                     continue;
                 }
-                let call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let call_id = resolve_tool_output_call_id(item, &mut pending_tool_call_ids)?;
                 let output_text = item
                     .get("output")
                     .or_else(|| item.get("result"))
@@ -511,10 +508,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                 }));
             }
             "custom_tool_call_output" => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let call_id = resolve_tool_output_call_id(item, &mut pending_tool_call_ids)?;
                 let output_text = item
                     .get("output")
                     .map(function_output_to_text)
@@ -559,12 +553,10 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                         }
                     }]
                 }));
+                pending_tool_call_ids.push_back(call_id);
             }
             "mcp_tool_call_output" => {
-                let call_id = item
-                    .get("call_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let call_id = resolve_tool_output_call_id(item, &mut pending_tool_call_ids)?;
                 let output_text = item
                     .get("result")
                     .map(|v| v.to_string())
@@ -611,7 +603,84 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
         }
     }
 
+    apply_responses_request_extensions(request, &mut chat_request)?;
+
     Ok(BridgeRequest { chat_request })
+}
+
+fn resolve_tool_output_call_id(item: &Value, pending_tool_call_ids: &mut VecDeque<String>) -> Result<String> {
+    let incoming_call_id = item
+        .get("call_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+
+    match incoming_call_id {
+        Some(call_id) => {
+            if let Some(pos) = pending_tool_call_ids.iter().position(|id| id == &call_id) {
+                pending_tool_call_ids.remove(pos);
+                return Ok(call_id);
+            }
+            if pending_tool_call_ids.len() == 1 {
+                let recovered = pending_tool_call_ids
+                    .pop_front()
+                    .expect("single pending id must exist");
+                warn!(
+                    "recovering tool output call_id mismatch: incoming={} recovered={}",
+                    call_id, recovered
+                );
+                return Ok(recovered);
+            }
+            if pending_tool_call_ids.is_empty() {
+                return Ok(call_id);
+            }
+            Err(anyhow!(
+                "tool output call_id `{}` does not match pending tool calls {:?}",
+                call_id,
+                pending_tool_call_ids
+            ))
+        }
+        None => {
+            let Some(recovered) = pending_tool_call_ids.pop_front() else {
+                return Err(anyhow!(
+                    "tool output is missing `call_id` and no pending tool call exists"
+                ));
+            };
+            warn!("recovering missing tool output call_id with pending call_id={recovered}");
+            Ok(recovered)
+        }
+    }
+}
+
+fn apply_responses_request_extensions(request: &Value, chat_request: &mut Value) -> Result<()> {
+    let Some(chat_obj) = chat_request.as_object_mut() else {
+        return Err(anyhow!("chat request payload must be an object"));
+    };
+
+    if let Some(max_output_tokens) = request.get("max_output_tokens") {
+        chat_obj.insert("max_tokens".to_string(), max_output_tokens.clone());
+    }
+    if let Some(metadata) = request.get("metadata") {
+        chat_obj.insert("metadata".to_string(), metadata.clone());
+    }
+    if let Some(reasoning) = request.get("reasoning") {
+        chat_obj.insert("reasoning".to_string(), reasoning.clone());
+    }
+    if let Some(service_tier) = request.get("service_tier") {
+        chat_obj.insert("service_tier".to_string(), service_tier.clone());
+    }
+    if let Some(include) = request.get("include") {
+        chat_obj.insert("include".to_string(), include.clone());
+    }
+    if let Some(text) = request.get("text") {
+        if let Some(format) = text.get("format") {
+            chat_obj.insert("response_format".to_string(), format.clone());
+        }
+        chat_obj.insert("text".to_string(), text.clone());
+    }
+
+    Ok(())
 }
 
 pub(crate) fn flatten_content_items(items: &[Value], enable_extended_input_types: bool) -> String {
@@ -721,6 +790,79 @@ pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<
                     .or_else(|| tool.get("input_schema").cloned())
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
 
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }));
+            }
+
+            if tool_type == Some("mcp") {
+                let server_label = tool
+                    .get("server_label")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or("mcp_server");
+                let function_name = format!("mcp__{server_label}");
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("MCP tool proxy");
+                let parameters = tool
+                    .get("parameters")
+                    .cloned()
+                    .or_else(|| tool.get("input_schema").cloned())
+                    .unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "arguments": {
+                                    "type": "object",
+                                    "additionalProperties": true
+                                }
+                            },
+                            "additionalProperties": true
+                        })
+                    });
+                return Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": function_name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }));
+            }
+
+            if matches!(tool_type, Some("web_search") | Some("web_search_preview")) {
+                let name = tool
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|v| !v.is_empty())
+                    .unwrap_or(tool_type.unwrap_or("web_search"));
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or("Web search tool");
+                let parameters = tool
+                    .get("parameters")
+                    .cloned()
+                    .or_else(|| tool.get("input_schema").cloned())
+                    .unwrap_or_else(|| {
+                        json!({
+                            "type": "object",
+                            "properties": {
+                                "query": {"type": "string"}
+                            },
+                            "required": ["query"],
+                            "additionalProperties": true
+                        })
+                    });
                 return Some(json!({
                     "type": "function",
                     "function": {

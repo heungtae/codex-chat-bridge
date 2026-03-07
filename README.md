@@ -54,15 +54,30 @@ npm install -g @heungtae/codex-chat-bridge
 - Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
 - For chat upstream streaming, emits Responses-style SSE events:
   - `response.created`
+  - `response.in_progress` (when `enable_extended_stream_events=true`)
   - `response.output_item.added` (assistant text starts; only emitted when text delta exists)
+  - `response.content_part.added/done` (when `enable_extended_stream_events=true`)
   - `response.output_text.delta`
+  - `response.output_text.done` (when `enable_extended_stream_events=true`)
+  - `response.function_call_arguments.delta/done` (when `enable_tool_argument_stream_events=true`)
+  - `response.reasoning_summary_text.delta/done` (when `enable_reasoning_stream_events=true`)
   - `response.output_item.done` (assistant message and function calls)
   - `response.completed`
   - `response.failed` (for upstream/network errors)
 
-## Recent Updates (v0.2.3)
+## Recent Updates (v0.2.4)
 
 - For `responses -> chat` upstream forwarding, `tools[].type="custom"` is normalized to `function` only when sending to chat upstream.
+- For `responses -> chat` upstream forwarding, bridge now maps additional request fields:
+  - `max_output_tokens -> max_tokens`
+  - `metadata`, `reasoning`, `service_tier`, `include`, `text`
+  - `text.format -> response_format` (kept together with `text`)
+- Added tool-result call id recovery for `responses -> chat` input flow:
+  - recovers missing `call_id` from pending tool calls
+  - recovers mismatched `call_id` when exactly one pending tool call exists
+  - returns explicit error when multiple pending calls make recovery ambiguous
+- Extended tool normalization for chat upstream compatibility:
+  - `mcp`, `web_search`, `web_search_preview` are normalized into chat `function` tools
 - For chat upstream responses converted back to Responses format:
   - incoming `custom_tool_call` is returned as `custom_tool_call_output`
   - incoming `function_call` is returned as `function_call_output`

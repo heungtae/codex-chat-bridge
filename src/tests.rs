@@ -78,10 +78,21 @@
     }
 
     #[test]
-    fn normalize_chat_tools_passes_non_function_tool() {
+    fn normalize_chat_tools_converts_web_search_preview_to_function() {
         let tools = vec![json!({"type": "web_search_preview"})];
         let out = normalize_chat_tools(tools, &HashSet::new());
-        assert_eq!(out, vec![json!({"type": "web_search_preview"})]);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["name"], "web_search_preview");
+    }
+
+    #[test]
+    fn normalize_chat_tools_converts_mcp_to_function() {
+        let tools = vec![json!({"type": "mcp", "server_label": "shell"})];
+        let out = normalize_chat_tools(tools, &HashSet::new());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["name"], "mcp__shell");
     }
 
     #[test]
@@ -233,6 +244,82 @@
             messages[0]["tool_calls"][0]["function"]["arguments"],
             "echo hello"
         );
+    }
+
+    #[test]
+    fn map_applies_responses_extensions_to_chat_payload() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "max_output_tokens": 321,
+            "metadata": {"trace_id":"t-1"},
+            "reasoning": {"effort":"medium"},
+            "service_tier": "default",
+            "include": ["reasoning.encrypted_content"],
+            "text": {"format":{"type":"json_object"}}
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        assert_eq!(req.chat_request["max_tokens"], 321);
+        assert_eq!(req.chat_request["metadata"]["trace_id"], "t-1");
+        assert_eq!(req.chat_request["reasoning"]["effort"], "medium");
+        assert_eq!(req.chat_request["service_tier"], "default");
+        assert_eq!(req.chat_request["include"][0], "reasoning.encrypted_content");
+        assert_eq!(req.chat_request["response_format"]["type"], "json_object");
+        assert_eq!(req.chat_request["text"]["format"]["type"], "json_object");
+    }
+
+    #[test]
+    fn map_recovers_missing_call_id_from_pending_tool_call() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{}"},
+                {"type":"function_call_output","output":"ok"}
+            ]
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true).expect("should map");
+        let messages = req.chat_request["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1]["role"], "tool");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn map_recovers_mismatched_call_id_when_single_pending_exists() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{}"},
+                {"type":"function_call_output","call_id":"wrong_id","output":"ok"}
+            ]
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true).expect("should map");
+        let messages = req.chat_request["messages"].as_array().expect("messages");
+        assert_eq!(messages[1]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn map_rejects_mismatched_call_id_when_multiple_pending_exist() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {"type":"function_call","call_id":"call_1","name":"tool_a","arguments":"{}"},
+                {"type":"function_call","call_id":"call_2","name":"tool_b","arguments":"{}"},
+                {"type":"function_call_output","call_id":"wrong_id","output":"ok"}
+            ]
+        });
+
+        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true)
+            .expect_err("must fail");
+        assert!(err
+            .to_string()
+            .contains("does not match pending tool calls"));
     }
 
     #[test]
@@ -1112,16 +1199,44 @@
     }
 
     #[test]
-    fn capability_gate_rejects_non_mappable_responses_fields() {
+    fn capability_gate_allows_extended_responses_fields() {
         let request = json!({
             "model": "gpt-4.1",
             "input": [],
-            "reasoning": {"effort":"medium"}
+            "reasoning": {"effort":"medium"},
+            "include": ["reasoning.encrypted_content"],
+            "text": {"format":{"type":"json_object"}},
+            "service_tier": "default"
+        });
+
+        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request);
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn capability_gate_rejects_invalid_max_output_tokens_type() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [],
+            "max_output_tokens": "bad"
         });
 
         let err = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request)
             .expect_err("must fail");
-        assert!(err.to_string().contains("does not support `reasoning`"));
+        assert!(err.to_string().contains("max_output_tokens"));
+    }
+
+    #[test]
+    fn capability_gate_rejects_invalid_metadata_type() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [],
+            "metadata": ["bad"]
+        });
+
+        let err = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("metadata"));
     }
 
     #[test]
