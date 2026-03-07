@@ -1,0 +1,68 @@
+# codex-chat-bridge example configuration
+# Priority: CLI flags > config file > built-in defaults
+
+# Global defaults
+upstream_url = "https://api.openai.com/v1/chat/completions"
+upstream_wire = "chat" # chat | responses
+upstream_http_headers = {
+  "openai-organization" = "org_123",
+  "x-custom-header" = "value"
+}
+# alias: http_headers = { ... }
+forward_incoming_headers = ["x-codex-turn-state", "x-request-id"]
+api_key_env = "OPENAI_API_KEY"
+server_info = "/tmp/codex-chat-bridge-info.json"
+http_shutdown = false
+verbose_logging = false
+drop_tool_types = ["web_search", "web_search_preview"]
+drop_request_fields = ["prompt_cache_key"]
+
+[features]
+enable_previous_response_id = true
+enable_tool_argument_stream_events = true
+enable_extended_stream_events = true
+enable_reasoning_stream_events = true
+enable_provider_specific_fields = true
+enable_extended_input_types = true
+
+# Routers (required for multi-route mode)
+# alias: [profiles.<name>] is also supported for [routers.<name>]
+
+[routers.default]
+incoming_url = "http://127.0.0.1:8787/default/v1/responses"
+upstream_url = "https://api.openai.com/v1/chat/completions"
+upstream_wire = "chat"
+upstream_http_headers = {
+  "x-router" = "default"
+}
+# alias: http_headers = { ... }
+forward_incoming_headers = ["x-codex-turn-state", "x-request-id"]
+drop_tool_types = []
+drop_request_fields = []
+
+[routers.default.features]
+enable_previous_response_id = true
+enable_tool_argument_stream_events = true
+enable_extended_stream_events = true
+enable_reasoning_stream_events = true
+enable_provider_specific_fields = true
+enable_extended_input_types = true
+
+[routers.research]
+incoming_url = "http://127.0.0.1:8787/research/v1/responses"
+upstream_url = "https://api.openai.com/v1/responses"
+upstream_wire = "responses"
+upstream_http_headers = {
+  "x-router" = "research"
+}
+forward_incoming_headers = ["x-request-id"]
+drop_tool_types = ["web_search_preview"]
+drop_request_fields = ["prompt_cache_key"]
+
+[routers.research.features]
+enable_previous_response_id = false
+enable_tool_argument_stream_events = false
+enable_extended_stream_events = true
+enable_reasoning_stream_events = false
+enable_provider_specific_fields = true
+enable_extended_input_types = true

@@ -58,6 +58,7 @@ pub(crate) fn translate_chat_stream<S>(
     router_name: String,
     verbose_logging: bool,
     tool_call_kinds_by_name: HashMap<String, ResponsesToolCallKind>,
+    feature_flags: crate::FeatureFlags,
 ) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -67,6 +68,8 @@ where
         let mut parser = SseParser::default();
         let mut acc = StreamAccumulator::default();
         let mut assistant_item_added = false;
+        let mut assistant_content_part_added = false;
+        let mut reasoning_item_added = false;
         let mut saw_done_marker = false;
         let mut saw_terminal_finish_reason = false;
 
@@ -79,6 +82,17 @@ where
                 }
             }),
         ));
+        if feature_flags.enable_extended_stream_events {
+            yield Ok(sse_event(
+                "response.in_progress",
+                &json!({
+                    "type": "response.in_progress",
+                    "response": {
+                        "id": response_id.clone(),
+                    }
+                }),
+            ));
+        }
 
         while let Some(chunk_result) = upstream_stream.next().await {
             let chunk = match chunk_result {
@@ -129,6 +143,44 @@ where
                             }
 
                             if let Some(delta) = choice.delta {
+                                if feature_flags.enable_reasoning_stream_events
+                                    && let Some(reasoning) = delta.reasoning_content
+                                    && !reasoning.is_empty()
+                                {
+                                    if !reasoning_item_added {
+                                        yield Ok(sse_event(
+                                            "response.output_item.added",
+                                            &json!({
+                                                "type": "response.output_item.added",
+                                                "output_index": 0,
+                                                "item": {
+                                                    "type": "reasoning",
+                                                    "id": reasoning_item_id(&response_id),
+                                                    "summary": [
+                                                        {
+                                                            "type": "summary_text",
+                                                            "text": "",
+                                                        }
+                                                    ]
+                                                }
+                                            }),
+                                        ));
+                                        reasoning_item_added = true;
+                                    }
+
+                                    acc.reasoning_text.push_str(&reasoning);
+                                    yield Ok(sse_event(
+                                        "response.reasoning_summary_text.delta",
+                                        &json!({
+                                            "type": "response.reasoning_summary_text.delta",
+                                            "item_id": reasoning_item_id(&response_id),
+                                            "output_index": 0,
+                                            "summary_index": 0,
+                                            "delta": reasoning,
+                                        }),
+                                    ));
+                                }
+
                                 if let Some(content) = delta.content
                                     && !content.is_empty()
                                 {
@@ -151,6 +203,24 @@ where
                                         ));
                                         assistant_item_added = true;
                                     }
+                                    if feature_flags.enable_extended_stream_events
+                                        && !assistant_content_part_added
+                                    {
+                                        yield Ok(sse_event(
+                                            "response.content_part.added",
+                                            &json!({
+                                                "type": "response.content_part.added",
+                                                "item_id": response_id.clone(),
+                                                "output_index": 0,
+                                                "content_index": 0,
+                                                "part": {
+                                                    "type": "output_text",
+                                                    "text": "",
+                                                }
+                                            }),
+                                        ));
+                                        assistant_content_part_added = true;
+                                    }
                                     acc.assistant_text.push_str(&content);
                                     yield Ok(sse_event(
                                         "response.output_text.delta",
@@ -164,19 +234,80 @@ where
                                 if let Some(tool_calls) = delta.tool_calls {
                                     for tool_call in tool_calls {
                                         let index = tool_call.index.unwrap_or(acc.tool_calls.len());
-                                        let entry = acc.tool_calls.entry(index).or_default();
+                                        let (
+                                            call_id,
+                                            name,
+                                            all_arguments,
+                                            delta_arguments,
+                                            emit_added,
+                                        ) = {
+                                            let entry = acc.tool_calls.entry(index).or_default();
 
-                                        if let Some(id) = tool_call.id {
-                                            entry.id = Some(id);
+                                            if let Some(id) = tool_call.id {
+                                                entry.id = Some(id);
+                                            }
+
+                                            let mut delta_arguments = None;
+                                            if let Some(function) = tool_call.function {
+                                                if let Some(name) = function.name {
+                                                    entry.name = Some(name);
+                                                }
+                                                if let Some(arguments) = function.arguments {
+                                                    if !arguments.is_empty() {
+                                                        entry.arguments.push_str(&arguments);
+                                                        delta_arguments = Some(arguments);
+                                                    }
+                                                }
+                                            }
+
+                                            let emit_added = !entry.added_emitted;
+                                            if emit_added {
+                                                entry.added_emitted = true;
+                                            }
+
+                                            (
+                                                entry.id.clone().unwrap_or_else(|| {
+                                                    deterministic_tool_call_id(&response_id, index)
+                                                }),
+                                                entry
+                                                    .name
+                                                    .clone()
+                                                    .unwrap_or_else(|| "unknown_function".to_string()),
+                                                entry.arguments.clone(),
+                                                delta_arguments,
+                                                emit_added,
+                                            )
+                                        };
+
+                                        if emit_added {
+                                            let item = responses_tool_call_item(
+                                                &name,
+                                                &all_arguments,
+                                                &call_id,
+                                                &tool_call_kinds_by_name,
+                                            );
+                                            yield Ok(sse_event(
+                                                "response.output_item.added",
+                                                &json!({
+                                                    "type": "response.output_item.added",
+                                                    "output_index": tool_output_index(index),
+                                                    "item": item,
+                                                }),
+                                            ));
                                         }
 
-                                        if let Some(function) = tool_call.function {
-                                            if let Some(name) = function.name {
-                                                entry.name = Some(name);
-                                            }
-                                            if let Some(arguments) = function.arguments {
-                                                entry.arguments.push_str(&arguments);
-                                            }
+                                        if feature_flags.enable_tool_argument_stream_events
+                                            && let Some(delta_arguments) = delta_arguments
+                                        {
+                                            yield Ok(sse_event(
+                                                "response.function_call_arguments.delta",
+                                                &json!({
+                                                    "type": "response.function_call_arguments.delta",
+                                                    "item_id": call_id,
+                                                    "output_index": tool_output_index(index),
+                                                    "delta": delta_arguments,
+                                                }),
+                                            ));
                                         }
                                     }
                                 }
@@ -197,6 +328,33 @@ where
         }
 
         if !acc.assistant_text.is_empty() {
+            if feature_flags.enable_extended_stream_events {
+                yield Ok(sse_event(
+                    "response.output_text.done",
+                    &json!({
+                        "type": "response.output_text.done",
+                        "item_id": response_id.clone(),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "text": acc.assistant_text,
+                    }),
+                ));
+
+                yield Ok(sse_event(
+                    "response.content_part.done",
+                    &json!({
+                        "type": "response.content_part.done",
+                        "item_id": response_id.clone(),
+                        "output_index": 0,
+                        "content_index": 0,
+                        "part": {
+                            "type": "output_text",
+                            "text": acc.assistant_text,
+                        }
+                    }),
+                ));
+            }
+
             yield Ok(sse_event(
                 "response.output_item.done",
                 &json!({
@@ -210,6 +368,34 @@ where
                                 "text": acc.assistant_text,
                             }
                         ]
+                    }
+                }),
+            ));
+        }
+
+        if feature_flags.enable_reasoning_stream_events && !acc.reasoning_text.is_empty() {
+            yield Ok(sse_event(
+                "response.reasoning_summary_text.done",
+                &json!({
+                    "type": "response.reasoning_summary_text.done",
+                    "item_id": reasoning_item_id(&response_id),
+                    "output_index": 0,
+                    "summary_index": 0,
+                    "text": acc.reasoning_text,
+                }),
+            ));
+            yield Ok(sse_event(
+                "response.output_item.done",
+                &json!({
+                    "type": "response.output_item.done",
+                    "output_index": 0,
+                    "item": {
+                        "type": "reasoning",
+                        "id": reasoning_item_id(&response_id),
+                        "summary": [{
+                            "type": "summary_text",
+                            "text": acc.reasoning_text,
+                        }]
                     }
                 }),
             ));
@@ -230,18 +416,34 @@ where
             );
             let item_for_done = item.clone();
 
-            yield Ok(sse_event(
-                "response.output_item.added",
-                &json!({
-                    "type": "response.output_item.added",
-                    "item": item,
-                }),
-            ));
+            if !tool_call.added_emitted {
+                yield Ok(sse_event(
+                    "response.output_item.added",
+                    &json!({
+                        "type": "response.output_item.added",
+                        "output_index": tool_output_index(index),
+                        "item": item,
+                    }),
+                ));
+            }
+
+            if feature_flags.enable_tool_argument_stream_events {
+                yield Ok(sse_event(
+                    "response.function_call_arguments.done",
+                    &json!({
+                        "type": "response.function_call_arguments.done",
+                        "item_id": call_id,
+                        "output_index": tool_output_index(index),
+                        "arguments": tool_call.arguments,
+                    }),
+                ));
+            }
 
             yield Ok(sse_event(
                 "response.output_item.done",
                 &json!({
                     "type": "response.output_item.done",
+                    "output_index": tool_output_index(index),
                     "item": item_for_done,
                 }),
             ));
@@ -289,6 +491,14 @@ where
 
 fn deterministic_tool_call_id(response_id: &str, index: usize) -> String {
     format!("call_{}_{}", response_id, index)
+}
+
+fn reasoning_item_id(response_id: &str) -> String {
+    format!("rs_{}", response_id)
+}
+
+fn tool_output_index(index: usize) -> usize {
+    index + 1
 }
 
 pub(crate) fn sse_event(event_name: &str, payload: &Value) -> Bytes {

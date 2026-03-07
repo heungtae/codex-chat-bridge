@@ -25,3 +25,5 @@ node_modules
 *.egg-info
 dist
 build
+litellm
+opencode

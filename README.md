@@ -50,6 +50,7 @@ npm install -g @heungtae/codex-chat-bridge
 - Forwards configured incoming headers (defaults include OpenAI metadata headers) to upstream with `--forward-incoming-header NAME` or `forward_incoming_headers`
 - Supports selectable upstream wire via `--upstream-wire chat|responses`
 - Uses `incoming_url` path matching for `POST /{*incoming_path}`
+- Supports feature flags globally (`[features]`) and per-router (`[routers.<name>.features]`)
 - Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
 - For chat upstream streaming, emits Responses-style SSE events:
   - `response.created`
@@ -97,10 +98,44 @@ Available router options:
 - `forward_incoming_headers`: Forwarded headers for this router
 - `drop_tool_types`: Tool types to drop for this router
 - `drop_request_fields`: Top-level request fields to drop before forwarding (for example `["prompt_cache_key"]`)
+- `features`: Router-specific feature flag overrides (for example `[routers.research.features]`)
 - `incoming_url`: Incoming URL/path bound to this router (for example `http://127.0.0.1:8787/research/v1/responses`)
   - Absolute `http://host:port/path` entries define listener addresses. The bridge listens on every unique `host:port` found in `routers.*.incoming_url`.
   - `incoming_url` is required for every router entry.
   - At least one absolute `incoming_url` is required to start the server.
+
+## Feature Flags (Global + Router Override)
+
+All feature flags default to `true`.
+
+Priority:
+- Built-in default (`true`)
+- Global override (`[features]`)
+- Router override (`[routers.<name>.features]`)
+
+Example:
+
+```toml
+[features]
+enable_previous_response_id = true
+enable_tool_argument_stream_events = true
+enable_extended_stream_events = true
+enable_reasoning_stream_events = true
+enable_provider_specific_fields = true
+enable_extended_input_types = true
+
+[routers.research.features]
+enable_reasoning_stream_events = false
+enable_tool_argument_stream_events = false
+```
+
+Available flags:
+- `enable_previous_response_id`: Enables `previous_response_id` session chaining for `responses -> chat`.
+- `enable_tool_argument_stream_events`: Emits tool argument SSE events (`response.function_call_arguments.delta/done`).
+- `enable_extended_stream_events`: Emits extended SSE lifecycle events (`response.in_progress`, content part add/done, `response.output_text.done`).
+- `enable_reasoning_stream_events`: Emits reasoning SSE events (`response.reasoning_summary_text.*`) and reasoning output items.
+- `enable_provider_specific_fields`: Preserves/passes `provider_specific_fields` in mapped responses.
+- `enable_extended_input_types`: Allows extended input/tool types (`input_image`, `input_file`, `mcp`, `web_search`, `web_search_preview`) in `responses -> chat` bridge path.
 
 ### CLI Options
 

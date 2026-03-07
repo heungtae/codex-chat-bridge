@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Write;
@@ -156,6 +157,7 @@ struct FileConfig {
     verbose_logging: Option<bool>,
     drop_tool_types: Option<Vec<String>>,
     drop_request_fields: Option<Vec<String>>,
+    features: Option<FeatureFlagsConfig>,
     #[serde(alias = "profiles")]
     routers: Option<BTreeMap<String, RouterConfig>>,
 }
@@ -169,7 +171,18 @@ struct RouterConfig {
     forward_incoming_headers: Option<Vec<String>>,
     drop_tool_types: Option<Vec<String>>,
     drop_request_fields: Option<Vec<String>>,
+    features: Option<FeatureFlagsConfig>,
     incoming_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct FeatureFlagsConfig {
+    enable_previous_response_id: Option<bool>,
+    enable_tool_argument_stream_events: Option<bool>,
+    enable_extended_stream_events: Option<bool>,
+    enable_reasoning_stream_events: Option<bool>,
+    enable_provider_specific_fields: Option<bool>,
+    enable_extended_input_types: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +197,57 @@ struct ResolvedConfig {
     verbose_logging: bool,
     drop_tool_types: Vec<String>,
     drop_request_fields: Vec<String>,
+    feature_flags: FeatureFlags,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct FeatureFlags {
+    enable_previous_response_id: bool,
+    enable_tool_argument_stream_events: bool,
+    enable_extended_stream_events: bool,
+    enable_reasoning_stream_events: bool,
+    enable_provider_specific_fields: bool,
+    enable_extended_input_types: bool,
+}
+
+impl Default for FeatureFlags {
+    fn default() -> Self {
+        Self {
+            enable_previous_response_id: true,
+            enable_tool_argument_stream_events: true,
+            enable_extended_stream_events: true,
+            enable_reasoning_stream_events: true,
+            enable_provider_specific_fields: true,
+            enable_extended_input_types: true,
+        }
+    }
+}
+
+impl FeatureFlags {
+    fn with_overrides(mut self, overrides: Option<&FeatureFlagsConfig>) -> Self {
+        let Some(overrides) = overrides else {
+            return self;
+        };
+        if let Some(v) = overrides.enable_previous_response_id {
+            self.enable_previous_response_id = v;
+        }
+        if let Some(v) = overrides.enable_tool_argument_stream_events {
+            self.enable_tool_argument_stream_events = v;
+        }
+        if let Some(v) = overrides.enable_extended_stream_events {
+            self.enable_extended_stream_events = v;
+        }
+        if let Some(v) = overrides.enable_reasoning_stream_events {
+            self.enable_reasoning_stream_events = v;
+        }
+        if let Some(v) = overrides.enable_provider_specific_fields {
+            self.enable_provider_specific_fields = v;
+        }
+        if let Some(v) = overrides.enable_extended_input_types {
+            self.enable_extended_input_types = v;
+        }
+        self
+    }
 }
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configuration
@@ -200,6 +264,14 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # verbose_logging = false
 # drop_tool_types = ["web_search", "web_search_preview"]
 # drop_request_fields = ["prompt_cache_key"]
+#
+# [features]
+# enable_previous_response_id = true
+# enable_tool_argument_stream_events = true
+# enable_extended_stream_events = true
+# enable_reasoning_stream_events = true
+# enable_provider_specific_fields = true
+# enable_extended_input_types = true
 
 # [routers.default]
 # upstream_url = "https://api.openai.com/v1/chat/completions"
@@ -209,6 +281,8 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # drop_tool_types = []
 # drop_request_fields = []
 # incoming_url = "http://<host>:<port>/default"
+# [routers.default.features]
+# enable_reasoning_stream_events = false
 
 # [routers.prod]
 # upstream_url = "https://api.openai.com/v1/chat/completions"
@@ -226,6 +300,7 @@ struct AppState {
     http_shutdown: bool,
     verbose_logging: bool,
     routers: Arc<RwLock<RouterManager>>,
+    sessions: Arc<RwLock<SessionStore>>,
 }
 
 #[derive(Clone)]
@@ -237,6 +312,7 @@ struct RouterManager {
     default_forward_incoming_headers: Vec<String>,
     default_drop_tool_types: HashSet<String>,
     default_drop_request_fields: HashSet<String>,
+    default_feature_flags: FeatureFlags,
     incoming_route_to_router: BTreeMap<IncomingRouteKey, String>,
     listen_addrs: BTreeSet<String>,
 }
@@ -250,6 +326,7 @@ struct RouteTarget {
     forward_incoming_headers: Vec<String>,
     drop_tool_types: HashSet<String>,
     drop_request_fields: HashSet<String>,
+    feature_flags: FeatureFlags,
 }
 
 #[derive(Clone, Debug)]
@@ -297,6 +374,7 @@ impl RouterManager {
         default_forward_incoming_headers: Vec<String>,
         default_drop_tool_types: Vec<String>,
         default_drop_request_fields: Vec<String>,
+        default_feature_flags: FeatureFlags,
     ) -> Result<Self> {
         let default_forward_incoming_headers = if default_forward_incoming_headers.is_empty() {
             DEFAULT_FORWARDED_UPSTREAM_HEADERS
@@ -355,6 +433,7 @@ impl RouterManager {
             default_forward_incoming_headers,
             default_drop_tool_types: default_drop_tool_types.into_iter().collect(),
             default_drop_request_fields: default_drop_request_fields.into_iter().collect(),
+            default_feature_flags,
             incoming_route_to_router,
             listen_addrs,
         })
@@ -577,6 +656,9 @@ impl RouterManager {
                 }
             }
         }
+        let feature_flags =
+            self.default_feature_flags
+                .with_overrides(router.and_then(|r| r.features.as_ref()));
 
         Ok(RouteTarget {
             router_name: name.to_string(),
@@ -586,6 +668,7 @@ impl RouterManager {
             forward_incoming_headers,
             drop_tool_types,
             drop_request_fields,
+            feature_flags,
         })
     }
 }
@@ -632,6 +715,8 @@ struct ChatDelta {
     #[serde(default)]
     content: Option<String>,
     #[serde(default)]
+    reasoning_content: Option<String>,
+    #[serde(default)]
     tool_calls: Option<Vec<ChatToolCallDelta>>,
 }
 
@@ -668,13 +753,54 @@ struct ToolCallAccumulator {
     id: Option<String>,
     name: Option<String>,
     arguments: String,
+    added_emitted: bool,
 }
 
 #[derive(Debug, Default)]
 struct StreamAccumulator {
     assistant_text: String,
+    reasoning_text: String,
     tool_calls: BTreeMap<usize, ToolCallAccumulator>,
     usage: Option<ChatUsage>,
+}
+
+#[derive(Debug)]
+struct SessionStore {
+    messages_by_response_id: HashMap<String, Vec<Value>>,
+    insertion_order: VecDeque<String>,
+}
+
+impl Default for SessionStore {
+    fn default() -> Self {
+        Self {
+            messages_by_response_id: HashMap::new(),
+            insertion_order: VecDeque::new(),
+        }
+    }
+}
+
+impl SessionStore {
+    const MAX_ENTRIES: usize = 1024;
+
+    fn get_messages(&self, response_id: &str) -> Option<Vec<Value>> {
+        self.messages_by_response_id.get(response_id).cloned()
+    }
+
+    fn insert_messages(&mut self, response_id: String, messages: Vec<Value>) {
+        if self.messages_by_response_id.contains_key(&response_id) {
+            self.insertion_order.retain(|id| id != &response_id);
+        }
+        self.messages_by_response_id
+            .insert(response_id.clone(), messages);
+        self.insertion_order.push_back(response_id);
+
+        while self.messages_by_response_id.len() > Self::MAX_ENTRIES {
+            let Some(oldest_id) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.messages_by_response_id.remove(&oldest_id);
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -745,6 +871,7 @@ pub async fn run() -> Result<()> {
         config.forward_incoming_headers,
         config.drop_tool_types,
         config.drop_request_fields,
+        config.feature_flags,
     )?;
     let listen_addrs = router_manager.get_listen_addrs();
     if listen_addrs.is_empty() {
@@ -769,11 +896,12 @@ pub async fn run() -> Result<()> {
         router_defaults.drop_request_fields
     );
     info!(
-        "runtime config: api_key_env={}, server_info={:?}, http_shutdown={}, verbose_logging={}",
+        "runtime config: api_key_env={}, server_info={:?}, http_shutdown={}, verbose_logging={}, feature_flags={:?}",
         config.api_key_env,
         config.server_info,
         config.http_shutdown,
-        config.verbose_logging
+        config.verbose_logging,
+        config.feature_flags
     );
     for snapshot in router_manager.get_router_delta_log_snapshots() {
         let RouterDeltaLogSnapshot {
@@ -826,6 +954,7 @@ pub async fn run() -> Result<()> {
         http_shutdown: config.http_shutdown,
         verbose_logging: config.verbose_logging,
         routers: Arc::new(RwLock::new(router_manager)),
+        sessions: Arc::new(RwLock::new(SessionStore::default())),
     });
 
     let app = Router::new()
@@ -914,6 +1043,7 @@ fn ensure_default_config_file(path: &Path) -> Result<()> {
 
 fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<ResolvedConfig> {
     let file_config = file_config.unwrap_or_default();
+    let feature_flags = FeatureFlags::default().with_overrides(file_config.features.as_ref());
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
     drop_tool_types.extend(args.drop_tool_types);
     drop_tool_types.retain(|v| !v.trim().is_empty());
@@ -962,6 +1092,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
         verbose_logging: args.verbose_logging || file_config.verbose_logging.unwrap_or(false),
         drop_tool_types,
         drop_request_fields,
+        feature_flags,
     })
 }
 
@@ -1360,7 +1491,12 @@ async fn handle_incoming(
         &route_target.drop_tool_types,
         &route_target.drop_request_fields,
     );
-    if let Err(err) = validate_capability_gate(incoming_api, route_target.upstream_wire, &request_value) {
+    if let Err(err) = validate_capability_gate(
+        incoming_api,
+        route_target.upstream_wire,
+        route_target.feature_flags.enable_extended_input_types,
+        &request_value,
+    ) {
         return error_response_for_stream(wants_stream, "unsupported_feature", &err.to_string());
     }
     let tool_call_kinds_by_name = if incoming_api == IncomingApi::Responses {
@@ -1370,17 +1506,50 @@ async fn handle_incoming(
     };
 
     let response_id = format!("resp_bridge_{}", Uuid::now_v7());
-    let upstream_payload =
+    let mut upstream_payload =
         match build_upstream_payload(
             &request_value,
             incoming_api,
             route_target.upstream_wire,
             wants_stream,
+            route_target.feature_flags.enable_extended_input_types,
         )
         {
             Ok(v) => v,
             Err(err) => return error_response_for_stream(wants_stream, "invalid_request", &err.to_string()),
         };
+
+    if route_target.feature_flags.enable_previous_response_id
+        && incoming_api == IncomingApi::Responses
+        && route_target.upstream_wire == WireApi::Chat
+    {
+        let previous_messages = {
+            let sessions = state.sessions.read().await;
+            match resolve_previous_messages_for_request(&request_value, &sessions) {
+                Ok(v) => v,
+                Err(err) => {
+                    return error_response_for_stream(
+                        wants_stream,
+                        "invalid_request",
+                        &err.to_string(),
+                    )
+                }
+            }
+        };
+        if let Some(messages) = previous_messages
+            && let Err(err) = merge_previous_messages(&mut upstream_payload, &messages)
+        {
+            return error_response_for_stream(wants_stream, "invalid_request", &err.to_string());
+        }
+
+        let chat_messages = upstream_payload
+            .get("messages")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut sessions = state.sessions.write().await;
+        sessions.insert_messages(response_id.clone(), chat_messages);
+    }
 
     if verbose_logging {
         if let Some(messages) =
@@ -1494,6 +1663,7 @@ async fn handle_incoming(
                 route_target.router_name.clone(),
                 verbose_logging,
                 tool_call_kinds_by_name.clone(),
+                route_target.feature_flags,
             )),
             WireApi::Responses => Body::from_stream(passthrough_responses_stream(
                 upstream_response.bytes_stream(),
@@ -1538,7 +1708,12 @@ async fn handle_incoming(
 
     let response_json = match route_target.upstream_wire {
         WireApi::Chat => {
-            chat_json_to_responses_json(upstream_json, response_id, &tool_call_kinds_by_name)
+            chat_json_to_responses_json(
+                upstream_json,
+                response_id,
+                &tool_call_kinds_by_name,
+                route_target.feature_flags.enable_provider_specific_fields,
+            )
         }
         WireApi::Responses => upstream_json,
     };
@@ -1604,7 +1779,12 @@ fn apply_request_filters(
     }
 }
 
-fn validate_capability_gate(incoming_api: IncomingApi, upstream_wire: WireApi, request: &Value) -> Result<()> {
+fn validate_capability_gate(
+    incoming_api: IncomingApi,
+    upstream_wire: WireApi,
+    enable_extended_input_types: bool,
+    request: &Value,
+) -> Result<()> {
     if incoming_api != IncomingApi::Responses || upstream_wire != WireApi::Chat {
         return Ok(());
     }
@@ -1620,7 +1800,15 @@ fn validate_capability_gate(incoming_api: IncomingApi, upstream_wire: WireApi, r
     if let Some(tools) = request.get("tools").and_then(Value::as_array) {
         for tool in tools {
             let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or_default();
-            if !matches!(tool_type, "function" | "custom") {
+            let is_supported = if enable_extended_input_types {
+                matches!(
+                    tool_type,
+                    "function" | "custom" | "mcp" | "web_search" | "web_search_preview"
+                )
+            } else {
+                matches!(tool_type, "function" | "custom")
+            };
+            if !is_supported {
                 return Err(anyhow!(
                     "responses->chat bridge does not support tool type `{tool_type}`"
                 ));
@@ -1646,16 +1834,64 @@ fn request_has_non_empty_field(request: &Value, field: &str) -> bool {
     }
 }
 
+fn previous_response_id_for_request(request: &Value) -> Option<&str> {
+    request
+        .get("previous_response_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+}
+
+fn resolve_previous_messages_for_request(
+    request: &Value,
+    sessions: &SessionStore,
+) -> Result<Option<Vec<Value>>> {
+    let Some(previous_response_id) = previous_response_id_for_request(request) else {
+        return Ok(None);
+    };
+
+    let Some(messages) = sessions.get_messages(previous_response_id) else {
+        return Err(anyhow!(
+            "unknown `previous_response_id`: {previous_response_id}"
+        ));
+    };
+    Ok(Some(messages))
+}
+
+fn merge_previous_messages(upstream_payload: &mut Value, previous_messages: &[Value]) -> Result<()> {
+    let obj = upstream_payload
+        .as_object_mut()
+        .ok_or_else(|| anyhow!("upstream chat payload must be an object"))?;
+    let messages = obj
+        .get_mut("messages")
+        .and_then(Value::as_array_mut)
+        .ok_or_else(|| anyhow!("upstream chat payload is missing `messages` array"))?;
+    if previous_messages.is_empty() {
+        return Ok(());
+    }
+    let mut merged = previous_messages.to_vec();
+    merged.extend(messages.iter().cloned());
+    *messages = merged;
+    Ok(())
+}
+
 fn build_upstream_payload(
     request: &Value,
     incoming_api: IncomingApi,
     upstream_wire: WireApi,
     stream: bool,
+    enable_extended_input_types: bool,
 ) -> Result<Value> {
     let mut payload = match (incoming_api, upstream_wire) {
         (IncomingApi::Responses, WireApi::Responses) => request.clone(),
         (IncomingApi::Responses, WireApi::Chat) => {
-            map_responses_to_chat_request_with_stream(request, &HashSet::new(), stream)?.chat_request
+            map_responses_to_chat_request_with_stream(
+                request,
+                &HashSet::new(),
+                stream,
+                enable_extended_input_types,
+            )?
+            .chat_request
         }
         (IncomingApi::Chat, WireApi::Chat) => request.clone(),
         (IncomingApi::Chat, WireApi::Responses) => map_chat_to_responses_request(request, stream)?,

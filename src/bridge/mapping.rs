@@ -231,14 +231,19 @@ pub(crate) fn chat_json_to_responses_json(
     chat: Value,
     response_id: String,
     tool_call_kinds_by_name: &HashMap<String, ResponsesToolCallKind>,
+    enable_provider_specific_fields: bool,
 ) -> Value {
     let mut output_items = Vec::new();
+    let mut status = "completed";
 
     if let Some(choice) = chat
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|items| items.first())
     {
+        status = map_chat_finish_reason_to_responses_status(
+            choice.get("finish_reason").and_then(Value::as_str),
+        );
         if let Some(message) = choice.get("message") {
             let text = message
                 .get("content")
@@ -269,12 +274,27 @@ pub(crate) fn chat_json_to_responses_json(
                         .map(function_arguments_to_text)
                         .unwrap_or_else(|| "{}".to_string());
 
-                    output_items.push(responses_tool_call_item(
+                    let mut item = responses_tool_call_item(
                         name,
                         &arguments,
                         &call_id,
                         tool_call_kinds_by_name,
-                    ));
+                    );
+                    if enable_provider_specific_fields {
+                        if let Some(provider_specific_fields) = tc
+                            .get("provider_specific_fields")
+                            .cloned()
+                            .or_else(|| function.get("provider_specific_fields").cloned())
+                            && let Some(obj) = item.as_object_mut()
+                        {
+                            obj.insert(
+                                "provider_specific_fields".to_string(),
+                                provider_specific_fields,
+                            );
+                        }
+                    }
+
+                    output_items.push(item);
                 }
             }
         }
@@ -290,19 +310,38 @@ pub(crate) fn chat_json_to_responses_json(
         })
     });
 
-    json!({
+    let mut response = json!({
         "id": response_id,
         "object": "response",
-        "status": "completed",
+        "status": status,
         "output": output_items,
         "usage": usage_json,
-    })
+    });
+    if enable_provider_specific_fields {
+        if let Some(provider_specific_fields) = chat.get("provider_specific_fields").cloned()
+            && let Some(obj) = response.as_object_mut()
+        {
+            obj.insert(
+                "provider_specific_fields".to_string(),
+                provider_specific_fields,
+            );
+        }
+    }
+    response
+}
+
+fn map_chat_finish_reason_to_responses_status(finish_reason: Option<&str>) -> &'static str {
+    match finish_reason {
+        Some("length" | "content_filter") => "incomplete",
+        _ => "completed",
+    }
 }
 
 pub(crate) fn map_responses_to_chat_request_with_stream(
     request: &Value,
     drop_tool_types: &HashSet<String>,
     stream: bool,
+    enable_extended_input_types: bool,
 ) -> Result<BridgeRequest> {
     let model = request
         .get("model")
@@ -356,7 +395,9 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     .get("content")
                     .and_then(Value::as_array)
                     .map(Vec::as_slice)
-                    .map_or_else(String::new, flatten_content_items);
+                    .map_or_else(String::new, |items| {
+                        flatten_content_items(items, enable_extended_input_types)
+                    });
 
                 if !content.trim().is_empty() {
                     messages.push(json!({
@@ -449,6 +490,26 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     "content": output_text,
                 }));
             }
+            "tool_result" => {
+                if !enable_extended_input_types {
+                    warn!("ignoring unsupported input item type: {item_type}");
+                    continue;
+                }
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let output_text = item
+                    .get("output")
+                    .or_else(|| item.get("result"))
+                    .map(function_output_to_text)
+                    .unwrap_or_default();
+                messages.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": output_text,
+                }));
+            }
             "custom_tool_call_output" => {
                 let call_id = item
                     .get("call_id")
@@ -462,6 +523,41 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     "role": "tool",
                     "tool_call_id": call_id,
                     "content": output_text,
+                }));
+            }
+            "web_search_call" => {
+                if !enable_extended_input_types {
+                    warn!("ignoring unsupported input item type: {item_type}");
+                    continue;
+                }
+                let call_id = item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                let name = item
+                    .get("name")
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.trim().is_empty())
+                    .unwrap_or("web_search");
+                let arguments = item
+                    .get("arguments")
+                    .or_else(|| item.get("query"))
+                    .map(function_arguments_to_text)
+                    .unwrap_or_else(|| "{}".to_string());
+
+                messages.push(json!({
+                    "role": "assistant",
+                    "content": "",
+                    "tool_calls": [{
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }]
                 }));
             }
             "mcp_tool_call_output" => {
@@ -518,7 +614,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
     Ok(BridgeRequest { chat_request })
 }
 
-pub(crate) fn flatten_content_items(items: &[Value]) -> String {
+pub(crate) fn flatten_content_items(items: &[Value], enable_extended_input_types: bool) -> String {
     let mut parts = Vec::new();
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
@@ -527,6 +623,26 @@ pub(crate) fn flatten_content_items(items: &[Value]) -> String {
             && !text.is_empty()
         {
             parts.push(text.to_string());
+            continue;
+        }
+
+        if enable_extended_input_types && item_type == "input_image" {
+            if let Some(url) = item.get("image_url").and_then(Value::as_str) {
+                parts.push(format!("[input_image] {url}"));
+            } else {
+                parts.push("[input_image]".to_string());
+            }
+            continue;
+        }
+
+        if enable_extended_input_types && item_type == "input_file" {
+            if let Some(file_id) = item.get("file_id").and_then(Value::as_str) {
+                parts.push(format!("[input_file] file_id={file_id}"));
+            } else if let Some(file_data) = item.get("file_data").and_then(Value::as_str) {
+                parts.push(format!("[input_file] file_data={file_data}"));
+            } else {
+                parts.push("[input_file]".to_string());
+            }
         }
     }
 
@@ -536,7 +652,7 @@ pub(crate) fn flatten_content_items(items: &[Value]) -> String {
 pub(crate) fn function_output_to_text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
-        Value::Array(items) => flatten_content_items(items),
+        Value::Array(items) => flatten_content_items(items, true),
         other => other.to_string(),
     }
 }
@@ -674,4 +790,3 @@ pub(crate) fn normalize_tool_choice(tool_choice: Value) -> Value {
 
     Value::String("auto".to_string())
 }
-

@@ -27,7 +27,7 @@
             "parallel_tool_calls": true
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -91,7 +91,7 @@
             json!({"type":"input_image","image_url":"x"}),
             json!({"type":"output_text","text":"b"}),
         ];
-        assert_eq!(flatten_content_items(&items), "a\nb");
+        assert_eq!(flatten_content_items(&items, true), "a\n[input_image] x\nb");
     }
 
     #[test]
@@ -108,7 +108,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -117,6 +117,59 @@
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "tool");
         assert_eq!(messages[0]["tool_call_id"], "call_1");
+    }
+
+    #[test]
+    fn map_supports_tool_result_to_tool_message() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "tool_result",
+                    "call_id": "call_2",
+                    "result": "{\"ok\":true}"
+                }
+            ],
+            "tools": []
+        });
+
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let messages = req
+            .chat_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "tool");
+        assert_eq!(messages[0]["tool_call_id"], "call_2");
+        assert_eq!(messages[0]["content"], "{\"ok\":true}");
+    }
+
+    #[test]
+    fn map_supports_web_search_call_to_assistant_tool_call_message() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "web_search_call",
+                    "call_id": "call_web_1",
+                    "name": "web_search",
+                    "arguments": "{\"query\":\"rust\"}"
+                }
+            ],
+            "tools": []
+        });
+
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let messages = req
+            .chat_request
+            .get("messages")
+            .and_then(Value::as_array)
+            .expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_web_1");
+        assert_eq!(messages[0]["tool_calls"][0]["function"]["name"], "web_search");
     }
 
     #[test]
@@ -134,7 +187,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -165,7 +218,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -191,14 +244,14 @@
             "tool_choice": 123
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
         assert_eq!(req.chat_request["tool_choice"], "auto");
     }
 
     #[test]
     fn map_requires_input_array() {
         let input = json!({"model":"gpt-4.1"});
-        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect_err("must fail");
+        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect_err("must fail");
         assert!(err.to_string().contains("missing `input` array"));
     }
 
@@ -218,7 +271,7 @@
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": []
         });
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("ok");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("ok");
         let obj = req.chat_request.as_object().expect("object");
         assert!(!obj.contains_key("tools"));
         assert!(!obj.contains_key("tool_choice"));
@@ -298,7 +351,7 @@
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": []
         });
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true).expect("ok");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("ok");
         let messages = req.chat_request["messages"].as_array().expect("array");
         assert_eq!(messages[0]["role"], "system");
     }
@@ -350,6 +403,7 @@
             "test_router".to_string(),
             false,
             HashMap::new(),
+            FeatureFlags::default(),
         ));
         let mut payload = String::new();
 
@@ -364,6 +418,10 @@
             .find("event: response.output_text.delta")
             .expect("delta event");
         assert!(added_idx < delta_idx);
+        assert!(payload.contains("event: response.in_progress"));
+        assert!(payload.contains("event: response.content_part.added"));
+        assert!(payload.contains("event: response.output_text.done"));
+        assert!(payload.contains("event: response.content_part.done"));
     }
 
     #[tokio::test]
@@ -380,6 +438,7 @@
             "test_router".to_string(),
             false,
             kinds,
+            FeatureFlags::default(),
         ));
         let mut payload = String::new();
 
@@ -409,11 +468,52 @@
         });
         let mut kinds = HashMap::new();
         kinds.insert("shell".to_string(), ResponsesToolCallKind::Custom);
-        let out = chat_json_to_responses_json(chat, "resp_1".to_string(), &kinds);
+        let out = chat_json_to_responses_json(chat, "resp_1".to_string(), &kinds, false);
         let output = out["output"].as_array().expect("output array");
         assert_eq!(output[0]["type"], "custom_tool_call");
         assert_eq!(output[0]["call_id"], "call_custom_1");
         assert_eq!(output[0]["input"], "echo hello");
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_maps_length_finish_reason_to_incomplete() {
+        let chat = json!({
+            "choices": [{
+                "finish_reason": "length",
+                "message": {
+                    "content": "partial output"
+                }
+            }]
+        });
+        let out = chat_json_to_responses_json(chat, "resp_2".to_string(), &HashMap::new(), false);
+        assert_eq!(out["status"], "incomplete");
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_preserves_provider_specific_fields() {
+        let chat = json!({
+            "provider_specific_fields": {
+                "mcp_list_tools": [{"name":"shell"}]
+            },
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_fn_1",
+                        "provider_specific_fields": {"source":"provider"},
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"seoul\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let out = chat_json_to_responses_json(chat, "resp_3".to_string(), &HashMap::new(), true);
+        assert_eq!(out["provider_specific_fields"]["mcp_list_tools"][0]["name"], "shell");
+        assert_eq!(
+            out["output"][0]["provider_specific_fields"]["source"],
+            "provider"
+        );
     }
 
     #[test]
@@ -447,6 +547,7 @@
             verbose_logging: Some(true),
             drop_tool_types: None,
             drop_request_fields: None,
+            features: None,
             routers: None,
         };
 
@@ -626,6 +727,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            FeatureFlags::default(),
         )
         .expect("manager");
         let target = manager
@@ -657,6 +759,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            FeatureFlags::default(),
         )
         .expect("manager");
         let target = manager
@@ -688,6 +791,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            FeatureFlags::default(),
         );
         match result {
             Ok(_) => panic!("must fail"),
@@ -721,6 +825,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            FeatureFlags::default(),
         )
         .expect("manager");
 
@@ -749,6 +854,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            FeatureFlags::default(),
         );
 
         match result {
@@ -790,6 +896,7 @@
             verbose_logging: None,
             drop_tool_types: None,
             drop_request_fields: None,
+            features: None,
             routers: None,
         };
 
@@ -831,6 +938,50 @@
         assert_eq!(out["stream"], false);
         assert_eq!(out["input"][0]["type"], "message");
         assert_eq!(out["input"][0]["content"][0]["text"], "hello");
+    }
+
+    #[test]
+    fn previous_response_id_for_request_ignores_blank_values() {
+        let request = json!({
+            "previous_response_id": "   "
+        });
+        assert_eq!(previous_response_id_for_request(&request), None);
+
+        let request = json!({
+            "previous_response_id": "resp_123"
+        });
+        assert_eq!(previous_response_id_for_request(&request), Some("resp_123"));
+    }
+
+    #[test]
+    fn resolve_previous_messages_for_request_errors_when_not_found() {
+        let request = json!({
+            "previous_response_id": "resp_missing"
+        });
+        let sessions = SessionStore::default();
+        let err = resolve_previous_messages_for_request(&request, &sessions).expect_err("must fail");
+        assert!(err.to_string().contains("unknown `previous_response_id`"));
+    }
+
+    #[test]
+    fn merge_previous_messages_prepends_history_messages() {
+        let mut payload = json!({
+            "messages": [
+                {"role":"user","content":"new"}
+            ]
+        });
+        let previous = vec![
+            json!({"role":"system","content":"old-system"}),
+            json!({"role":"user","content":"old-user"}),
+        ];
+
+        merge_previous_messages(&mut payload, &previous).expect("ok");
+
+        let messages = payload["messages"].as_array().expect("array");
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[0]["content"], "old-system");
+        assert_eq!(messages[1]["content"], "old-user");
+        assert_eq!(messages[2]["content"], "new");
     }
 
     #[test]
@@ -968,7 +1119,7 @@
             "reasoning": {"effort":"medium"}
         });
 
-        let err = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request)
+        let err = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request)
             .expect_err("must fail");
         assert!(err.to_string().contains("does not support `reasoning`"));
     }
@@ -981,7 +1132,7 @@
             "tools": [{"type":"function","name":"f","parameters":{"type":"object"}}]
         });
 
-        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request);
+        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request);
         assert!(out.is_ok());
     }
 
@@ -993,7 +1144,23 @@
             "prompt_cache_key": "session-key-1"
         });
 
-        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request);
+        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request);
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn capability_gate_allows_mcp_and_web_search_tool_types() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "tools": [
+                {"type":"mcp","server_label":"s","server_url":"http://localhost/mcp"},
+                {"type":"web_search"},
+                {"type":"web_search_preview"}
+            ]
+        });
+
+        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request);
         assert!(out.is_ok());
     }
 
@@ -1016,6 +1183,7 @@
             "test_router".to_string(),
             false,
             HashMap::new(),
+            FeatureFlags::default(),
         ));
         let mut payload = String::new();
 
@@ -1041,6 +1209,7 @@
             "test_router".to_string(),
             false,
             kinds,
+            FeatureFlags::default(),
         ));
         let mut payload = String::new();
 
@@ -1056,4 +1225,33 @@
             .expect("done event");
         assert!(added_idx < done_idx);
         assert!(payload.contains("\"call_id\":\"call_resp_1_0\""));
+        assert!(payload.contains("event: response.function_call_arguments.delta"));
+        assert!(payload.contains("event: response.function_call_arguments.done"));
+        assert!(payload.contains("\"arguments\":\"echo hi\""));
+    }
+
+    #[tokio::test]
+    async fn stream_emits_reasoning_summary_events() {
+        let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"think \"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step\"}}]}\n\n\
+             data: [DONE]\n\n",
+        ))]);
+        let mut output = Box::pin(translate_chat_stream(
+            upstream,
+            "resp_1".to_string(),
+            "test_router".to_string(),
+            false,
+            HashMap::new(),
+            FeatureFlags::default(),
+        ));
+        let mut payload = String::new();
+
+        while let Some(event) = output.next().await {
+            payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+        }
+
+        assert!(payload.contains("event: response.reasoning_summary_text.delta"));
+        assert!(payload.contains("event: response.reasoning_summary_text.done"));
+        assert!(payload.contains("\"text\":\"think step\""));
     }
