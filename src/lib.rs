@@ -155,6 +155,7 @@ struct FileConfig {
     http_shutdown: Option<bool>,
     verbose_logging: Option<bool>,
     drop_tool_types: Option<Vec<String>>,
+    drop_request_fields: Option<Vec<String>>,
     #[serde(alias = "profiles")]
     routers: Option<BTreeMap<String, RouterConfig>>,
 }
@@ -167,6 +168,7 @@ struct RouterConfig {
     upstream_http_headers: Option<BTreeMap<String, String>>,
     forward_incoming_headers: Option<Vec<String>>,
     drop_tool_types: Option<Vec<String>>,
+    drop_request_fields: Option<Vec<String>>,
     incoming_url: Option<String>,
 }
 
@@ -181,6 +183,7 @@ struct ResolvedConfig {
     http_shutdown: bool,
     verbose_logging: bool,
     drop_tool_types: Vec<String>,
+    drop_request_fields: Vec<String>,
 }
 
 const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configuration
@@ -196,6 +199,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # http_shutdown = false
 # verbose_logging = false
 # drop_tool_types = ["web_search", "web_search_preview"]
+# drop_request_fields = ["prompt_cache_key"]
 
 # [routers.default]
 # upstream_url = "https://api.openai.com/v1/chat/completions"
@@ -203,6 +207,7 @@ const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime configurati
 # upstream_http_headers = {}
 # forward_incoming_headers = []
 # drop_tool_types = []
+# drop_request_fields = []
 # incoming_url = "http://<host>:<port>/default"
 
 # [routers.prod]
@@ -231,6 +236,7 @@ struct RouterManager {
     default_upstream_http_headers: Vec<UpstreamHeader>,
     default_forward_incoming_headers: Vec<String>,
     default_drop_tool_types: HashSet<String>,
+    default_drop_request_fields: HashSet<String>,
     incoming_route_to_router: BTreeMap<IncomingRouteKey, String>,
     listen_addrs: BTreeSet<String>,
 }
@@ -243,6 +249,7 @@ struct RouteTarget {
     upstream_http_headers: Vec<UpstreamHeader>,
     forward_incoming_headers: Vec<String>,
     drop_tool_types: HashSet<String>,
+    drop_request_fields: HashSet<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -252,6 +259,7 @@ struct RouterDefaultsLogSnapshot {
     upstream_http_headers: Vec<UpstreamHeader>,
     forward_incoming_headers: Vec<String>,
     drop_tool_types: Vec<String>,
+    drop_request_fields: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -265,6 +273,7 @@ struct RouterDeltaLogSnapshot {
     override_upstream_http_headers: Option<Vec<UpstreamHeader>>,
     override_forward_incoming_headers: Option<Vec<String>>,
     override_drop_tool_types: Option<Vec<String>>,
+    override_drop_request_fields: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -287,6 +296,7 @@ impl RouterManager {
         default_upstream_http_headers: Vec<UpstreamHeader>,
         default_forward_incoming_headers: Vec<String>,
         default_drop_tool_types: Vec<String>,
+        default_drop_request_fields: Vec<String>,
     ) -> Result<Self> {
         let default_forward_incoming_headers = if default_forward_incoming_headers.is_empty() {
             DEFAULT_FORWARDED_UPSTREAM_HEADERS
@@ -344,6 +354,7 @@ impl RouterManager {
             default_upstream_http_headers,
             default_forward_incoming_headers,
             default_drop_tool_types: default_drop_tool_types.into_iter().collect(),
+            default_drop_request_fields: default_drop_request_fields.into_iter().collect(),
             incoming_route_to_router,
             listen_addrs,
         })
@@ -360,12 +371,19 @@ impl RouterManager {
             .cloned()
             .collect::<Vec<_>>();
         drop_tool_types.sort();
+        let mut drop_request_fields = self
+            .default_drop_request_fields
+            .iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        drop_request_fields.sort();
         RouterDefaultsLogSnapshot {
             upstream_url: self.default_upstream_url.clone(),
             upstream_wire: self.default_upstream_wire,
             upstream_http_headers: self.default_upstream_http_headers.clone(),
             forward_incoming_headers: self.default_forward_incoming_headers.clone(),
             drop_tool_types,
+            drop_request_fields,
         }
     }
 
@@ -437,6 +455,22 @@ impl RouterManager {
                     Some(extras)
                 }
             });
+            let override_drop_request_fields =
+                router_cfg.drop_request_fields.as_ref().and_then(|fields| {
+                    let mut extras = fields
+                        .iter()
+                        .map(|f| f.trim())
+                        .filter(|f| !f.is_empty() && !self.default_drop_request_fields.contains(*f))
+                        .map(ToString::to_string)
+                        .collect::<Vec<_>>();
+                    extras.sort();
+                    extras.dedup();
+                    if extras.is_empty() {
+                        None
+                    } else {
+                        Some(extras)
+                    }
+                });
 
             snapshots.push(RouterDeltaLogSnapshot {
                 name: name.clone(),
@@ -448,6 +482,7 @@ impl RouterManager {
                 override_upstream_http_headers,
                 override_forward_incoming_headers,
                 override_drop_tool_types,
+                override_drop_request_fields,
             });
         }
 
@@ -533,6 +568,15 @@ impl RouterManager {
         if let Some(router_drop) = router.and_then(|r| r.drop_tool_types.clone()) {
             drop_tool_types.extend(router_drop);
         }
+        let mut drop_request_fields = self.default_drop_request_fields.clone();
+        if let Some(router_drop_fields) = router.and_then(|r| r.drop_request_fields.clone()) {
+            for field in router_drop_fields {
+                let normalized = field.trim();
+                if !normalized.is_empty() {
+                    drop_request_fields.insert(normalized.to_string());
+                }
+            }
+        }
 
         Ok(RouteTarget {
             router_name: name.to_string(),
@@ -541,6 +585,7 @@ impl RouterManager {
             upstream_http_headers,
             forward_incoming_headers,
             drop_tool_types,
+            drop_request_fields,
         })
     }
 }
@@ -699,6 +744,7 @@ pub async fn run() -> Result<()> {
         config.upstream_http_headers,
         config.forward_incoming_headers,
         config.drop_tool_types,
+        config.drop_request_fields,
     )?;
     let listen_addrs = router_manager.get_listen_addrs();
     if listen_addrs.is_empty() {
@@ -714,12 +760,13 @@ pub async fn run() -> Result<()> {
         router_manager.get_router_names().len()
     );
     info!(
-        "router defaults: upstream_url={}, upstream_wire={:?}, upstream_http_headers={:?}, forward_incoming_headers={:?}, drop_tool_types={:?}",
+        "router defaults: upstream_url={}, upstream_wire={:?}, upstream_http_headers={:?}, forward_incoming_headers={:?}, drop_tool_types={:?}, drop_request_fields={:?}",
         router_defaults.upstream_url,
         router_defaults.upstream_wire,
         router_defaults.upstream_http_headers,
         router_defaults.forward_incoming_headers,
-        router_defaults.drop_tool_types
+        router_defaults.drop_tool_types,
+        router_defaults.drop_request_fields
     );
     info!(
         "runtime config: api_key_env={}, server_info={:?}, http_shutdown={}, verbose_logging={}",
@@ -739,6 +786,7 @@ pub async fn run() -> Result<()> {
             override_upstream_http_headers,
             override_forward_incoming_headers,
             override_drop_tool_types,
+            override_drop_request_fields,
         } = snapshot;
 
         let mut overrides = Vec::new();
@@ -756,6 +804,9 @@ pub async fn run() -> Result<()> {
         }
         if let Some(v) = override_drop_tool_types {
             overrides.push(format!("drop_tool_types={v:?}"));
+        }
+        if let Some(v) = override_drop_request_fields {
+            overrides.push(format!("drop_request_fields={v:?}"));
         }
         let override_summary = if overrides.is_empty() {
             "none".to_string()
@@ -866,6 +917,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
     drop_tool_types.extend(args.drop_tool_types);
     drop_tool_types.retain(|v| !v.trim().is_empty());
+    let drop_request_fields = normalize_drop_request_fields(file_config.drop_request_fields.unwrap_or_default());
     let selected_upstream_url = args.upstream_url.or(file_config.upstream_url);
     let explicit_upstream_wire = args.upstream_wire.or(file_config.upstream_wire);
     let upstream_wire = resolve_upstream_wire(
@@ -909,7 +961,19 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
         http_shutdown: args.http_shutdown || file_config.http_shutdown.unwrap_or(false),
         verbose_logging: args.verbose_logging || file_config.verbose_logging.unwrap_or(false),
         drop_tool_types,
+        drop_request_fields,
     })
+}
+
+fn normalize_drop_request_fields(fields: Vec<String>) -> Vec<String> {
+    let mut normalized = fields
+        .into_iter()
+        .map(|f| f.trim().to_string())
+        .filter(|f| !f.is_empty())
+        .collect::<Vec<_>>();
+    normalized.sort();
+    normalized.dedup();
+    normalized
 }
 
 fn parse_upstream_http_header_arg(raw: &str) -> std::result::Result<UpstreamHeader, String> {
@@ -1281,11 +1345,21 @@ async fn handle_incoming(
             route_target.router_name,
             tool_types_for_logging(&request_value)
         );
+        debug!(
+            "incoming request fields (router={}): {}",
+            route_target.router_name,
+            request_fields_for_logging(&request_value)
+        );
     }
 
     let incoming_api = incoming_api_hint.unwrap_or_else(|| infer_incoming_api(&request_value));
     let wants_stream = stream_flag_for_request(incoming_api, &request_value);
-    apply_request_filters(incoming_api, &mut request_value, &route_target.drop_tool_types);
+    apply_request_filters(
+        incoming_api,
+        &mut request_value,
+        &route_target.drop_tool_types,
+        &route_target.drop_request_fields,
+    );
     if let Err(err) = validate_capability_gate(incoming_api, route_target.upstream_wire, &request_value) {
         return error_response_for_stream(wants_stream, "unsupported_feature", &err.to_string());
     }
@@ -1341,6 +1415,13 @@ async fn handle_incoming(
             incoming_api,
             route_target.upstream_wire,
             tool_types_for_logging(&upstream_payload)
+        );
+        debug!(
+            "upstream request fields (router={}, {:?}->{:?}): {}",
+            route_target.router_name,
+            incoming_api,
+            route_target.upstream_wire,
+            request_fields_for_logging(&upstream_payload)
         );
     }
 
@@ -1491,10 +1572,15 @@ fn apply_request_filters(
     incoming_api: IncomingApi,
     request: &mut Value,
     drop_tool_types: &HashSet<String>,
+    drop_request_fields: &HashSet<String>,
 ) {
     let Some(obj) = request.as_object_mut() else {
         return;
     };
+
+    for field in drop_request_fields {
+        obj.remove(field);
+    }
 
     let Some(tools) = obj.get_mut("tools") else {
         return;
@@ -1523,7 +1609,7 @@ fn validate_capability_gate(incoming_api: IncomingApi, upstream_wire: WireApi, r
         return Ok(());
     }
 
-    for field in ["reasoning", "include", "text", "service_tier", "prompt_cache_key"] {
+    for field in ["reasoning", "include", "text", "service_tier"] {
         if request_has_non_empty_field(request, field) {
             return Err(anyhow!(
                 "responses->chat bridge does not support `{field}` yet; disable it or route to native responses upstream"
@@ -1662,6 +1748,16 @@ fn tool_types_for_logging(payload: &Value) -> Value {
         })
         .unwrap_or_default();
     Value::Array(tool_labels)
+}
+
+fn request_fields_for_logging(payload: &Value) -> Value {
+    let Some(obj) = payload.as_object() else {
+        return Value::Array(Vec::new());
+    };
+
+    let mut fields = obj.keys().cloned().collect::<Vec<_>>();
+    fields.sort();
+    Value::Array(fields.into_iter().map(Value::String).collect())
 }
 
 fn tool_type_label_for_logging(tool: &Value) -> String {

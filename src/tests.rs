@@ -446,6 +446,7 @@
             http_shutdown: Some(false),
             verbose_logging: Some(true),
             drop_tool_types: None,
+            drop_request_fields: None,
             routers: None,
         };
 
@@ -624,6 +625,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .expect("manager");
         let target = manager
@@ -654,6 +656,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .expect("manager");
         let target = manager
@@ -681,6 +684,7 @@
             routers,
             "https://api.openai.com/v1/chat/completions".to_string(),
             WireApi::Chat,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -716,6 +720,7 @@
             Vec::new(),
             Vec::new(),
             Vec::new(),
+            Vec::new(),
         )
         .expect("manager");
 
@@ -740,6 +745,7 @@
             routers,
             "https://api.openai.com/v1/chat/completions".to_string(),
             WireApi::Chat,
+            Vec::new(),
             Vec::new(),
             Vec::new(),
             Vec::new(),
@@ -783,6 +789,7 @@
             http_shutdown: None,
             verbose_logging: None,
             drop_tool_types: None,
+            drop_request_fields: None,
             routers: None,
         };
 
@@ -803,7 +810,7 @@
         let mut drop = HashSet::new();
         drop.insert("web_search_preview".to_string());
 
-        apply_request_filters(IncomingApi::Chat, &mut request, &drop);
+        apply_request_filters(IncomingApi::Chat, &mut request, &drop, &HashSet::new());
         let tools = request["tools"].as_array().expect("tools");
         assert_eq!(tools.len(), 1);
         assert_eq!(tools[0]["type"], "function");
@@ -887,6 +894,18 @@
     }
 
     #[test]
+    fn request_fields_for_logging_sorts_top_level_keys() {
+        let payload = json!({
+            "stream": true,
+            "model": "gpt-4.1",
+            "input": []
+        });
+
+        let out = request_fields_for_logging(&payload);
+        assert_eq!(out, json!(["input", "model", "stream"]));
+    }
+
+    #[test]
     fn upstream_headers_for_logging_includes_forwarded_headers() {
         let mut headers = HeaderMap::new();
         headers.insert("openai-organization", HeaderValue::from_static("org_123"));
@@ -960,6 +979,18 @@
             "model": "gpt-4.1",
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": [{"type":"function","name":"f","parameters":{"type":"object"}}]
+        });
+
+        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request);
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn capability_gate_allows_prompt_cache_key() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "prompt_cache_key": "session-key-1"
         });
 
         let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request);

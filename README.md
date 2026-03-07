@@ -45,7 +45,7 @@ npm install -g @heungtae/codex-chat-bridge
 
 ## What it does
 
-- Filters request payloads (`drop_tool_types`) before upstream forwarding
+- Filters request payloads (`drop_tool_types`, `drop_request_fields`) before upstream forwarding
 - Adds static upstream headers via `--upstream-http-header NAME=VALUE` or config map (`upstream_http_headers`, alias: `http_headers`)
 - Forwards configured incoming headers (defaults include OpenAI metadata headers) to upstream with `--forward-incoming-header NAME` or `forward_incoming_headers`
 - Supports selectable upstream wire via `--upstream-wire chat|responses`
@@ -96,6 +96,7 @@ Available router options:
 - `upstream_http_headers`: Static headers for this router
 - `forward_incoming_headers`: Forwarded headers for this router
 - `drop_tool_types`: Tool types to drop for this router
+- `drop_request_fields`: Top-level request fields to drop before forwarding (for example `["prompt_cache_key"]`)
 - `incoming_url`: Incoming URL/path bound to this router (for example `http://127.0.0.1:8787/research/v1/responses`)
   - Absolute `http://host:port/path` entries define listener addresses. The bridge listens on every unique `host:port` found in `routers.*.incoming_url`.
   - `incoming_url` is required for every router entry.
@@ -110,7 +111,7 @@ When the bridge starts, it logs startup summary, defaults, and per-router overri
 
 ```
 INFO codex_chat_bridge: startup: listen_addrs=["127.0.0.1:8787"] router_count=3
-INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions upstream_wire=Chat upstream_http_headers=[] forward_incoming_headers=[...] drop_tool_types=[...]
+INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions upstream_wire=Chat upstream_http_headers=[] forward_incoming_headers=[...] drop_tool_types=[...] drop_request_fields=[...]
 INFO codex_chat_bridge: runtime config: api_key_env=OPENROUTER_API_KEY server_info=Some("/tmp/codex-chat-bridge-info.json") http_shutdown=false verbose_logging=false
 INFO codex_chat_bridge: router: name=openrouter active=true incoming_url=Some("http://127.0.0.1:8787/openrouter/v1/responses") overrides=none
 INFO codex_chat_bridge: request routed: router=research, incoming_route=/research/v1/responses, upstream_url=..., upstream_wire=Responses
