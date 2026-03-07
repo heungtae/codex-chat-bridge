@@ -5,7 +5,6 @@ use axum::Router;
 use axum::body::Body;
 use axum::extract::Path as AxumPath;
 use axum::extract::State;
-use axum::extract::Json;
 use axum::http::HeaderMap;
 use axum::http::HeaderName;
 use axum::http::HeaderValue;
@@ -226,7 +225,6 @@ struct AppState {
 
 #[derive(Clone)]
 struct RouterManager {
-    current_router: String,
     routers: BTreeMap<String, RouterConfig>,
     default_upstream_url: String,
     default_upstream_wire: WireApi,
@@ -261,6 +259,7 @@ struct RouterDeltaLogSnapshot {
     name: String,
     active: bool,
     incoming_url: Option<String>,
+    upstream_wire: WireApi,
     override_upstream_url: Option<String>,
     override_upstream_wire: Option<WireApi>,
     override_upstream_http_headers: Option<Vec<UpstreamHeader>>,
@@ -283,21 +282,12 @@ struct ParsedIncomingUrl {
 impl RouterManager {
     fn new(
         routers: BTreeMap<String, RouterConfig>,
-        initial_router: String,
         default_upstream_url: String,
         default_upstream_wire: WireApi,
         default_upstream_http_headers: Vec<UpstreamHeader>,
         default_forward_incoming_headers: Vec<String>,
         default_drop_tool_types: Vec<String>,
     ) -> Result<Self> {
-        if !routers.is_empty() && !routers.contains_key(&initial_router) {
-            return Err(anyhow!(
-                "router '{}' not found. Available routers: {:?}",
-                initial_router,
-                routers.keys().collect::<Vec<_>>()
-            ));
-        }
-
         let default_forward_incoming_headers = if default_forward_incoming_headers.is_empty() {
             DEFAULT_FORWARDED_UPSTREAM_HEADERS
                 .iter()
@@ -315,6 +305,16 @@ impl RouterManager {
                     "missing required incoming_url for [routers.{router_name}]. default(active-router) routing is disabled"
                 )
             })?;
+            let effective_router_upstream_url = router_config
+                .upstream_url
+                .as_deref()
+                .unwrap_or(&default_upstream_url);
+            resolve_upstream_wire(
+                Some(effective_router_upstream_url),
+                router_config.upstream_wire,
+                default_upstream_wire,
+                &format!("[routers.{router_name}]"),
+            )?;
             let parsed = parse_incoming_url(incoming_url).with_context(|| {
                 format!(
                     "invalid incoming_url for [routers.{router_name}] => {}",
@@ -338,7 +338,6 @@ impl RouterManager {
         }
 
         Ok(Self {
-            current_router: initial_router,
             routers,
             default_upstream_url,
             default_upstream_wire,
@@ -348,10 +347,6 @@ impl RouterManager {
             incoming_route_to_router,
             listen_addrs,
         })
-    }
-
-    fn get_current_router(&self) -> String {
-        self.current_router.clone()
     }
 
     fn get_router_names(&self) -> Vec<String> {
@@ -387,9 +382,20 @@ impl RouterManager {
                 .upstream_url
                 .clone()
                 .filter(|url| *url != self.default_upstream_url);
-            let override_upstream_wire = router_cfg
-                .upstream_wire
-                .filter(|wire| *wire != self.default_upstream_wire);
+            let effective_router_upstream_url = router_cfg
+                .upstream_url
+                .as_deref()
+                .unwrap_or(&self.default_upstream_url);
+            let resolved_upstream_wire = resolve_upstream_wire(
+                Some(effective_router_upstream_url),
+                router_cfg.upstream_wire,
+                self.default_upstream_wire,
+                &format!("[routers.{name}]"),
+            )
+            .ok()
+            .unwrap_or(self.default_upstream_wire);
+            let override_upstream_wire = (resolved_upstream_wire != self.default_upstream_wire)
+                .then_some(resolved_upstream_wire);
 
             let override_upstream_http_headers = router_cfg.upstream_http_headers.as_ref().and_then(
                 |router_headers| {
@@ -434,8 +440,9 @@ impl RouterManager {
 
             snapshots.push(RouterDeltaLogSnapshot {
                 name: name.clone(),
-                active: *name == self.current_router,
+                active: true,
                 incoming_url: router_cfg.incoming_url.clone(),
+                upstream_wire: resolved_upstream_wire,
                 override_upstream_url,
                 override_upstream_wire,
                 override_upstream_http_headers,
@@ -445,10 +452,6 @@ impl RouterManager {
         }
 
         snapshots
-    }
-
-    fn get_target_for_active_router(&self) -> Result<RouteTarget> {
-        self.resolve_target_for_router_name(&self.current_router)
     }
 
     fn get_listen_addrs(&self) -> Vec<String> {
@@ -483,16 +486,6 @@ impl RouterManager {
         self.resolve_target_for_router_name(router_name).map(Some)
     }
 
-    fn set_router(&mut self, name: &str) -> Result<String> {
-        if !self.routers.is_empty() && !self.routers.contains_key(name) {
-            return Err(anyhow!("router '{}' not found", name));
-        }
-
-        let old_router = std::mem::replace(&mut self.current_router, name.to_string());
-        info!("switched router from '{}' to '{}'", old_router, name);
-        Ok(format!("switched router from '{}' to '{}'", old_router, name))
-    }
-
     fn resolve_target_for_router_name(&self, name: &str) -> Result<RouteTarget> {
         let router = if self.routers.is_empty() {
             None
@@ -508,9 +501,12 @@ impl RouterManager {
             .and_then(|r| r.upstream_url.clone())
             .unwrap_or_else(|| self.default_upstream_url.clone());
 
-        let upstream_wire = router
-            .and_then(|r| r.upstream_wire)
-            .unwrap_or(self.default_upstream_wire);
+        let upstream_wire = resolve_upstream_wire(
+            Some(&upstream_url),
+            router.and_then(|r| r.upstream_wire),
+            self.default_upstream_wire,
+            &format!("router '{name}'"),
+        )?;
 
         let mut upstream_http_headers = self.default_upstream_http_headers.clone();
         if let Some(router_headers) = router.and_then(|r| r.upstream_http_headers.clone()) {
@@ -681,37 +677,6 @@ pub async fn run() -> Result<()> {
         return Ok(());
     }
 
-    let (initial_router, initial_router_source) = if let Some(cli_router) = args.router.clone() {
-        (cli_router, "cli(--router)".to_string())
-    } else if let Some(router_map) = file_config.as_ref().and_then(|fc| fc.routers.as_ref()) {
-        if router_map.contains_key("default") {
-            ("default".to_string(), "config(routers.default)".to_string())
-        } else if let Some(first_router) = router_map.keys().next().cloned() {
-            (
-                first_router,
-                "config(first router key; routers.default missing)".to_string(),
-            )
-        } else {
-            (
-                "default".to_string(),
-                "builtin(default; empty router map)".to_string(),
-            )
-        }
-    } else {
-        (
-            "default".to_string(),
-            "builtin(default; no router map)".to_string(),
-        )
-    };
-
-    if !routers.is_empty() && !routers.contains_key(&initial_router) {
-        return Err(anyhow!(
-            "router '{}' not found. Available routers: {:?}",
-            initial_router,
-            routers.keys().collect::<Vec<_>>()
-        ));
-    }
-
     let api_key = std::env::var(&config.api_key_env)
         .ok()
         .filter(|v| !v.trim().is_empty())
@@ -723,7 +688,6 @@ pub async fn run() -> Result<()> {
 
     let router_manager = RouterManager::new(
         routers,
-        initial_router.clone(),
         config.upstream_url.clone(),
         config.upstream_wire,
         config.upstream_http_headers,
@@ -739,9 +703,7 @@ pub async fn run() -> Result<()> {
     let router_defaults = router_manager.get_default_log_snapshot();
 
     info!(
-        "startup: active_router={} selected_by={} listen_addrs={:?} router_count={}",
-        router_manager.get_current_router(),
-        initial_router_source,
+        "startup: listen_addrs={:?} router_count={}",
         listen_addrs,
         router_manager.get_router_names().len()
     );
@@ -765,6 +727,7 @@ pub async fn run() -> Result<()> {
             name,
             active,
             incoming_url,
+            upstream_wire,
             override_upstream_url,
             override_upstream_wire,
             override_upstream_http_headers,
@@ -795,8 +758,8 @@ pub async fn run() -> Result<()> {
         };
 
         info!(
-            "router: name={}, active={}, incoming_url={:?}, overrides={}",
-            name, active, incoming_url, override_summary
+            "router: name={}, active={}, incoming_url={:?}, upstream_wire={:?}, overrides={}",
+            name, active, incoming_url, upstream_wire, override_summary
         );
     }
 
@@ -813,11 +776,7 @@ pub async fn run() -> Result<()> {
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/healthz", get(healthz))
         .route("/shutdown", get(shutdown))
-        .route("/router", get(get_current_router))
-        .route("/router", post(set_router))
         .route("/routers", get(list_routers))
-        .route("/profile", get(get_current_router))
-        .route("/profile", post(set_router))
         .route("/profiles", get(list_routers))
         .route("/{*incoming_path}", post(handle_routed_incoming))
         .with_state(state.clone());
@@ -901,10 +860,14 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
     drop_tool_types.extend(args.drop_tool_types);
     drop_tool_types.retain(|v| !v.trim().is_empty());
-    let upstream_wire = args
-        .upstream_wire
-        .or(file_config.upstream_wire)
-        .unwrap_or(WireApi::Chat);
+    let selected_upstream_url = args.upstream_url.or(file_config.upstream_url);
+    let explicit_upstream_wire = args.upstream_wire.or(file_config.upstream_wire);
+    let upstream_wire = resolve_upstream_wire(
+        selected_upstream_url.as_deref(),
+        explicit_upstream_wire,
+        WireApi::Chat,
+        "default upstream",
+    )?;
     let mut upstream_http_headers = Vec::new();
     for (name, value) in file_config.upstream_http_headers.unwrap_or_default() {
         upsert_upstream_http_header(
@@ -928,10 +891,7 @@ fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<Resolve
     }
 
     Ok(ResolvedConfig {
-        upstream_url: args
-            .upstream_url
-            .or(file_config.upstream_url)
-            .unwrap_or_else(|| default_upstream_url(upstream_wire)),
+        upstream_url: selected_upstream_url.unwrap_or_else(|| default_upstream_url(upstream_wire)),
         upstream_wire,
         upstream_http_headers,
         forward_incoming_headers,
@@ -1010,6 +970,46 @@ fn default_upstream_url(upstream_wire: WireApi) -> String {
         WireApi::Chat => "https://api.openai.com/v1/chat/completions".to_string(),
         WireApi::Responses => "https://api.openai.com/v1/responses".to_string(),
     }
+}
+
+fn infer_upstream_wire_from_url(raw: &str) -> Option<WireApi> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let path = reqwest::Url::parse(trimmed)
+        .ok()
+        .map(|url| url.path().to_string())
+        .unwrap_or_else(|| trimmed.split('?').next().unwrap_or(trimmed).to_string());
+    let normalized = normalize_request_path(&path);
+
+    if normalized.ends_with("/v1/chat/completions") {
+        Some(WireApi::Chat)
+    } else if normalized.ends_with("/v1/responses") {
+        Some(WireApi::Responses)
+    } else {
+        None
+    }
+}
+
+fn resolve_upstream_wire(
+    upstream_url: Option<&str>,
+    explicit_wire: Option<WireApi>,
+    fallback_wire: WireApi,
+    context: &str,
+) -> Result<WireApi> {
+    let inferred_wire = upstream_url.and_then(infer_upstream_wire_from_url);
+    if let (Some(explicit), Some(inferred)) = (explicit_wire, inferred_wire)
+        && explicit != inferred
+    {
+        return Err(anyhow!(
+            "{context} configuration mismatch: upstream_url implies {:?}, but upstream_wire is {:?}",
+            inferred,
+            explicit
+        ));
+    }
+    Ok(explicit_wire.or(inferred_wire).unwrap_or(fallback_wire))
 }
 
 fn normalize_host_port(host: &str, port: u16) -> String {
@@ -1165,61 +1165,13 @@ async fn shutdown(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     (StatusCode::OK, "shutting down").into_response()
 }
 
-#[derive(Deserialize)]
-struct SetRouterRequest {
-    name: String,
-}
-
-async fn get_current_router(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let routers = state.routers.read().await;
-    let current = routers.get_current_router();
-    let target = match routers.get_target_for_active_router() {
-        Ok(target) => target,
-        Err(err) => return json_error_response("router_error", &err.to_string()),
-    };
-
-    json_success_response(json!({
-        "current_router": current,
-        "current_profile": current,
-        "upstream_url": target.upstream_url,
-        "upstream_wire": target.upstream_wire,
-    }))
-}
-
-async fn set_router(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<SetRouterRequest>,
-) -> impl IntoResponse {
-    let mut routers = state.routers.write().await;
-    match routers.set_router(&req.name) {
-        Ok(msg) => {
-            let target = match routers.get_target_for_active_router() {
-                Ok(target) => target,
-                Err(err) => return json_error_response("router_error", &err.to_string()),
-            };
-            json_success_response(json!({
-            "status": "ok",
-            "message": msg,
-            "current_router": routers.get_current_router(),
-            "current_profile": routers.get_current_router(),
-            "upstream_url": target.upstream_url,
-            "upstream_wire": target.upstream_wire,
-        }))
-        }
-        Err(e) => json_error_response("router_error", &e.to_string()),
-    }
-}
-
 async fn list_routers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let routers = state.routers.read().await;
     let router_names = routers.get_router_names();
-    let current = routers.get_current_router();
 
     json_success_response(json!({
         "routers": router_names,
         "profiles": router_names,
-        "current_router": current,
-        "current_profile": current,
     }))
 }
 
@@ -1273,7 +1225,7 @@ async fn handle_incoming(
         None => {
             return json_error_response(
                 "router_error",
-                "default(active-router) routing is disabled; use POST /{incoming_path} that matches routers.*.incoming_url",
+                "routing requires POST /{incoming_path} that matches routers.*.incoming_url",
             )
         }
     };
@@ -2316,6 +2268,56 @@ mod tests {
     }
 
     #[test]
+    fn resolve_config_infers_upstream_wire_from_upstream_url() {
+        let args = Args {
+            config: None,
+            upstream_url: None,
+            upstream_wire: None,
+            upstream_http_headers: vec![],
+            forward_incoming_headers: vec![],
+            api_key_env: None,
+            server_info: None,
+            http_shutdown: false,
+            verbose_logging: false,
+            drop_tool_types: vec![],
+            router: None,
+            list_routers: false,
+        };
+        let file = FileConfig {
+            upstream_url: Some("https://api.openai.com/v1/responses".to_string()),
+            ..Default::default()
+        };
+
+        let resolved = resolve_config(args, Some(file)).expect("ok");
+        assert_eq!(resolved.upstream_wire, WireApi::Responses);
+    }
+
+    #[test]
+    fn resolve_config_rejects_mismatched_upstream_wire_and_url() {
+        let args = Args {
+            config: None,
+            upstream_url: None,
+            upstream_wire: Some(WireApi::Chat),
+            upstream_http_headers: vec![],
+            forward_incoming_headers: vec![],
+            api_key_env: None,
+            server_info: None,
+            http_shutdown: false,
+            verbose_logging: false,
+            drop_tool_types: vec![],
+            router: None,
+            list_routers: false,
+        };
+        let file = FileConfig {
+            upstream_url: Some("https://api.openai.com/v1/responses".to_string()),
+            ..Default::default()
+        };
+
+        let err = resolve_config(args, Some(file)).expect_err("must fail");
+        assert!(err.to_string().contains("configuration mismatch"));
+    }
+
+    #[test]
     fn parse_upstream_http_header_arg_rejects_invalid_input() {
         let err = parse_upstream_http_header_arg("not-valid").expect_err("must fail");
         assert!(err.contains("NAME=VALUE"));
@@ -2365,7 +2367,6 @@ mod tests {
 
         let manager = RouterManager::new(
             routers,
-            "gpt_oss".to_string(),
             "https://api.openai.com/v1/chat/completions".to_string(),
             WireApi::Chat,
             Vec::new(),
@@ -2380,6 +2381,62 @@ mod tests {
 
         assert_eq!(target.router_name, "gpt_oss");
         assert_eq!(target.upstream_url, "http://upstream.local/v1/chat/completions");
+    }
+
+    #[test]
+    fn router_manager_infers_router_wire_from_upstream_url() {
+        let mut routers = BTreeMap::new();
+        routers.insert(
+            "gpt_oss".to_string(),
+            RouterConfig {
+                incoming_url: Some("http://localhost:8080/gpt-oss".to_string()),
+                upstream_url: Some("http://upstream.local/v1/responses".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let manager = RouterManager::new(
+            routers,
+            "https://api.openai.com/v1/chat/completions".to_string(),
+            WireApi::Chat,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("manager");
+        let target = manager
+            .get_target_for_incoming_route("/gpt-oss", Some("localhost:8080"))
+            .expect("route lookup")
+            .expect("target");
+
+        assert_eq!(target.upstream_wire, WireApi::Responses);
+    }
+
+    #[test]
+    fn router_manager_rejects_mismatched_router_wire_and_upstream_url() {
+        let mut routers = BTreeMap::new();
+        routers.insert(
+            "gpt_oss".to_string(),
+            RouterConfig {
+                incoming_url: Some("http://localhost:8080/gpt-oss".to_string()),
+                upstream_url: Some("http://upstream.local/v1/responses".to_string()),
+                upstream_wire: Some(WireApi::Chat),
+                ..Default::default()
+            },
+        );
+
+        let result = RouterManager::new(
+            routers,
+            "https://api.openai.com/v1/chat/completions".to_string(),
+            WireApi::Chat,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+        );
+        match result {
+            Ok(_) => panic!("must fail"),
+            Err(err) => assert!(err.to_string().contains("configuration mismatch")),
+        }
     }
 
     #[test]
@@ -2402,7 +2459,6 @@ mod tests {
 
         let manager = RouterManager::new(
             routers,
-            "one".to_string(),
             "https://api.openai.com/v1/chat/completions".to_string(),
             WireApi::Chat,
             Vec::new(),
@@ -2430,7 +2486,6 @@ mod tests {
 
         let result = RouterManager::new(
             routers,
-            "missing_route".to_string(),
             "https://api.openai.com/v1/chat/completions".to_string(),
             WireApi::Chat,
             Vec::new(),

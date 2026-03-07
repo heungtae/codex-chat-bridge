@@ -91,7 +91,8 @@ upstream_wire = "chat"
 
 Available router options:
 - `upstream_url`: Override upstream URL for this router
-- `upstream_wire`: Set wire API (`chat` or `responses`)
+- `upstream_wire`: Optional. If omitted, inferred from `upstream_url` (`.../v1/chat/completions` -> `chat`, `.../v1/responses` -> `responses`)
+  - If `upstream_url` and `upstream_wire` are both set but inconsistent, startup fails with a configuration error.
 - `upstream_http_headers`: Static headers for this router
 - `forward_incoming_headers`: Forwarded headers for this router
 - `drop_tool_types`: Tool types to drop for this router
@@ -102,14 +103,13 @@ Available router options:
 
 ### CLI Options
 
-- `--router <name>`: Start with a specific router
 - `--list-routers`: List available routers and exit
-- Compatibility alias: `--profile`, `--list-profiles`
+- Compatibility alias: `--list-profiles`
 
 When the bridge starts, it logs startup summary, defaults, and per-router overrides:
 
 ```
-INFO codex_chat_bridge: startup: active_router=openrouter selected_by=config(first router key; routers.default missing) listen_addrs=["127.0.0.1:8787"] router_count=3
+INFO codex_chat_bridge: startup: listen_addrs=["127.0.0.1:8787"] router_count=3
 INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions upstream_wire=Chat upstream_http_headers=[] forward_incoming_headers=[...] drop_tool_types=[...]
 INFO codex_chat_bridge: runtime config: api_key_env=OPENROUTER_API_KEY server_info=Some("/tmp/codex-chat-bridge-info.json") http_shutdown=false verbose_logging=false
 INFO codex_chat_bridge: router: name=openrouter active=true incoming_url=Some("http://127.0.0.1:8787/openrouter/v1/responses") overrides=none
@@ -118,19 +118,11 @@ INFO codex_chat_bridge: request routed: router=research, incoming_route=/researc
 
 ### Runtime Router Management
 
-Switch routers at runtime via HTTP API:
+Route requests by `incoming_url` path:
 
 ```bash
-# Get current router
-curl http://127.0.0.1:8787/router
-
 # List all routers
 curl http://127.0.0.1:8787/routers
-
-# Switch router
-curl -X POST http://127.0.0.1:8787/router \
-  -H "Content-Type: application/json" \
-  -d '{"name": "research"}'
 
 # Send request using incoming_url routing
 curl -X POST http://127.0.0.1:8787/research/v1/responses \
@@ -140,7 +132,7 @@ curl -X POST http://127.0.0.1:8787/research/v1/responses \
 
 Routing behavior:
 - `POST /{*incoming_path}`: use `routers.*.incoming_url` path match (for example `/openrouter/v1/responses`, `/research/v1/responses`)
-- `POST /v1/responses`, `POST /v1/chat/completions`: not used for routing (default active-router routing is disabled)
+- `POST /v1/responses`, `POST /v1/chat/completions`: not used for routing
 
 ## Run
 
@@ -151,12 +143,6 @@ npx @heungtae/codex-chat-bridge --api-key-env OPENAI_API_KEY
 By default, the bridge uses `~/.config/codex-chat-bridge/conf.toml`.
 If the file does not exist, it is created automatically with commented defaults.
 CLI flags override file values.
-
-Start with a specific router:
-
-```bash
-codex-chat-bridge --router research
-```
 
 Or run the binary directly via Cargo:
 
@@ -223,9 +209,5 @@ npm run pack:check
 - `POST /{*incoming_path}`: Process by `routers.*.incoming_url` path match
 - `GET /healthz`: Health check
 - `GET /shutdown`: Shutdown bridge process (available when `--http-shutdown` is enabled)
-- `GET /router`: Current router info
-- `POST /router`: Switch active router (`{"name": "router_name"}`)
-- `GET /routers`: List routers and current router
-- `GET /profile`: Compatibility alias of `GET /router`
-- `POST /profile`: Compatibility alias of `POST /router`
+- `GET /routers`: List routers
 - `GET /profiles`: Compatibility alias of `GET /routers`
