@@ -638,6 +638,12 @@ struct SseParser {
     current_data_lines: Vec<String>,
 }
 
+#[derive(Debug)]
+struct NormalizedUpstreamError {
+    code: String,
+    message: String,
+}
+
 fn init_tracing(verbose_logging: bool) {
     let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
         if verbose_logging {
@@ -1280,6 +1286,9 @@ async fn handle_incoming(
     let incoming_api = incoming_api_hint.unwrap_or_else(|| infer_incoming_api(&request_value));
     let wants_stream = stream_flag_for_request(incoming_api, &request_value);
     apply_request_filters(incoming_api, &mut request_value, &route_target.drop_tool_types);
+    if let Err(err) = validate_capability_gate(incoming_api, route_target.upstream_wire, &request_value) {
+        return error_response_for_stream(wants_stream, "unsupported_feature", &err.to_string());
+    }
     let tool_call_kinds_by_name = if incoming_api == IncomingApi::Responses {
         responses_tool_call_kind_by_name(&request_value)
     } else {
@@ -1392,8 +1401,8 @@ async fn handle_incoming(
                 route_target.upstream_wire
             );
         }
-        let message = format!("upstream returned {status}: {body}");
-        return error_response_for_stream(wants_stream, "upstream_error", &message);
+        let normalized = normalize_upstream_error_payload(status, &body);
+        return error_response_for_stream(wants_stream, &normalized.code, &normalized.message);
     }
 
     if wants_stream {
@@ -1509,6 +1518,48 @@ fn apply_request_filters(
     }
 }
 
+fn validate_capability_gate(incoming_api: IncomingApi, upstream_wire: WireApi, request: &Value) -> Result<()> {
+    if incoming_api != IncomingApi::Responses || upstream_wire != WireApi::Chat {
+        return Ok(());
+    }
+
+    for field in ["reasoning", "include", "text", "service_tier", "prompt_cache_key"] {
+        if request_has_non_empty_field(request, field) {
+            return Err(anyhow!(
+                "responses->chat bridge does not support `{field}` yet; disable it or route to native responses upstream"
+            ));
+        }
+    }
+
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let tool_type = tool.get("type").and_then(Value::as_str).unwrap_or_default();
+            if !matches!(tool_type, "function" | "custom") {
+                return Err(anyhow!(
+                    "responses->chat bridge does not support tool type `{tool_type}`"
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn request_has_non_empty_field(request: &Value, field: &str) -> bool {
+    let Some(value) = request.get(field) else {
+        return false;
+    };
+
+    match value {
+        Value::Null => false,
+        Value::String(v) => !v.trim().is_empty(),
+        Value::Array(v) => !v.is_empty(),
+        Value::Object(v) => !v.is_empty(),
+        Value::Bool(v) => *v,
+        Value::Number(_) => true,
+    }
+}
+
 fn build_upstream_payload(
     request: &Value,
     incoming_api: IncomingApi,
@@ -1525,6 +1576,54 @@ fn build_upstream_payload(
     };
     set_stream_flag(&mut payload, stream);
     Ok(payload)
+}
+
+fn normalize_upstream_error_payload(status: StatusCode, body: &str) -> NormalizedUpstreamError {
+    let default_message = format!("upstream returned {status}: {body}");
+    let mut upstream_code = String::new();
+    let mut upstream_message = String::new();
+
+    if let Ok(parsed) = serde_json::from_str::<Value>(body) {
+        if let Some(error) = parsed.get("error") {
+            if let Some(code) = error.get("code").and_then(Value::as_str) {
+                upstream_code = code.to_string();
+            }
+            if let Some(message) = error.get("message").and_then(Value::as_str) {
+                upstream_message = message.to_string();
+            }
+        } else if let Some(code) = parsed.get("code").and_then(Value::as_str) {
+            upstream_code = code.to_string();
+            if let Some(message) = parsed.get("message").and_then(Value::as_str) {
+                upstream_message = message.to_string();
+            }
+        }
+    }
+
+    let normalized_code = match upstream_code.as_str() {
+        "context_length_exceeded" => "context_window_exceeded",
+        "insufficient_quota" => "quota_exceeded",
+        "rate_limit_exceeded" => "rate_limit_exceeded",
+        "invalid_request_error" | "invalid_request" => "invalid_request",
+        _ => {
+            if status == StatusCode::TOO_MANY_REQUESTS {
+                "rate_limit_exceeded"
+            } else if status == StatusCode::BAD_REQUEST {
+                "invalid_request"
+            } else {
+                "upstream_error"
+            }
+        }
+    };
+    let normalized_message = if upstream_message.is_empty() {
+        default_message
+    } else {
+        upstream_message
+    };
+
+    NormalizedUpstreamError {
+        code: normalized_code.to_string(),
+        message: normalized_message,
+    }
 }
 
 fn set_stream_flag(payload: &mut Value, stream: bool) {
@@ -2687,5 +2786,91 @@ mod tests {
         assert_eq!(out["authorization"], "<redacted>");
         assert_eq!(out["cookie"], "<redacted>");
         assert_eq!(out["x-trace-id"], "trace-1");
+    }
+
+    #[test]
+    fn capability_gate_rejects_non_mappable_responses_fields() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [],
+            "reasoning": {"effort":"medium"}
+        });
+
+        let err = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request)
+            .expect_err("must fail");
+        assert!(err.to_string().contains("does not support `reasoning`"));
+    }
+
+    #[test]
+    fn capability_gate_allows_basic_responses_request() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+            "tools": [{"type":"function","name":"f","parameters":{"type":"object"}}]
+        });
+
+        let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, &request);
+        assert!(out.is_ok());
+    }
+
+    #[test]
+    fn normalize_upstream_error_maps_known_codes() {
+        let payload = r#"{"error":{"code":"context_length_exceeded","message":"too long"}}"#;
+        let err = normalize_upstream_error_payload(StatusCode::BAD_REQUEST, payload);
+        assert_eq!(err.code, "context_window_exceeded");
+        assert_eq!(err.message, "too long");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_failed_when_done_marker_missing() {
+        let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        ))]);
+        let mut output = Box::pin(translate_chat_stream(
+            upstream,
+            "resp_1".to_string(),
+            "test_router".to_string(),
+            false,
+            HashMap::new(),
+        ));
+        let mut payload = String::new();
+
+        while let Some(event) = output.next().await {
+            payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+        }
+
+        assert!(payload.contains("\"type\":\"response.failed\""));
+        assert!(!payload.contains("event: response.completed"));
+    }
+
+    #[tokio::test]
+    async fn stream_emits_added_and_done_for_tool_calls() {
+        let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"shell\",\"arguments\":\"echo hi\"}}]}}],\"usage\":{\"prompt_tokens\":1,\"completion_tokens\":1,\"total_tokens\":2}}\n\n\
+             data: [DONE]\n\n",
+        ))]);
+        let mut kinds = HashMap::new();
+        kinds.insert("shell".to_string(), ResponsesToolCallKind::Custom);
+        let mut output = Box::pin(translate_chat_stream(
+            upstream,
+            "resp_1".to_string(),
+            "test_router".to_string(),
+            false,
+            kinds,
+        ));
+        let mut payload = String::new();
+
+        while let Some(event) = output.next().await {
+            payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+        }
+
+        let added_idx = payload
+            .find("event: response.output_item.added")
+            .expect("added event");
+        let done_idx = payload
+            .rfind("event: response.output_item.done")
+            .expect("done event");
+        assert!(added_idx < done_idx);
+        assert!(payload.contains("\"call_id\":\"call_resp_1_0\""));
     }
 }

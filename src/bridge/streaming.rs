@@ -5,7 +5,6 @@ use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::collections::HashMap;
 use tracing::{debug, warn};
-use uuid::Uuid;
 
 use crate::{
     ChatChunk, ResponsesToolCallKind, SseParser, StreamAccumulator, responses_tool_call_item,
@@ -68,6 +67,8 @@ where
         let mut parser = SseParser::default();
         let mut acc = StreamAccumulator::default();
         let mut assistant_item_added = false;
+        let mut saw_done_marker = false;
+        let mut saw_terminal_finish_reason = false;
 
         yield Ok(sse_event(
             "response.created",
@@ -112,6 +113,7 @@ where
             let events = parser.feed(&text);
             for data in events {
                 if data == "[DONE]" {
+                    saw_done_marker = true;
                     continue;
                 }
 
@@ -122,6 +124,10 @@ where
                         }
 
                         for choice in chat_chunk.choices {
+                            if choice.finish_reason.as_deref().is_some_and(|reason| !reason.trim().is_empty()) {
+                                saw_terminal_finish_reason = true;
+                            }
+
                             if let Some(delta) = choice.delta {
                                 if let Some(content) = delta.content
                                     && !content.is_empty()
@@ -210,9 +216,9 @@ where
         }
 
         for (index, tool_call) in acc.tool_calls {
-            let call_id = tool_call
-                .id
-                .unwrap_or_else(|| format!("call_{}_{}", Uuid::now_v7(), index));
+            let call_id = tool_call.id.unwrap_or_else(|| {
+                deterministic_tool_call_id(&response_id, index)
+            });
             let name = tool_call
                 .name
                 .unwrap_or_else(|| "unknown_function".to_string());
@@ -222,14 +228,40 @@ where
                 &call_id,
                 &tool_call_kinds_by_name,
             );
+            let item_for_done = item.clone();
+
+            yield Ok(sse_event(
+                "response.output_item.added",
+                &json!({
+                    "type": "response.output_item.added",
+                    "item": item,
+                }),
+            ));
 
             yield Ok(sse_event(
                 "response.output_item.done",
                 &json!({
                     "type": "response.output_item.done",
-                    "item": item,
+                    "item": item_for_done,
                 }),
             ));
+        }
+
+        if !saw_done_marker && !saw_terminal_finish_reason {
+            yield Ok(sse_event(
+                "response.failed",
+                &json!({
+                    "type": "response.failed",
+                    "response": {
+                        "id": response_id.clone(),
+                        "error": {
+                            "code": "upstream_stream_incomplete",
+                            "message": "upstream stream ended before terminal marker",
+                        }
+                    }
+                }),
+            ));
+            return;
         }
 
         let usage_json = acc.usage.map(|usage| {
@@ -253,6 +285,10 @@ where
             }),
         ));
     }
+}
+
+fn deterministic_tool_call_id(response_id: &str, index: usize) -> String {
+    format!("call_{}_{}", response_id, index)
 }
 
 pub(crate) fn sse_event(event_name: &str, payload: &Value) -> Bytes {
@@ -300,4 +336,3 @@ impl SseParser {
         }
     }
 }
-
