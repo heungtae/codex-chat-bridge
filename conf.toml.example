@@ -26,7 +26,6 @@ enable_provider_specific_fields = true
 enable_extended_input_types = true
 
 # Routers (required for multi-route mode)
-# alias: [profiles.<name>] is also supported for [routers.<name>]
 
 [routers.default]
 incoming_url = "http://127.0.0.1:8787/default/v1/responses"

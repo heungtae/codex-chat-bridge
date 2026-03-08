@@ -22,7 +22,6 @@ pub(crate) fn build_app(state: Arc<AppState>) -> Router {
         .route("/healthz", get(healthz))
         .route("/shutdown", get(shutdown))
         .route("/routers", get(list_routers))
-        .route("/profiles", get(list_routers))
         .route("/{*incoming_path}", post(handle_routed_incoming))
         .with_state(state)
 }
@@ -50,7 +49,6 @@ async fn list_routers(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     json_success_response(json!({
         "routers": router_names,
-        "profiles": router_names,
     }))
 }
 

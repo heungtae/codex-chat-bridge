@@ -83,7 +83,6 @@ pub(crate) struct Args {
 
     #[arg(
         long,
-        alias = "list-profiles",
         help = "list available routers from config file and exit"
     )]
     pub(crate) list_routers: bool,
@@ -103,7 +102,6 @@ pub(crate) struct FileConfig {
     pub(crate) drop_tool_types: Option<Vec<String>>,
     pub(crate) drop_request_fields: Option<Vec<String>>,
     pub(crate) features: Option<FeatureFlagsConfig>,
-    #[serde(alias = "profiles")]
     pub(crate) routers: Option<BTreeMap<String, RouterConfig>>,
 }
 

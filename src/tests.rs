@@ -775,13 +775,12 @@
     }
 
     #[test]
-    fn file_config_accepts_profiles_alias_for_routers() {
+    fn file_config_does_not_accept_profiles_alias_for_routers() {
         let parsed: FileConfig = toml::from_str(
             "[profiles.gpt_oss]\nincoming_url = \"http://localhost:8080/gpt-oss\"",
         )
         .expect("ok");
-        let routers = parsed.routers.expect("routers");
-        assert!(routers.contains_key("gpt_oss"));
+        assert!(parsed.routers.is_none());
     }
 
     #[test]

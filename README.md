@@ -152,7 +152,6 @@ Available flags:
 ### CLI Options
 
 - `--list-routers`: List available routers and exit
-- Compatibility alias: `--list-profiles`
 
 When the bridge starts, it logs startup summary, defaults, and per-router overrides:
 
@@ -241,4 +240,3 @@ npm run pack:check
 - `GET /healthz`: Health check
 - `GET /shutdown`: Shutdown bridge process (available when `--http-shutdown` is enabled)
 - `GET /routers`: List routers
-- `GET /profiles`: Compatibility alias of `GET /routers`
