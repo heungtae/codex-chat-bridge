@@ -2,6 +2,9 @@
     use axum::body::Bytes;
     use futures::stream;
     use futures::StreamExt;
+    use serde_json::json;
+    use std::collections::HashSet;
+    use std::path::PathBuf;
 
     #[test]
     fn maps_responses_request_to_chat_request_with_function_tool() {
@@ -1062,7 +1065,7 @@
             json!({"role":"user","content":"old-user"}),
         ];
 
-        merge_previous_messages(&mut payload, &previous).expect("ok");
+        merge_previous_messages(&mut payload, previous).expect("ok");
 
         let messages = payload["messages"].as_array().expect("array");
         assert_eq!(messages.len(), 3);

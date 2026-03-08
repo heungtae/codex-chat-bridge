@@ -43,14 +43,19 @@ Install globally if you want the `codex-chat-bridge` command on PATH:
 npm install -g @heungtae/codex-chat-bridge
 ```
 
+When starting via `bin/codex-chat-bridge.js`, the package checks `npm` for a newer version.
+If a new version exists, it prints an upgrade recommendation and attempts automatic update.
+Set `CODEX_CHAT_BRIDGE_AUTO_UPDATE=0` to disable automatic update.
+
 ## What it does
 
 - Filters request payloads (`drop_tool_types`, `drop_request_fields`) before upstream forwarding
 - Adds static upstream headers via `--upstream-http-header NAME=VALUE` or config map (`upstream_http_headers`, alias: `http_headers`)
 - Forwards configured incoming headers (defaults include OpenAI metadata headers) to upstream with `--forward-incoming-header NAME` or `forward_incoming_headers`
-- Supports selectable upstream wire via `--upstream-wire chat|responses`
+- Automatically maps upstream API type from `upstream_url` (`.../v1/chat/completions` or `.../v1/responses`)
 - Uses `incoming_url` path matching for `POST /{*incoming_path}`
 - Supports feature flags globally (`[features]`) and per-router (`[routers.<name>.features]`)
+- Supports host-aware routing when routers use absolute `incoming_url` values
 - Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
 - For chat upstream streaming, emits Responses-style SSE events:
   - `response.created`
@@ -65,59 +70,51 @@ npm install -g @heungtae/codex-chat-bridge
   - `response.completed`
   - `response.failed` (for upstream/network errors)
 
-## Recent Updates (v0.2.4)
-
-- For `responses -> chat` upstream forwarding, `tools[].type="custom"` is normalized to `function` only when sending to chat upstream.
-- For `responses -> chat` upstream forwarding, bridge now maps additional request fields:
-  - `max_output_tokens -> max_tokens`
-  - `metadata`, `reasoning`, `service_tier`, `include`, `text`
-  - `text.format -> response_format` (kept together with `text`)
-- Added tool-result call id recovery for `responses -> chat` input flow:
-  - recovers missing `call_id` from pending tool calls
-  - recovers mismatched `call_id` when exactly one pending tool call exists
-  - returns explicit error when multiple pending calls make recovery ambiguous
-- Extended tool normalization for chat upstream compatibility:
-  - `mcp`, `web_search`, `web_search_preview` are normalized into chat `function` tools
-- For chat upstream responses converted back to Responses format:
-  - incoming `custom_tool_call` is returned as `custom_tool_call_output`
-  - incoming `function_call` is returned as `function_call_output`
-  - `call_id` is preserved in both flows
-- Added explicit `custom_tool_call` input handling in the mapper and preserved output mapping behavior for both `custom_tool_call_output` and `function_call_output`.
-
 ## Routers
 
-The bridge supports multiple routers for different upstream configurations. Define routers in `conf.toml`:
+The bridge supports multiple routers for different upstream configurations. Routing key is:
+
+- absolute `incoming_url` in config: `host:port + path`
+- path-only `incoming_url` in config: `path` only
+
+Define routers in `conf.toml`:
 
 ```toml
 [routers.openrouter]
 incoming_url = "http://127.0.0.1:8787/openrouter/v1/responses"
 upstream_url = "https://openrouter.ai/api/v1/chat/completions"
-upstream_wire = "chat"
 
 [routers.research]
 incoming_url = "http://127.0.0.1:8787/research/v1/responses"
 upstream_url = "https://api.openai.com/v1/responses"
-upstream_wire = "responses"
 
 [routers.local]
 incoming_url = "http://127.0.0.1:8787/local/v1/responses"
 upstream_url = "http://localhost:8080/v1/chat/completions"
-upstream_wire = "chat"
 ```
 
-Available router options:
+Router resolution and overrides:
+- Every router must define `incoming_url`.
+- `incoming_url` can be absolute URL (`http://host:port/path`) or path-only (`/path`).
+- At least one router must use an absolute `incoming_url` so the process can bind/listen.
+- Duplicate route keys are rejected at startup.
+- For each request, router config is merged onto defaults.
+  - `upstream_http_headers`: merged (router keys overwrite same header names)
+  - `forward_incoming_headers`: replaced by router list when set
+  - `drop_tool_types`, `drop_request_fields`: appended/unioned with defaults
+  - `features`: per-router override on top of global feature flags
+
+Available router fields:
 - `upstream_url`: Override upstream URL for this router
-- `upstream_wire`: Optional. If omitted, inferred from `upstream_url` (`.../v1/chat/completions` -> `chat`, `.../v1/responses` -> `responses`)
-  - If `upstream_url` and `upstream_wire` are both set but inconsistent, startup fails with a configuration error.
+  - Upstream API type is inferred automatically from URL suffix (`.../v1/chat/completions` -> chat, `.../v1/responses` -> responses)
 - `upstream_http_headers`: Static headers for this router
 - `forward_incoming_headers`: Forwarded headers for this router
 - `drop_tool_types`: Tool types to drop for this router
 - `drop_request_fields`: Top-level request fields to drop before forwarding (for example `["prompt_cache_key"]`)
 - `features`: Router-specific feature flag overrides (for example `[routers.research.features]`)
 - `incoming_url`: Incoming URL/path bound to this router (for example `http://127.0.0.1:8787/research/v1/responses`)
-  - Absolute `http://host:port/path` entries define listener addresses. The bridge listens on every unique `host:port` found in `routers.*.incoming_url`.
-  - `incoming_url` is required for every router entry.
-  - At least one absolute `incoming_url` is required to start the server.
+  - Absolute URL entries define listener addresses. The bridge listens on every unique `host:port` found in `routers.*.incoming_url`.
+  - Path-only entries participate in route matching but do not create listeners.
 
 ## Feature Flags (Global + Router Override)
 
@@ -161,29 +158,11 @@ When the bridge starts, it logs startup summary, defaults, and per-router overri
 
 ```
 INFO codex_chat_bridge: startup: listen_addrs=["127.0.0.1:8787"] router_count=3
-INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions upstream_wire=Chat upstream_http_headers=[] forward_incoming_headers=[...] drop_tool_types=[...] drop_request_fields=[...]
+INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions upstream_http_headers=[] forward_incoming_headers=[...] drop_tool_types=[...] drop_request_fields=[...]
 INFO codex_chat_bridge: runtime config: api_key_env=OPENROUTER_API_KEY server_info=Some("/tmp/codex-chat-bridge-info.json") http_shutdown=false verbose_logging=false
 INFO codex_chat_bridge: router: name=openrouter active=true incoming_url=Some("http://127.0.0.1:8787/openrouter/v1/responses") overrides=none
-INFO codex_chat_bridge: request routed: router=research, incoming_route=/research/v1/responses, upstream_url=..., upstream_wire=Responses
+INFO codex_chat_bridge: request routed: router=research, incoming_route=/research/v1/responses, upstream_url=...
 ```
-
-### Runtime Router Management
-
-Route requests by `incoming_url` path:
-
-```bash
-# List all routers
-curl http://127.0.0.1:8787/routers
-
-# Send request using incoming_url routing
-curl -X POST http://127.0.0.1:8787/research/v1/responses \
-  -H "Content-Type: application/json" \
-  -d '{"model":"gpt-4.1","input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}]}'
-```
-
-Routing behavior:
-- `POST /{*incoming_path}`: use `routers.*.incoming_url` path match (for example `/openrouter/v1/responses`, `/research/v1/responses`)
-- `POST /v1/responses`, `POST /v1/chat/completions`: not used for routing
 
 ## Run
 
@@ -219,7 +198,6 @@ So if provider `base_url` is `http://127.0.0.1:8787/research/v1`, set:
 [routers.research]
 incoming_url = "http://127.0.0.1:8787/research/v1/responses"
 upstream_url = "https://api.openai.com/v1/responses"
-upstream_wire = "responses"
 ```
 
 Multi-router Codex provider example:
@@ -257,7 +235,9 @@ npm run pack:check
 
 ## Endpoints
 
-- `POST /{*incoming_path}`: Process by `routers.*.incoming_url` path match
+- `POST /{*incoming_path}`: Process by `routers.*.incoming_url` match
+- `POST /v1/responses`: Routed request entrypoint (requires matching router `incoming_url`)
+- `POST /v1/chat/completions`: Routed request entrypoint (requires matching router `incoming_url`)
 - `GET /healthz`: Health check
 - `GET /shutdown`: Shutdown bridge process (available when `--http-shutdown` is enabled)
 - `GET /routers`: List routers
