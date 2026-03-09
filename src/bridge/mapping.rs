@@ -240,10 +240,36 @@ fn custom_tool_input_from_arguments(arguments: &str) -> String {
         Ok(Value::String(s)) => s,
         Ok(Value::Object(obj)) => obj
             .get("input")
+            .or_else(|| obj.get("patch"))
+            .or_else(|| obj.get("content"))
             .and_then(Value::as_str)
             .map(ToString::to_string)
             .unwrap_or_else(|| arguments.to_string()),
         _ => arguments.to_string(),
+    }
+}
+
+fn default_custom_tool_function_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "input": { "type": "string" }
+        },
+        "required": ["input"],
+        "additionalProperties": true
+    })
+}
+
+fn normalize_custom_tool_parameters(parameters: Option<Value>) -> Value {
+    match parameters {
+        Some(Value::Object(obj)) => {
+            if obj.get("type").and_then(Value::as_str) == Some("string") {
+                return default_custom_tool_function_parameters();
+            }
+            Value::Object(obj)
+        }
+        Some(other) => other,
+        None => default_custom_tool_function_parameters(),
     }
 }
 
@@ -836,11 +862,11 @@ pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<
                     .and_then(Value::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let parameters = tool
-                    .get("parameters")
-                    .cloned()
-                    .or_else(|| tool.get("input_schema").cloned())
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                let parameters = normalize_custom_tool_parameters(
+                    tool.get("parameters")
+                        .cloned()
+                        .or_else(|| tool.get("input_schema").cloned()),
+                );
 
                 return Some(json!({
                     "type": "function",

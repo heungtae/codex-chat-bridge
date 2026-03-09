@@ -476,6 +476,42 @@
     }
 
     #[test]
+    fn normalize_chat_tools_custom_without_schema_requires_input_string() {
+        let tools = vec![json!({
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "patch files"
+        })];
+        let out = normalize_chat_tools(tools, &HashSet::new());
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            out[0]["function"]["parameters"]["required"],
+            json!(["input"])
+        );
+        assert_eq!(
+            out[0]["function"]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
+    fn normalize_chat_tools_custom_string_schema_wraps_as_input_object() {
+        let tools = vec![json!({
+            "type": "custom",
+            "name": "apply_patch",
+            "input_schema": {"type":"string"}
+        })];
+        let out = normalize_chat_tools(tools, &HashSet::new());
+        assert_eq!(out[0]["type"], "function");
+        assert_eq!(out[0]["function"]["parameters"]["type"], "object");
+        assert_eq!(
+            out[0]["function"]["parameters"]["properties"]["input"]["type"],
+            "string"
+        );
+    }
+
+    #[test]
     fn normalize_tool_choice_preserves_wrapped_choice() {
         let choice = json!({"type":"function", "function":{"name":"do_it"}});
         assert_eq!(normalize_tool_choice(choice.clone()), choice);
@@ -669,6 +705,29 @@
         let mut kinds = HashMap::new();
         kinds.insert("apply_patch".to_string(), ResponsesToolCallKind::Custom);
         let out = chat_json_to_responses_json(chat, "resp_3".to_string(), &kinds, false);
+        let output = out["output"].as_array().expect("output");
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["input"], "*** Begin Patch\n*** End Patch");
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_unwraps_custom_tool_call_patch_field_arguments() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_custom_4",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"patch\":\"*** Begin Patch\\n*** End Patch\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut kinds = HashMap::new();
+        kinds.insert("apply_patch".to_string(), ResponsesToolCallKind::Custom);
+        let out = chat_json_to_responses_json(chat, "resp_4".to_string(), &kinds, false);
         let output = out["output"].as_array().expect("output");
         assert_eq!(output[0]["type"], "custom_tool_call");
         assert_eq!(output[0]["input"], "*** Begin Patch\n*** End Patch");
