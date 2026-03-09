@@ -1025,6 +1025,35 @@
     }
 
     #[test]
+    fn router_snapshot_marks_registered_route_as_active() {
+        let mut routers = BTreeMap::new();
+        routers.insert(
+            "gpt_oss".to_string(),
+            RouterConfig {
+                incoming_url: Some("http://localhost:8080/gpt-oss".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let manager = RouterManager::new(
+            routers,
+            "https://api.openai.com/v1/chat/completions".to_string(),
+            WireApi::Chat,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            FeatureFlags::default(),
+        )
+        .expect("manager");
+
+        let snapshots = manager.get_router_delta_log_snapshots();
+        assert_eq!(snapshots.len(), 1);
+        assert_eq!(snapshots[0].name, "gpt_oss");
+        assert!(snapshots[0].active);
+    }
+
+    #[test]
     fn router_manager_infers_router_wire_from_upstream_url() {
         let mut routers = BTreeMap::new();
         routers.insert(

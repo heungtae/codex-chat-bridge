@@ -265,9 +265,16 @@ impl RouterManager {
                     }
                 });
 
+            let active = router_cfg
+                .incoming_url
+                .as_deref()
+                .and_then(|incoming_url| parse_incoming_url(incoming_url).ok())
+                .and_then(|parsed| self.incoming_route_to_router.get(&parsed.route_key))
+                .is_some_and(|router_name| router_name == name);
+
             snapshots.push(RouterDeltaLogSnapshot {
                 name: name.clone(),
-                active: true,
+                active,
                 incoming_url: router_cfg.incoming_url.clone(),
                 upstream_wire: resolved_upstream_wire,
                 override_upstream_url,
