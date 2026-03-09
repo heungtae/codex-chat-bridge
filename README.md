@@ -43,13 +43,6 @@ Install globally if you want the `codex-chat-bridge` command on PATH:
 npm install -g @heungtae/codex-chat-bridge
 ```
 
-When starting via `bin/codex-chat-bridge.js`, the package checks `npm` for a newer version.
-If a new version exists, it compares current vs latest and shows choices:
-- update now and exit
-- skip this run
-- skip this version
-Set `CODEX_CHAT_BRIDGE_AUTO_UPDATE=0` to disable update checks.
-
 ## What it does
 
 - Filters request payloads (`drop_tool_types`, `drop_request_fields`) before upstream forwarding
@@ -167,10 +160,15 @@ When the bridge starts, it logs startup summary, defaults, and per-router overri
 
 ```
 INFO codex_chat_bridge: startup: listen_addrs=["127.0.0.1:8787"] router_count=3
-INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions upstream_http_headers=[] forward_incoming_headers=[...] drop_tool_types=[...] drop_request_fields=[...]
-INFO codex_chat_bridge: runtime config: api_key_env=OPENROUTER_API_KEY server_info=Some("/tmp/codex-chat-bridge-info.json") http_shutdown=false verbose_logging=false
-INFO codex_chat_bridge: router: name=openrouter active=true incoming_url=Some("http://127.0.0.1:8787/openrouter/v1/responses") overrides=none
-INFO codex_chat_bridge: request routed: router=research, incoming_route=/research/v1/responses, upstream_url=...
+INFO codex_chat_bridge: router defaults: upstream_url=http://localhost:8080/v1/chat/completions, upstream_wire=Chat, upstream_http_headers=[], forward_incoming_headers=[...], drop_tool_types=[...], drop_request_fields=[...]
+INFO codex_chat_bridge: runtime config: api_key_env=OPENROUTER_API_KEY, server_info=Some("/tmp/codex-chat-bridge-info.json"), http_shutdown=false, verbose_logging=false, feature_flags=FeatureFlags { enable_provider_specific_fields: false, enable_extended_input_types: false, tool_transform_mode: LegacyConvert }
+INFO codex_chat_bridge: router: name=openrouter, active=true, incoming_url=Some("http://127.0.0.1:8787/openrouter/v1/responses"), upstream_wire=Responses, overrides=upstream_url=http://openrouter.ai/api/v1/responses, upstream_wire=Responses
+```
+
+With `verbose_logging=true`, request-level routing logs are also emitted at `DEBUG` level:
+
+```
+DEBUG codex_chat_bridge: request routed: router=research, incoming_route=/research/v1/responses, upstream_url=http://localhost:8080/v1/chat/completions, upstream_wire=Chat
 ```
 
 ## Run
