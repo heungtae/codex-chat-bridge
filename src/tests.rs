@@ -274,6 +274,69 @@
     }
 
     #[test]
+    fn map_supports_reasoning_input_item_summary_text() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type":"summary_text","text":"step 1"},
+                        {"type":"summary_text","text":"step 2"}
+                    ]
+                }
+            ]
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false).expect("should map");
+        let messages = req.chat_request["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "[reasoning_summary] step 1\nstep 2");
+    }
+
+    #[test]
+    fn map_ignores_reasoning_input_item_with_empty_summary() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type":"summary_text","text":""}
+                    ]
+                }
+            ]
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false).expect("should map");
+        let messages = req.chat_request["messages"].as_array().expect("messages");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn map_supports_reasoning_input_item_text_fallback() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "reasoning",
+                    "text": "fallback reasoning text"
+                }
+            ]
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false).expect("should map");
+        let messages = req.chat_request["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["content"], "[reasoning_summary] fallback reasoning text");
+    }
+
+    #[test]
     fn map_recovers_missing_call_id_from_pending_tool_call() {
         let input = json!({
             "model": "gpt-4.1",

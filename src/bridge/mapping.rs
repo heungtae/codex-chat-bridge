@@ -407,6 +407,16 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     }));
                 }
             }
+            "reasoning" => {
+                if let Some(content) = reasoning_item_to_text(item)
+                    && !content.trim().is_empty()
+                {
+                    messages.push(json!({
+                        "role": "assistant",
+                        "content": content,
+                    }));
+                }
+            }
             "function_call" => {
                 let name = item
                     .get("name")
@@ -683,11 +693,33 @@ fn apply_responses_request_extensions(request: &Value, chat_request: &mut Value)
     Ok(())
 }
 
+fn reasoning_item_to_text(item: &Value) -> Option<String> {
+    if let Some(summary_items) = item.get("summary").and_then(Value::as_array) {
+        let summary_text = flatten_content_items(summary_items, true);
+        if !summary_text.trim().is_empty() {
+            return Some(format!("[reasoning_summary] {summary_text}"));
+        }
+    }
+
+    if let Some(content_items) = item.get("content").and_then(Value::as_array) {
+        let content_text = flatten_content_items(content_items, true);
+        if !content_text.trim().is_empty() {
+            return Some(format!("[reasoning_summary] {content_text}"));
+        }
+    }
+
+    let text = item.get("text").and_then(Value::as_str).unwrap_or_default();
+    if text.trim().is_empty() {
+        return None;
+    }
+    Some(format!("[reasoning_summary] {text}"))
+}
+
 pub(crate) fn flatten_content_items(items: &[Value], enable_extended_input_types: bool) -> String {
     let mut parts = Vec::new();
     for item in items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-        if matches!(item_type, "input_text" | "output_text")
+        if matches!(item_type, "input_text" | "output_text" | "summary_text")
             && let Some(text) = item.get("text").and_then(Value::as_str)
             && !text.is_empty()
         {

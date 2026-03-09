@@ -149,6 +149,8 @@ Available flags:
 - `enable_provider_specific_fields`: Preserves/passes `provider_specific_fields` in mapped responses.
 - `enable_extended_input_types`: Allows extended input/tool types (`input_image`, `input_file`, `mcp`, `web_search`, `web_search_preview`) in `responses -> chat` bridge path.
 
+`responses -> chat` mapping also accepts top-level `input` items with `type: "reasoning"` and converts their summary/text into assistant message context.
+
 ### CLI Options
 
 - `--list-routers`: List available routers and exit
