@@ -135,7 +135,7 @@ enable_extended_stream_events = true
 enable_reasoning_stream_events = true
 enable_provider_specific_fields = true
 enable_extended_input_types = true
-tool_transform_mode = "passthrough" # passthrough | legacy_convert
+tool_transform_mode = "legacy_convert" # passthrough | legacy_convert
 
 [routers.research.features]
 enable_reasoning_stream_events = false
@@ -151,8 +151,8 @@ Available flags:
 - `enable_provider_specific_fields`: Preserves/passes `provider_specific_fields` in mapped responses.
 - `enable_extended_input_types`: Allows extended input/tool types (`input_image`, `input_file`, `mcp`, `web_search`, `web_search_preview`) in `responses -> chat` bridge path.
 - `tool_transform_mode`: Controls `responses -> chat` tool conversion.
-  - `passthrough` (default): Keep non-`function` tool types as-is (LiteLLM-like behavior).
-  - `legacy_convert`: Convert `custom`/`mcp`/`web_search*` tools into chat `function` tools.
+  - `legacy_convert` (default): Convert `custom`/`mcp`/`web_search*` tools into chat `function` tools.
+  - `passthrough`: Keep non-`function` tool types as-is (LiteLLM-like behavior).
 
 `responses -> chat` mapping also accepts top-level `input` items with `type: "reasoning"` and converts their summary/text into assistant message context.
 

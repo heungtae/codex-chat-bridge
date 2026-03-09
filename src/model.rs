@@ -67,7 +67,7 @@ impl Default for FeatureFlags {
             enable_reasoning_stream_events: true,
             enable_provider_specific_fields: true,
             enable_extended_input_types: true,
-            tool_transform_mode: ToolTransformMode::Passthrough,
+            tool_transform_mode: ToolTransformMode::LegacyConvert,
         }
     }
 }
