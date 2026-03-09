@@ -1,6 +1,6 @@
 {
   "name": "@heungtae/codex-chat-bridge",
-  "version": "0.3.5",
+  "version": "0.3.6",
   "description": "Responses-to-chat/completions bridge for Codex workflows",
   "license": "Apache-2.0",
   "type": "commonjs",
@@ -29,8 +29,5 @@
     "start": "node bin/codex-chat-bridge.js",
     "prepack": "npm run sync:version",
     "pack:check": "npm pack --dry-run"
-  },
-  "dependencies": {
-    "@heungtae/codex-chat-bridge": "^0.1.7"
   }
 }
