@@ -44,8 +44,11 @@ npm install -g @heungtae/codex-chat-bridge
 ```
 
 When starting via `bin/codex-chat-bridge.js`, the package checks `npm` for a newer version.
-If a new version exists, it prints an upgrade recommendation and attempts automatic update.
-Set `CODEX_CHAT_BRIDGE_AUTO_UPDATE=0` to disable automatic update.
+If a new version exists, it compares current vs latest and shows choices:
+- update now and exit
+- skip this run
+- skip this version
+Set `CODEX_CHAT_BRIDGE_AUTO_UPDATE=0` to disable update checks.
 
 ## What it does
 

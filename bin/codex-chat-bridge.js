@@ -18,31 +18,60 @@ const updatePrefPath = resolve(
   "update-preferences.json"
 );
 
-function getOutdatedPackageInfo() {
-  const result = spawnSync("npm", ["outdated", "--json", packageName], {
+function getLatestPublishedVersion() {
+  const result = spawnSync("npm", ["view", packageName, "version", "--json"], {
     encoding: "utf8",
     stdio: ["ignore", "pipe", "pipe"],
     timeout: 5000,
   });
 
-  if (result.error || !result.stdout.trim()) {
+  if (result.error || result.status !== 0 || !result.stdout.trim()) {
     return null;
   }
-
-  if (result.status !== 1) {
-    return null;
-  }
-
   try {
     const parsed = JSON.parse(result.stdout);
-    const info = parsed[packageName];
-    if (!info || !info.latest) {
+    if (typeof parsed === "string" && parsed.trim()) {
+      return parsed.trim();
+    }
+    if (parsed && typeof parsed.version === "string" && parsed.version.trim()) {
+      return parsed.version.trim();
+    }
+    if (Array.isArray(parsed) && typeof parsed[0] === "string") {
+      return parsed[0].trim();
+    }
+    return null;
+  } catch {
+    const raw = result.stdout.trim();
+    if (!raw) {
       return null;
     }
-    return info;
-  } catch {
+    return raw.replace(/^"+|"+$/g, "");
+  }
+}
+
+function normalizeSemver(version) {
+  const match = String(version).trim().match(/^(\d+)\.(\d+)\.(\d+)(?:[-+].*)?$/);
+  if (!match) {
     return null;
   }
+  return [Number(match[1]), Number(match[2]), Number(match[3])];
+}
+
+function isNewerVersion(currentVersion, latestVersion) {
+  const current = normalizeSemver(currentVersion);
+  const latest = normalizeSemver(latestVersion);
+  if (!current || !latest) {
+    return latestVersion !== currentVersion;
+  }
+  for (let i = 0; i < 3; i += 1) {
+    if (latest[i] > current[i]) {
+      return true;
+    }
+    if (latest[i] < current[i]) {
+      return false;
+    }
+  }
+  return false;
 }
 
 function isGlobalInstallPath() {
@@ -82,13 +111,14 @@ function saveUpdatePreference(pref) {
 }
 
 function runUpdateCommand(updateArgs, latest) {
-  console.error(`info: running automatic update: npm ${updateArgs.join(" ")}`);
+  console.error(`info: running update: npm ${updateArgs.join(" ")}`);
   const updateResult = spawnSync("npm", updateArgs, { stdio: "inherit", timeout: 60000 });
   if (updateResult.error || updateResult.status !== 0) {
-    console.error("warn: automatic update failed. Continue with current installed version.");
-  } else {
-    console.error(`info: update completed. Restart to use ${latest}.`);
+    console.error("error: update failed.");
+    return false;
   }
+  console.error(`info: update completed. Restart to use ${latest}.`);
+  return true;
 }
 
 function askQuestion(rl, prompt) {
@@ -103,9 +133,9 @@ async function promptUpdateChoice(currentVersion, latestVersion) {
   console.error("");
   console.error("  Release notes: https://github.com/openai/codex/releases/latest");
   console.error("");
-  console.error(`› 1. Update now (runs \`npm install -g ${packageName}\`)`);
-  console.error("  2. Skip");
-  console.error("  3. Skip until next version");
+  console.error(`› 1. Update now and exit (runs \`npm install -g ${packageName}\`)`);
+  console.error("  2. Skip this run");
+  console.error("  3. Skip this version");
   console.error("");
 
   const rl = readline.createInterface({
@@ -114,8 +144,11 @@ async function promptUpdateChoice(currentVersion, latestVersion) {
   });
 
   try {
-    const answer = (await askQuestion(rl, "  Press enter to continue ")).trim();
-    if (answer === "" || answer === "1") {
+    const answer = (await askQuestion(rl, "  Choose [1/2/3] (default: 2): ")).trim();
+    if (answer === "" || answer === "2") {
+      return "skip";
+    }
+    if (answer === "1") {
       return "update";
     }
     if (answer === "3") {
@@ -132,12 +165,11 @@ async function autoUpdateIfOutdated() {
     return;
   }
 
-  const outdated = getOutdatedPackageInfo();
-  if (!outdated) {
+  const latest = getLatestPublishedVersion();
+  if (!latest || !isNewerVersion(packageVersion, latest)) {
     return;
   }
 
-  const latest = outdated.latest;
   console.error(
     `warn: ${packageName} has a newer version (${packageVersion} -> ${latest}).`
   );
@@ -153,14 +185,14 @@ async function autoUpdateIfOutdated() {
   }
 
   if (!process.stdin.isTTY || !process.stderr.isTTY) {
-    runUpdateCommand(updateArgs, latest);
+    console.error("info: non-interactive mode detected; skipping update prompt.");
     return;
   }
 
   const choice = await promptUpdateChoice(packageVersion, latest);
   if (choice === "update") {
-    runUpdateCommand(updateArgs, latest);
-    return;
+    const ok = runUpdateCommand(updateArgs, latest);
+    process.exit(ok ? 0 : 1);
   }
   if (choice === "skip-until-next-version") {
     saveUpdatePreference({ skipUntilVersion: latest });
