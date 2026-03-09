@@ -133,7 +133,7 @@ async function promptUpdateChoice(currentVersion, latestVersion) {
   console.error("");
   console.error("  Release notes: https://github.com/openai/codex/releases/latest");
   console.error("");
-  console.error(`› 1. Update now and exit (runs \`npm install -g ${packageName}\`)`);
+  console.error(`  1. Update now and exit (runs \`npm install -g ${packageName}\`)`);
   console.error("  2. Skip this run");
   console.error("  3. Skip this version");
   console.error("");
