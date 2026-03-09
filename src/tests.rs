@@ -30,7 +30,7 @@
             "parallel_tool_calls": true
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -64,7 +64,7 @@
     #[test]
     fn normalize_tool_choice_wraps_function_name() {
         let choice = json!({"type":"function", "name":"f"});
-        let normalized = normalize_tool_choice(choice);
+        let normalized = normalize_tool_choice(choice, ToolTransformMode::LegacyConvert);
         assert_eq!(
             normalized,
             json!({"type":"function", "function": {"name":"f"}})
@@ -83,7 +83,7 @@
     #[test]
     fn normalize_chat_tools_converts_web_search_preview_to_function() {
         let tools = vec![json!({"type": "web_search_preview"})];
-        let out = normalize_chat_tools(tools, &HashSet::new());
+        let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "function");
         assert_eq!(out[0]["function"]["name"], "web_search_preview");
@@ -92,7 +92,7 @@
     #[test]
     fn normalize_chat_tools_converts_mcp_to_function() {
         let tools = vec![json!({"type": "mcp", "server_label": "shell"})];
-        let out = normalize_chat_tools(tools, &HashSet::new());
+        let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "function");
         assert_eq!(out[0]["function"]["name"], "mcp__shell");
@@ -122,7 +122,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -147,7 +147,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -174,7 +174,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -201,7 +201,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -232,7 +232,7 @@
             "tools": []
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req
             .chat_request
             .get("messages")
@@ -263,7 +263,7 @@
         });
 
         let req =
-            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         assert_eq!(req.chat_request["max_tokens"], 321);
         assert_eq!(req.chat_request["metadata"]["trace_id"], "t-1");
         assert_eq!(req.chat_request["reasoning"]["effort"], "medium");
@@ -289,7 +289,7 @@
         });
 
         let req =
-            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false).expect("should map");
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "assistant");
@@ -311,7 +311,7 @@
         });
 
         let req =
-            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false).expect("should map");
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
         assert!(messages.is_empty());
     }
@@ -329,7 +329,7 @@
         });
 
         let req =
-            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false).expect("should map");
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0]["role"], "assistant");
@@ -347,7 +347,7 @@
         });
 
         let req =
-            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true).expect("should map");
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[1]["role"], "tool");
@@ -365,7 +365,7 @@
         });
 
         let req =
-            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true).expect("should map");
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
         assert_eq!(messages[1]["tool_call_id"], "call_1");
     }
@@ -381,7 +381,7 @@
             ]
         });
 
-        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true)
+        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, true, ToolTransformMode::LegacyConvert)
             .expect_err("must fail");
         assert!(err
             .to_string()
@@ -397,14 +397,14 @@
             "tool_choice": 123
         });
 
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("should map");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("should map");
         assert_eq!(req.chat_request["tool_choice"], "auto");
     }
 
     #[test]
     fn map_requires_input_array() {
         let input = json!({"model":"gpt-4.1"});
-        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect_err("must fail");
+        let err = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect_err("must fail");
         assert!(err.to_string().contains("missing `input` array"));
     }
 
@@ -424,7 +424,7 @@
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": []
         });
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("ok");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("ok");
         let obj = req.chat_request.as_object().expect("object");
         assert!(!obj.contains_key("tools"));
         assert!(!obj.contains_key("tool_choice"));
@@ -449,7 +449,11 @@
             "type": "function",
             "function": {"name":"f", "parameters": {"type":"object"}}
         })];
-        let out = normalize_chat_tools(tools.clone(), &HashSet::new());
+        let out = normalize_chat_tools(
+            tools.clone(),
+            &HashSet::new(),
+            ToolTransformMode::LegacyConvert,
+        );
         assert_eq!(out, tools);
     }
 
@@ -461,7 +465,7 @@
             "description": "run shell",
             "input_schema": {"type":"object","properties":{"cmd":{"type":"string"}}}
         })];
-        let out = normalize_chat_tools(tools, &HashSet::new());
+        let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
         assert_eq!(
             out[0],
             json!({
@@ -482,7 +486,7 @@
             "name": "apply_patch",
             "description": "patch files"
         })];
-        let out = normalize_chat_tools(tools, &HashSet::new());
+        let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
         assert_eq!(out[0]["type"], "function");
         assert_eq!(out[0]["function"]["parameters"]["type"], "object");
         assert_eq!(
@@ -502,7 +506,7 @@
             "name": "apply_patch",
             "input_schema": {"type":"string"}
         })];
-        let out = normalize_chat_tools(tools, &HashSet::new());
+        let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
         assert_eq!(out[0]["type"], "function");
         assert_eq!(out[0]["function"]["parameters"]["type"], "object");
         assert_eq!(
@@ -514,14 +518,17 @@
     #[test]
     fn normalize_tool_choice_preserves_wrapped_choice() {
         let choice = json!({"type":"function", "function":{"name":"do_it"}});
-        assert_eq!(normalize_tool_choice(choice.clone()), choice);
+        assert_eq!(
+            normalize_tool_choice(choice.clone(), ToolTransformMode::LegacyConvert),
+            choice
+        );
     }
 
     #[test]
     fn normalize_tool_choice_converts_custom_name() {
         let choice = json!({"type":"custom", "name":"shell"});
         assert_eq!(
-            normalize_tool_choice(choice),
+            normalize_tool_choice(choice, ToolTransformMode::LegacyConvert),
             json!({"type":"function","function":{"name":"shell"}})
         );
     }
@@ -540,7 +547,7 @@
             "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
             "tools": []
         });
-        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true).expect("ok");
+        let req = map_responses_to_chat_request_with_stream(&input, &HashSet::new(), true, true, ToolTransformMode::LegacyConvert).expect("ok");
         let messages = req.chat_request["messages"].as_array().expect("array");
         assert_eq!(messages[0]["role"], "system");
     }
@@ -553,9 +560,30 @@
         ];
         let mut drop = HashSet::new();
         drop.insert("web_search_preview".to_string());
-        let out = normalize_chat_tools(tools, &drop);
+        let out = normalize_chat_tools(tools, &drop, ToolTransformMode::LegacyConvert);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0]["type"], "function");
+    }
+
+    #[test]
+    fn normalize_chat_tools_passthrough_keeps_custom_tool() {
+        let tools = vec![json!({
+            "type": "custom",
+            "name": "apply_patch",
+            "description": "patch files",
+            "input_schema": {"type":"string"}
+        })];
+        let out = normalize_chat_tools(tools.clone(), &HashSet::new(), ToolTransformMode::Passthrough);
+        assert_eq!(out, tools);
+    }
+
+    #[test]
+    fn normalize_tool_choice_passthrough_keeps_custom_choice() {
+        let choice = json!({"type":"custom", "name":"apply_patch"});
+        assert_eq!(
+            normalize_tool_choice(choice.clone(), ToolTransformMode::Passthrough),
+            choice
+        );
     }
 
     #[test]

@@ -155,6 +155,7 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # enable_reasoning_stream_events = true
 # enable_provider_specific_fields = true
 # enable_extended_input_types = true
+# tool_transform_mode = "passthrough" # passthrough | legacy_convert
 
 # [routers.default]
 # upstream_url = "https://api.openai.com/v1/chat/completions"
@@ -166,6 +167,7 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # incoming_url = "http://<host>:<port>/default"
 # [routers.default.features]
 # enable_reasoning_stream_events = false
+# tool_transform_mode = "legacy_convert"
 
 # [routers.prod]
 # upstream_url = "https://api.openai.com/v1/chat/completions"

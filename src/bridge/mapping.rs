@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{BridgeRequest, ResponsesToolCallKind};
+use crate::{BridgeRequest, ResponsesToolCallKind, ToolTransformMode};
 
 pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Result<Value> {
     let model = request
@@ -388,6 +388,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
     drop_tool_types: &HashSet<String>,
     stream: bool,
     enable_extended_input_types: bool,
+    tool_transform_mode: ToolTransformMode,
 ) -> Result<BridgeRequest> {
     let model = request
         .get("model")
@@ -629,8 +630,8 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
         }
     }
 
-    let chat_tools = normalize_chat_tools(tools, drop_tool_types);
-    let chat_tool_choice = normalize_tool_choice(tool_choice);
+    let chat_tools = normalize_chat_tools(tools, drop_tool_types, tool_transform_mode);
+    let chat_tool_choice = normalize_tool_choice(tool_choice, tool_transform_mode);
 
     let mut chat_request = json!({
         "model": model,
@@ -811,7 +812,11 @@ pub(crate) fn function_arguments_to_text(value: &Value) -> String {
     }
 }
 
-pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<String>) -> Vec<Value> {
+pub(crate) fn normalize_chat_tools(
+    tools: Vec<Value>,
+    drop_tool_types: &HashSet<String>,
+    tool_transform_mode: ToolTransformMode,
+) -> Vec<Value> {
     tools
         .into_iter()
         .filter_map(|tool| {
@@ -847,6 +852,9 @@ pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<
             }
 
             if tool_type == Some("custom") {
+                if tool_transform_mode == ToolTransformMode::Passthrough {
+                    return Some(tool);
+                }
                 if let Some(function) = tool.get("function").cloned() {
                     let mut converted = tool;
                     if let Some(obj) = converted.as_object_mut() {
@@ -879,6 +887,9 @@ pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<
             }
 
             if tool_type == Some("mcp") {
+                if tool_transform_mode == ToolTransformMode::Passthrough {
+                    return Some(tool);
+                }
                 let server_label = tool
                     .get("server_label")
                     .and_then(Value::as_str)
@@ -917,6 +928,9 @@ pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<
             }
 
             if matches!(tool_type, Some("web_search") | Some("web_search_preview")) {
+                if tool_transform_mode == ToolTransformMode::Passthrough {
+                    return Some(tool);
+                }
                 let name = tool
                     .get("name")
                     .and_then(Value::as_str)
@@ -956,7 +970,7 @@ pub(crate) fn normalize_chat_tools(tools: Vec<Value>, drop_tool_types: &HashSet<
         .collect()
 }
 
-pub(crate) fn normalize_tool_choice(tool_choice: Value) -> Value {
+pub(crate) fn normalize_tool_choice(tool_choice: Value, tool_transform_mode: ToolTransformMode) -> Value {
     if let Some(s) = tool_choice.as_str() {
         return Value::String(s.to_string());
     }
@@ -967,7 +981,8 @@ pub(crate) fn normalize_tool_choice(tool_choice: Value) -> Value {
 
     let tool_type = obj.get("type").and_then(Value::as_str);
 
-    if tool_type == Some("custom")
+    if tool_transform_mode == ToolTransformMode::LegacyConvert
+        && tool_type == Some("custom")
         && let Some(name) = obj
             .get("function")
             .and_then(Value::as_object)
@@ -982,7 +997,8 @@ pub(crate) fn normalize_tool_choice(tool_choice: Value) -> Value {
         });
     }
 
-    if tool_type == Some("custom")
+    if tool_transform_mode == ToolTransformMode::LegacyConvert
+        && tool_type == Some("custom")
         && let Some(name) = obj.get("name").and_then(Value::as_str)
     {
         return json!({
@@ -1006,6 +1022,10 @@ pub(crate) fn normalize_tool_choice(tool_choice: Value) -> Value {
                 "name": name,
             }
         });
+    }
+
+    if tool_transform_mode == ToolTransformMode::Passthrough {
+        return tool_choice;
     }
 
     Value::String("auto".to_string())

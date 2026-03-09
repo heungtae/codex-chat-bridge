@@ -24,6 +24,7 @@ enable_extended_stream_events = true
 enable_reasoning_stream_events = true
 enable_provider_specific_fields = true
 enable_extended_input_types = true
+tool_transform_mode = "passthrough" # passthrough | legacy_convert
 
 # Routers (required for multi-route mode)
 
@@ -46,6 +47,7 @@ enable_extended_stream_events = true
 enable_reasoning_stream_events = true
 enable_provider_specific_fields = true
 enable_extended_input_types = true
+tool_transform_mode = "passthrough"
 
 [routers.research]
 incoming_url = "http://127.0.0.1:8787/research/v1/responses"
@@ -65,3 +67,4 @@ enable_extended_stream_events = true
 enable_reasoning_stream_events = false
 enable_provider_specific_fields = true
 enable_extended_input_types = true
+tool_transform_mode = "legacy_convert"

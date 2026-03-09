@@ -389,6 +389,7 @@ async fn build_upstream_payload_with_session(
         route_target.upstream_wire,
         wants_stream,
         route_target.feature_flags.enable_extended_input_types,
+        route_target.feature_flags.tool_transform_mode,
     ) {
         Ok(v) => v,
         Err(err) => {

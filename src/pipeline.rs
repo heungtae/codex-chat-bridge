@@ -6,6 +6,7 @@ use std::collections::HashSet;
 use crate::bridge::mapping::map_chat_to_responses_request;
 use crate::bridge::mapping::map_responses_to_chat_request_with_stream;
 use crate::model::IncomingApi;
+use crate::model::ToolTransformMode;
 use crate::model::WireApi;
 
 pub(crate) fn infer_incoming_api(request: &Value) -> IncomingApi {
@@ -118,6 +119,7 @@ pub(crate) fn build_upstream_payload(
     upstream_wire: WireApi,
     stream: bool,
     enable_extended_input_types: bool,
+    tool_transform_mode: ToolTransformMode,
 ) -> Result<Value> {
     let mut payload = match (incoming_api, upstream_wire) {
         (IncomingApi::Responses, WireApi::Responses) => request.clone(),
@@ -127,6 +129,7 @@ pub(crate) fn build_upstream_payload(
                 &HashSet::new(),
                 stream,
                 enable_extended_input_types,
+                tool_transform_mode,
             )?
             .chat_request
         }
