@@ -629,6 +629,52 @@
     }
 
     #[test]
+    fn chat_json_to_responses_json_unwraps_custom_tool_call_json_string_arguments() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_custom_2",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "\"*** Begin Patch\\n*** End Patch\""
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut kinds = HashMap::new();
+        kinds.insert("apply_patch".to_string(), ResponsesToolCallKind::Custom);
+        let out = chat_json_to_responses_json(chat, "resp_2".to_string(), &kinds, false);
+        let output = out["output"].as_array().expect("output");
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["input"], "*** Begin Patch\n*** End Patch");
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_unwraps_custom_tool_call_input_field_arguments() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_custom_3",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"*** Begin Patch\\n*** End Patch\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut kinds = HashMap::new();
+        kinds.insert("apply_patch".to_string(), ResponsesToolCallKind::Custom);
+        let out = chat_json_to_responses_json(chat, "resp_3".to_string(), &kinds, false);
+        let output = out["output"].as_array().expect("output");
+        assert_eq!(output[0]["type"], "custom_tool_call");
+        assert_eq!(output[0]["input"], "*** Begin Patch\n*** End Patch");
+    }
+
+    #[test]
     fn chat_json_to_responses_json_maps_length_finish_reason_to_incomplete() {
         let chat = json!({
             "choices": [{

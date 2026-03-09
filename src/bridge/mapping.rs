@@ -212,10 +212,13 @@ pub(crate) fn responses_tool_call_item(
     tool_call_kinds_by_name: &HashMap<String, ResponsesToolCallKind>,
 ) -> Value {
     match tool_call_kinds_by_name.get(name) {
+        // Custom tools are freeform inputs in Responses API. If upstream chat
+        // produced JSON-wrapped arguments (e.g. "..." or {"input":"..."}),
+        // unwrap them back to raw text.
         Some(ResponsesToolCallKind::Custom) => json!({
             "type": "custom_tool_call",
             "name": name,
-            "input": arguments,
+            "input": custom_tool_input_from_arguments(arguments),
             "call_id": call_id,
         }),
         _ => json!({
@@ -224,6 +227,23 @@ pub(crate) fn responses_tool_call_item(
             "arguments": arguments,
             "call_id": call_id,
         }),
+    }
+}
+
+fn custom_tool_input_from_arguments(arguments: &str) -> String {
+    let trimmed = arguments.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    match serde_json::from_str::<Value>(trimmed) {
+        Ok(Value::String(s)) => s,
+        Ok(Value::Object(obj)) => obj
+            .get("input")
+            .and_then(Value::as_str)
+            .map(ToString::to_string)
+            .unwrap_or_else(|| arguments.to_string()),
+        _ => arguments.to_string(),
     }
 }
 
