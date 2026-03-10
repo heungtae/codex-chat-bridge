@@ -5,6 +5,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{BridgeRequest, ResponsesToolCallKind, ToolTransformMode};
+use crate::bridge::apply_patch::normalize_apply_patch_input;
 
 pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Result<Value> {
     let model = request
@@ -218,7 +219,7 @@ pub(crate) fn responses_tool_call_item(
         Some(ResponsesToolCallKind::Custom) => json!({
             "type": "custom_tool_call",
             "name": name,
-            "input": custom_tool_input_from_arguments(arguments),
+            "input": custom_tool_input_from_arguments(name, arguments),
             "call_id": call_id,
         }),
         _ => json!({
@@ -230,13 +231,13 @@ pub(crate) fn responses_tool_call_item(
     }
 }
 
-fn custom_tool_input_from_arguments(arguments: &str) -> String {
+fn custom_tool_input_from_arguments(name: &str, arguments: &str) -> String {
     let trimmed = arguments.trim();
     if trimmed.is_empty() {
         return String::new();
     }
 
-    match serde_json::from_str::<Value>(trimmed) {
+    let input = match serde_json::from_str::<Value>(trimmed) {
         Ok(Value::String(s)) => s,
         Ok(Value::Object(obj)) => obj
             .get("input")
@@ -246,6 +247,12 @@ fn custom_tool_input_from_arguments(arguments: &str) -> String {
             .map(ToString::to_string)
             .unwrap_or_else(|| arguments.to_string()),
         _ => arguments.to_string(),
+    };
+
+    if name == "apply_patch" {
+        normalize_apply_patch_input(&input)
+    } else {
+        input
     }
 }
 

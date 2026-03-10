@@ -1,4 +1,5 @@
     use super::*;
+    use crate::bridge::apply_patch::normalize_apply_patch_input;
     use axum::body::Bytes;
     use futures::stream;
     use futures::StreamExt;
@@ -759,6 +760,62 @@
         let output = out["output"].as_array().expect("output");
         assert_eq!(output[0]["type"], "custom_tool_call");
         assert_eq!(output[0]["input"], "*** Begin Patch\n*** End Patch");
+    }
+
+    #[test]
+    fn normalize_apply_patch_input_strips_code_fence_and_text() {
+        let raw = "Here is the patch:\n```patch\n*** Begin Patch\n*** Update File: a.txt\n@@\n-old   \n+new   \n*** End Patch\n```\n";
+        assert_eq!(
+            normalize_apply_patch_input(raw),
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_normalizes_apply_patch_arguments() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_custom_5",
+                        "function": {
+                            "name": "apply_patch",
+                            "arguments": "{\"input\":\"Patch follows\\n```patch\\n*** Begin Patch\\n*** Update File: a.txt\\n@@\\n-old   \\n+new   \\n*** End Patch\\n```\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut kinds = HashMap::new();
+        kinds.insert("apply_patch".to_string(), ResponsesToolCallKind::Custom);
+        let out = chat_json_to_responses_json(chat, "resp_5".to_string(), &kinds, false);
+        let output = out["output"].as_array().expect("output");
+        assert_eq!(
+            output[0]["input"],
+            "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn chat_json_to_responses_json_keeps_non_apply_patch_custom_input_unchanged() {
+        let chat = json!({
+            "choices": [{
+                "message": {
+                    "tool_calls": [{
+                        "id": "call_custom_6",
+                        "function": {
+                            "name": "shell",
+                            "arguments": "{\"input\":\"```bash\\necho hello\\n```\"}"
+                        }
+                    }]
+                }
+            }]
+        });
+        let mut kinds = HashMap::new();
+        kinds.insert("shell".to_string(), ResponsesToolCallKind::Custom);
+        let out = chat_json_to_responses_json(chat, "resp_6".to_string(), &kinds, false);
+        let output = out["output"].as_array().expect("output");
+        assert_eq!(output[0]["input"], "```bash\necho hello\n```");
     }
 
     #[test]
