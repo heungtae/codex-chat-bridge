@@ -6,13 +6,12 @@ pub(crate) fn normalize_apply_patch_input(raw: &str) -> String {
 
     let unfenced = strip_code_fence(trimmed);
     let extracted = extract_patch_block(unfenced).unwrap_or(unfenced);
-    extracted
+    let normalized = extracted
         .lines()
         .map(str::trim_end)
         .collect::<Vec<_>>()
-        .join("\n")
-        .trim()
-        .to_string()
+        .join("\n");
+    repair_add_file_lines(normalized.trim())
 }
 
 fn strip_code_fence(input: &str) -> &str {
@@ -44,4 +43,46 @@ fn extract_patch_block(input: &str) -> Option<&str> {
     let end_offset = after_start.find(end_marker)?;
     let end = start + end_offset + end_marker.len();
     Some(input[start..end].trim())
+}
+
+fn repair_add_file_lines(input: &str) -> String {
+    let mut output = Vec::new();
+    let mut in_add_file = false;
+
+    for line in input.lines() {
+        if in_add_file && is_patch_header(line) {
+            in_add_file = false;
+        }
+
+        if in_add_file {
+            if let Some(stripped) = line.strip_prefix('+') {
+                output.push(format!("+{stripped}"));
+            } else {
+                output.push(format!("+{line}"));
+            }
+            continue;
+        }
+
+        if line.starts_with("*** Add File: ") {
+            in_add_file = true;
+        }
+
+        output.push(line.to_string());
+    }
+
+    output.join("\n")
+}
+
+fn is_patch_header(line: &str) -> bool {
+    matches!(
+        line,
+        "*** End Patch"
+            | "@@"
+            | "*** Add File: "
+            | "*** Delete File: "
+            | "*** Update File: "
+    ) || line.starts_with("@@ ")
+        || line.starts_with("*** Add File: ")
+        || line.starts_with("*** Delete File: ")
+        || line.starts_with("*** Update File: ")
 }

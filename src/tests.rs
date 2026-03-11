@@ -772,6 +772,24 @@
     }
 
     #[test]
+    fn normalize_apply_patch_input_repairs_add_file_lines_without_prefix() {
+        let raw = "*** Begin Patch\n*** Add File: hello.txt\nhello\n\nworld\n*** End Patch";
+        assert_eq!(
+            normalize_apply_patch_input(raw),
+            "*** Begin Patch\n*** Add File: hello.txt\n+hello\n+\n+world\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn normalize_apply_patch_input_repairs_mixed_add_file_lines() {
+        let raw = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n world\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch";
+        assert_eq!(
+            normalize_apply_patch_input(raw),
+            "*** Begin Patch\n*** Add File: hello.txt\n+hello\n+ world\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch"
+        );
+    }
+
+    #[test]
     fn chat_json_to_responses_json_normalizes_apply_patch_arguments() {
         let chat = json!({
             "choices": [{
