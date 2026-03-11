@@ -1,5 +1,5 @@
     use super::*;
-    use crate::bridge::apply_patch::normalize_apply_patch_input;
+    use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
     use axum::body::Bytes;
     use futures::stream;
     use futures::StreamExt;
@@ -766,7 +766,7 @@
     fn normalize_apply_patch_input_strips_code_fence_and_text() {
         let raw = "Here is the patch:\n```patch\n*** Begin Patch\n*** Update File: a.txt\n@@\n-old   \n+new   \n*** End Patch\n```\n";
         assert_eq!(
-            normalize_apply_patch_input(raw),
+            normalize_apply_patch_input_with_repairs(raw).normalized,
             "*** Begin Patch\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch"
         );
     }
@@ -775,7 +775,7 @@
     fn normalize_apply_patch_input_repairs_add_file_lines_without_prefix() {
         let raw = "*** Begin Patch\n*** Add File: hello.txt\nhello\n\nworld\n*** End Patch";
         assert_eq!(
-            normalize_apply_patch_input(raw),
+            normalize_apply_patch_input_with_repairs(raw).normalized,
             "*** Begin Patch\n*** Add File: hello.txt\n+hello\n+\n+world\n*** End Patch"
         );
     }
@@ -784,8 +784,25 @@
     fn normalize_apply_patch_input_repairs_mixed_add_file_lines() {
         let raw = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n world\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch";
         assert_eq!(
-            normalize_apply_patch_input(raw),
+            normalize_apply_patch_input_with_repairs(raw).normalized,
             "*** Begin Patch\n*** Add File: hello.txt\n+hello\n+ world\n*** Update File: a.txt\n@@\n-old\n+new\n*** End Patch"
+        );
+    }
+
+    #[test]
+    fn normalize_apply_patch_input_reports_repairs() {
+        let raw = "*** Begin Patch\n*** Add File: hello.txt\nhello\n\n*** End Patch";
+        let normalized = normalize_apply_patch_input_with_repairs(raw);
+        assert_eq!(
+            normalized.normalized,
+            "*** Begin Patch\n*** Add File: hello.txt\n+hello\n+\n*** End Patch"
+        );
+        assert_eq!(
+            normalized.repairs,
+            vec![
+                "added missing '+' prefix for add-file content line (hello.txt:1)",
+                "added missing '+' prefix for blank add-file line (hello.txt:2)",
+            ]
         );
     }
 

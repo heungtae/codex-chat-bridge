@@ -5,7 +5,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{BridgeRequest, ResponsesToolCallKind, ToolTransformMode};
-use crate::bridge::apply_patch::normalize_apply_patch_input;
+use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
 
 pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Result<Value> {
     let model = request
@@ -250,7 +250,16 @@ fn custom_tool_input_from_arguments(name: &str, arguments: &str) -> String {
     };
 
     if name == "apply_patch" {
-        normalize_apply_patch_input(&input)
+        let normalized = normalize_apply_patch_input_with_repairs(&input);
+        if !normalized.repairs.is_empty() {
+            warn!(
+                repairs = ?normalized.repairs,
+                before = %input,
+                after = %normalized.normalized,
+                "repaired apply_patch input"
+            );
+        }
+        normalized.normalized
     } else {
         input
     }
