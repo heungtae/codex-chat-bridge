@@ -275,7 +275,7 @@
     }
 
     #[test]
-    fn map_supports_reasoning_input_item_summary_text() {
+    fn map_drops_reasoning_input_item_summary_text() {
         let input = json!({
             "model": "gpt-4.1",
             "input": [
@@ -292,9 +292,7 @@
         let req =
             map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
-        assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["content"], "[reasoning_summary] step 1\nstep 2");
+        assert!(messages.is_empty());
     }
 
     #[test]
@@ -318,7 +316,7 @@
     }
 
     #[test]
-    fn map_supports_reasoning_input_item_text_fallback() {
+    fn map_drops_reasoning_input_item_text_fallback() {
         let input = json!({
             "model": "gpt-4.1",
             "input": [
@@ -332,9 +330,36 @@
         let req =
             map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false, ToolTransformMode::LegacyConvert).expect("should map");
         let messages = req.chat_request["messages"].as_array().expect("messages");
+        assert!(messages.is_empty());
+    }
+
+    #[test]
+    fn map_preserves_user_messages_while_dropping_reasoning_items() {
+        let input = json!({
+            "model": "gpt-4.1",
+            "input": [
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [
+                        {"type":"input_text","text":"hello"}
+                    ]
+                },
+                {
+                    "type": "reasoning",
+                    "summary": [
+                        {"type":"summary_text","text":"internal step"}
+                    ]
+                }
+            ]
+        });
+
+        let req =
+            map_responses_to_chat_request_with_stream(&input, &HashSet::new(), false, false, ToolTransformMode::LegacyConvert).expect("should map");
+        let messages = req.chat_request["messages"].as_array().expect("messages");
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0]["role"], "assistant");
-        assert_eq!(messages[0]["content"], "[reasoning_summary] fallback reasoning text");
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"], "hello");
     }
 
     #[test]
@@ -1688,4 +1713,5 @@
         assert!(payload.contains("event: response.reasoning_summary_text.delta"));
         assert!(payload.contains("event: response.reasoning_summary_text.done"));
         assert!(payload.contains("\"text\":\"think step\""));
+        assert!(!payload.contains("[reasoning_summary]"));
     }

@@ -150,7 +150,7 @@ Available flags:
   - `legacy_convert` (default): Convert `custom`/`mcp`/`web_search*` tools into chat `function` tools.
   - `passthrough`: Keep non-`function` tool types as-is (LiteLLM-like behavior).
 
-`responses -> chat` mapping also accepts top-level `input` items with `type: "reasoning"` and converts their summary/text into assistant message context.
+`responses -> chat` mapping accepts top-level `input` items with `type: "reasoning"` for compatibility, but does not serialize them into assistant message text. Live reasoning visibility is provided through Responses-style reasoning stream events/items.
 
 ### CLI Options
 
