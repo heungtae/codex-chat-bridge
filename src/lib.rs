@@ -446,6 +446,23 @@ fn build_upstream_request(
     headers: &HeaderMap,
     upstream_payload: &Value,
 ) -> reqwest::RequestBuilder {
+    let mut merged_headers = HeaderMap::new();
+    for header_name in &route_target.forward_incoming_headers {
+        if let Some(value) = headers.get(header_name) {
+            if let Ok(name) = HeaderName::from_bytes(header_name.as_bytes()) {
+                merged_headers.insert(name, value.clone());
+            }
+        }
+    }
+    for header in &route_target.upstream_http_headers {
+        if let (Ok(name), Ok(value)) = (
+            HeaderName::from_bytes(header.name.as_bytes()),
+            HeaderValue::from_str(&header.value),
+        ) {
+            merged_headers.insert(name, value);
+        }
+    }
+
     let mut upstream_request = state
         .client
         .post(&route_target.upstream_url)
@@ -453,13 +470,8 @@ fn build_upstream_request(
         .header(CONTENT_TYPE, "application/json")
         .json(upstream_payload);
 
-    for header_name in &route_target.forward_incoming_headers {
-        if let Some(value) = headers.get(header_name) {
-            upstream_request = upstream_request.header(header_name, value.clone());
-        }
-    }
-    for header in &route_target.upstream_http_headers {
-        upstream_request = upstream_request.header(&header.name, &header.value);
+    if !merged_headers.is_empty() {
+        upstream_request = upstream_request.headers(merged_headers);
     }
     upstream_request
 }

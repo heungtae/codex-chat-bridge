@@ -48,6 +48,7 @@ npm install -g @heungtae/codex-chat-bridge
 - Filters request payloads (`drop_tool_types`, `drop_request_fields`) before upstream forwarding
 - Adds static upstream headers via `--upstream-http-header NAME=VALUE` or config map (`upstream_http_headers`, alias: `http_headers`)
 - Forwards configured incoming headers (defaults include OpenAI metadata headers) to upstream with `--forward-incoming-header NAME` or `forward_incoming_headers`
+- If the same header key exists in both `forward_incoming_headers` and `upstream_http_headers`, the value from `upstream_http_headers` is sent
 - Automatically maps upstream API type from `upstream_url` (`.../v1/chat/completions` or `.../v1/responses`)
 - Uses `incoming_url` path matching for `POST /{*incoming_path}`
 - Supports feature flags globally (`[features]`) and per-router (`[routers.<name>.features]`)
@@ -97,6 +98,7 @@ Router resolution and overrides:
 - For each request, router config is merged onto defaults.
   - `upstream_http_headers`: merged (router keys overwrite same header names)
   - `forward_incoming_headers`: replaced by router list when set
+  - If the same header key appears in both forwarded and static upstream headers, static `upstream_http_headers` wins
   - `drop_tool_types`, `drop_request_fields`: appended/unioned with defaults
   - `features`: per-router override on top of global feature flags
 

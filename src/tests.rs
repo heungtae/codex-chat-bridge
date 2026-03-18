@@ -1631,6 +1631,61 @@
         assert_eq!(err.message, "too long");
     }
 
+    #[test]
+    fn build_upstream_request_prefers_static_header_on_duplicate_key() {
+        let router_manager = RouterManager::new(
+            BTreeMap::new(),
+            "http://localhost:8080/v1/chat/completions".to_string(),
+            WireApi::Chat,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            FeatureFlags::default(),
+        )
+        .expect("router manager");
+        let state = Arc::new(AppState {
+            client: Client::new(),
+            api_key: "test-key".to_string(),
+            http_shutdown: false,
+            verbose_logging: false,
+            routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
+            sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+        });
+        let route_target = RouteTarget {
+            router_name: "default".to_string(),
+            upstream_url: "http://localhost:8080/v1/chat/completions".to_string(),
+            upstream_wire: WireApi::Chat,
+            upstream_http_headers: vec![UpstreamHeader {
+                name: "x-request-id".to_string(),
+                value: "from-upstream-http-headers".to_string(),
+            }],
+            forward_incoming_headers: vec!["x-request-id".to_string()],
+            drop_tool_types: HashSet::new(),
+            drop_request_fields: HashSet::new(),
+            feature_flags: FeatureFlags::default(),
+        };
+        let mut incoming_headers = HeaderMap::new();
+        incoming_headers.insert(
+            "x-request-id",
+            HeaderValue::from_static("from-forward-incoming-headers"),
+        );
+
+        let request = build_upstream_request(
+            &state,
+            &route_target,
+            &incoming_headers,
+            &json!({"model":"gpt-4.1","messages":[]}),
+        )
+        .build()
+        .expect("request");
+        let values = request.headers().get_all("x-request-id");
+        let collected = values.iter().collect::<Vec<_>>();
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0], "from-upstream-http-headers");
+    }
+
     #[tokio::test]
     async fn stream_emits_failed_when_done_marker_missing() {
         let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
