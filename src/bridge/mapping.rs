@@ -91,6 +91,310 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
     Ok(out)
 }
 
+pub(crate) fn map_anthropic_messages_to_chat_request(request: &Value) -> Result<Value> {
+    let model = request
+        .get("model")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing `model`"))?;
+    let messages = request
+        .get("messages")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("missing `messages` array"))?;
+
+    let mut chat_messages = Vec::new();
+
+    if let Some(system_message) = anthropic_system_to_chat_message(request.get("system")) {
+        chat_messages.push(system_message);
+    }
+
+    for message in messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        match role {
+            "assistant" => {
+                if let Some(chat_message) =
+                    anthropic_assistant_message_to_chat_message(message.get("content"))
+                {
+                    chat_messages.push(chat_message);
+                }
+            }
+            "user" => {
+                chat_messages.extend(anthropic_user_message_to_chat_messages(
+                    message.get("content"),
+                ));
+            }
+            _ => {}
+        }
+    }
+
+    let mut out = json!({
+        "model": model,
+        "messages": chat_messages,
+    });
+
+    let Some(obj) = out.as_object_mut() else {
+        return Ok(out);
+    };
+
+    for field in ["max_tokens", "temperature", "top_p", "metadata"] {
+        if let Some(value) = request.get(field).cloned()
+            && !value.is_null()
+        {
+            obj.insert(field.to_string(), value);
+        }
+    }
+
+    if let Some(stop_sequences) = request.get("stop_sequences").cloned()
+        && !stop_sequences.is_null()
+    {
+        obj.insert("stop".to_string(), stop_sequences);
+    }
+
+    if let Some(stream) = request.get("stream").cloned()
+        && !stream.is_null()
+    {
+        obj.insert("stream".to_string(), stream);
+    }
+
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        let chat_tools = tools
+            .iter()
+            .filter_map(|tool| {
+                let name = tool.get("name").and_then(Value::as_str)?;
+                let description = tool
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let parameters = tool
+                    .get("input_schema")
+                    .cloned()
+                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                Some(json!({
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "description": description,
+                        "parameters": parameters,
+                    }
+                }))
+            })
+            .collect::<Vec<_>>();
+        if !chat_tools.is_empty() {
+            obj.insert("tools".to_string(), Value::Array(chat_tools));
+        }
+    }
+
+    if let Some(tool_choice) = anthropic_tool_choice_to_chat_tool_choice(request.get("tool_choice")) {
+        obj.insert("tool_choice".to_string(), tool_choice);
+    }
+
+    Ok(out)
+}
+
+fn anthropic_system_to_chat_message(system: Option<&Value>) -> Option<Value> {
+    let content = match system {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .filter_map(|item| item.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n\n"),
+        _ => String::new(),
+    };
+    if content.is_empty() {
+        None
+    } else {
+        Some(json!({
+            "role": "system",
+            "content": content,
+        }))
+    }
+}
+
+fn anthropic_assistant_message_to_chat_message(content: Option<&Value>) -> Option<Value> {
+    let mut content_parts = Vec::new();
+    let mut reasoning_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    match content {
+        Some(Value::String(text)) => {
+            if !text.trim().is_empty() {
+                content_parts.push(text.to_string());
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str)
+                            && !text.trim().is_empty()
+                        {
+                            content_parts.push(text.to_string());
+                        }
+                    }
+                    "thinking" => {
+                        if let Some(thinking) = item.get("thinking").and_then(Value::as_str)
+                            && !thinking.trim().is_empty()
+                        {
+                            reasoning_parts.push(thinking.to_string());
+                        }
+                    }
+                    "tool_use" => {
+                        let name = item
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or("unknown_function");
+                        let arguments = item
+                            .get("input")
+                            .cloned()
+                            .unwrap_or_else(|| json!({}))
+                            .to_string();
+                        tool_calls.push(json!({
+                            "id": item.get("id").and_then(Value::as_str).unwrap_or_default(),
+                            "type": "function",
+                            "function": {
+                                "name": name,
+                                "arguments": arguments,
+                            }
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Some(other) => {
+            let text = other.to_string();
+            if !text.trim().is_empty() {
+                content_parts.push(text);
+            }
+        }
+        None => {}
+    }
+
+    if content_parts.is_empty() && reasoning_parts.is_empty() && tool_calls.is_empty() {
+        return None;
+    }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": if content_parts.is_empty() { Value::String(String::new()) } else { Value::String(content_parts.join("\n\n")) },
+    });
+    if let Some(obj) = message.as_object_mut() {
+        if !tool_calls.is_empty() {
+            obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
+        }
+        if !reasoning_parts.is_empty() {
+            obj.insert(
+                "reasoning_content".to_string(),
+                Value::String(reasoning_parts.join("\n\n")),
+            );
+        }
+    }
+    Some(message)
+}
+
+fn anthropic_user_message_to_chat_messages(content: Option<&Value>) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut text_parts = Vec::new();
+
+    let flush_text = |messages: &mut Vec<Value>, text_parts: &mut Vec<String>| {
+        if !text_parts.is_empty() {
+            messages.push(json!({
+                "role": "user",
+                "content": text_parts.join("\n"),
+            }));
+            text_parts.clear();
+        }
+    };
+
+    match content {
+        Some(Value::String(text)) => {
+            if !text.trim().is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": text,
+                }));
+            }
+        }
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                    "text" => {
+                        if let Some(text) = item.get("text").and_then(Value::as_str)
+                            && !text.trim().is_empty()
+                        {
+                            text_parts.push(text.to_string());
+                        }
+                    }
+                    "tool_result" => {
+                        flush_text(&mut messages, &mut text_parts);
+                        let content = anthropic_tool_result_content_to_text(item.get("content"));
+                        messages.push(json!({
+                            "role": "tool",
+                            "tool_call_id": item.get("tool_use_id").and_then(Value::as_str).unwrap_or_default(),
+                            "content": content,
+                        }));
+                    }
+                    _ => {}
+                }
+            }
+            flush_text(&mut messages, &mut text_parts);
+        }
+        Some(other) => {
+            let text = other.to_string();
+            if !text.trim().is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": text,
+                }));
+            }
+        }
+        None => {}
+    }
+
+    messages
+}
+
+fn anthropic_tool_result_content_to_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.to_string(),
+        Some(Value::Array(items)) => items
+            .iter()
+            .map(|item| {
+                item.get("text")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+                    .unwrap_or_else(|| item.to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(Value::Object(_)) => content.cloned().unwrap_or(Value::Null).to_string(),
+        Some(other) => other.to_string(),
+        None => String::new(),
+    }
+}
+
+fn anthropic_tool_choice_to_chat_tool_choice(tool_choice: Option<&Value>) -> Option<Value> {
+    let tool_choice = tool_choice?.as_object()?;
+    match tool_choice.get("type").and_then(Value::as_str)? {
+        "auto" => Some(Value::String("auto".to_string())),
+        "any" => Some(Value::String("required".to_string())),
+        "tool" => tool_choice.get("name").and_then(Value::as_str).map(|name| {
+            json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                }
+            })
+        }),
+        _ => None,
+    }
+}
+
 pub(crate) fn normalize_responses_tools(tools: Vec<Value>) -> Vec<Value> {
     tools
         .into_iter()
@@ -390,6 +694,157 @@ pub(crate) fn chat_json_to_responses_json(
         }
     }
     response
+}
+
+pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> Value {
+    let mut content = Vec::new();
+    let mut stop_reason = "end_turn";
+
+    if let Some(choice) = chat
+        .get("choices")
+        .and_then(Value::as_array)
+        .and_then(|items| items.first())
+    {
+        stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
+            Some("length") => "max_tokens",
+            Some("tool_calls") => "tool_use",
+            _ => "end_turn",
+        };
+
+        if let Some(message) = choice.get("message") {
+            if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
+                && !reasoning.trim().is_empty()
+            {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": reasoning,
+                }));
+            }
+
+            let text = message
+                .get("content")
+                .map(function_output_to_text)
+                .unwrap_or_default();
+            if !text.trim().is_empty() {
+                content.push(json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for tc in tool_calls {
+                    let arguments = tc
+                        .get("function")
+                        .and_then(|f| f.get("arguments"))
+                        .cloned()
+                        .unwrap_or_else(|| json!({}));
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": tc.get("id").and_then(Value::as_str).unwrap_or_default(),
+                        "name": tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str).unwrap_or("unknown_function"),
+                        "input": parse_json_or_string(arguments),
+                    }));
+                }
+            }
+        }
+    }
+
+    json!({
+        "id": chat.get("id").and_then(Value::as_str).map(ToString::to_string).unwrap_or_else(|| format!("msg_{}", Uuid::now_v7())),
+        "type": "message",
+        "role": "assistant",
+        "model": chat.get("model").and_then(Value::as_str).unwrap_or(fallback_model),
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": chat.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0),
+            "output_tokens": chat.get("usage").and_then(|u| u.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0),
+        }
+    })
+}
+
+pub(crate) fn responses_json_to_anthropic_json(response: Value, fallback_model: &str) -> Value {
+    let mut content = Vec::new();
+    let mut stop_reason = "end_turn";
+
+    if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+        stop_reason = "max_tokens";
+    }
+
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "reasoning" => {
+                    let text = item
+                        .get("summary")
+                        .and_then(Value::as_array)
+                        .and_then(|items| items.first())
+                        .and_then(|item| item.get("text"))
+                        .and_then(Value::as_str)
+                        .unwrap_or_default();
+                    if !text.trim().is_empty() {
+                        content.push(json!({
+                            "type": "thinking",
+                            "thinking": text,
+                        }));
+                    }
+                }
+                "message" => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        let text = parts
+                            .iter()
+                            .filter_map(|part| part.get("text").and_then(Value::as_str))
+                            .collect::<Vec<_>>()
+                            .join("\n");
+                        if !text.trim().is_empty() {
+                            content.push(json!({
+                                "type": "text",
+                                "text": text,
+                            }));
+                        }
+                    }
+                }
+                "function_call" | "custom_tool_call" => {
+                    stop_reason = "tool_use";
+                    let input_value = item
+                        .get("arguments")
+                        .cloned()
+                        .or_else(|| item.get("input").cloned())
+                        .unwrap_or_else(|| json!({}));
+                    content.push(json!({
+                        "type": "tool_use",
+                        "id": item.get("call_id").and_then(Value::as_str).or_else(|| item.get("id").and_then(Value::as_str)).unwrap_or_default(),
+                        "name": item.get("name").and_then(Value::as_str).unwrap_or("unknown_function"),
+                        "input": parse_json_or_string(input_value),
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    json!({
+        "id": response.get("id").and_then(Value::as_str).map(ToString::to_string).unwrap_or_else(|| format!("msg_{}", Uuid::now_v7())),
+        "type": "message",
+        "role": "assistant",
+        "model": fallback_model,
+        "content": content,
+        "stop_reason": stop_reason,
+        "stop_sequence": null,
+        "usage": {
+            "input_tokens": response.get("usage").and_then(|u| u.get("input_tokens")).and_then(Value::as_i64).unwrap_or(0),
+            "output_tokens": response.get("usage").and_then(|u| u.get("output_tokens")).and_then(Value::as_i64).unwrap_or(0),
+        }
+    })
+}
+
+fn parse_json_or_string(value: Value) -> Value {
+    match value {
+        Value::String(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
+        other => other,
+    }
 }
 
 fn map_chat_finish_reason_to_responses_status(finish_reason: Option<&str>) -> &'static str {

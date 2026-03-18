@@ -164,7 +164,7 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # forward_incoming_headers = []
 # drop_tool_types = []
 # drop_request_fields = []
-# incoming_url = "http://<host>:<port>/default"
+# incoming_url = "http://<host>:<port>/v1/messages"
 # [routers.default.features]
 # enable_reasoning_stream_events = false
 # tool_transform_mode = "legacy_convert"

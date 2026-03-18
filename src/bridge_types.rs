@@ -89,5 +89,6 @@ pub(crate) struct StreamAccumulator {
 #[derive(Debug, Default)]
 pub(crate) struct SseParser {
     pub(crate) buffer: String,
+    pub(crate) current_event_name: Option<String>,
     pub(crate) current_data_lines: Vec<String>,
 }

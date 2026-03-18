@@ -470,6 +470,13 @@
     }
 
     #[test]
+    fn parser_collects_event_names() {
+        let mut parser = SseParser::default();
+        let out = parser.feed_with_event_names("event: hello\ndata: {\"z\":1}\n\n");
+        assert_eq!(out, vec![(Some("hello".to_string()), "{\"z\":1}".to_string())]);
+    }
+
+    #[test]
     fn normalize_chat_tools_keeps_function_already_wrapped() {
         let tools = vec![json!({
             "type": "function",
@@ -481,6 +488,80 @@
             ToolTransformMode::LegacyConvert,
         );
         assert_eq!(out, tools);
+    }
+
+    #[test]
+    fn map_anthropic_messages_to_chat_request_supports_tools_and_thinking() {
+        let input = json!({
+            "model": "claude-sonnet",
+            "system": [{"type":"text","text":"system prompt"}],
+            "messages": [
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type":"thinking","thinking":"internal"},
+                        {"type":"text","text":"hello"},
+                        {"type":"tool_use","id":"tool_1","name":"shell","input":{"cmd":"pwd"}}
+                    ]
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type":"text","text":"run it"},
+                        {"type":"tool_result","tool_use_id":"tool_1","content":"done"}
+                    ]
+                }
+            ],
+            "tools": [
+                {"name":"shell","description":"Run shell","input_schema":{"type":"object"}}
+            ],
+            "tool_choice": {"type":"tool","name":"shell"}
+        });
+
+        let out = map_anthropic_messages_to_chat_request(&input).expect("ok");
+        let messages = out["messages"].as_array().expect("messages");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["reasoning_content"], "internal");
+        assert_eq!(messages[1]["tool_calls"][0]["function"]["name"], "shell");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(messages[3]["role"], "tool");
+        assert_eq!(out["tools"][0]["function"]["name"], "shell");
+        assert_eq!(out["tool_choice"]["function"]["name"], "shell");
+    }
+
+    #[test]
+    fn chat_json_to_anthropic_json_maps_tool_calls() {
+        let input = json!({
+            "id": "chatcmpl_1",
+            "model": "gpt-4.1",
+            "choices": [{
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "hello",
+                    "reasoning_content": "thinking",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "function": {
+                            "name": "shell",
+                            "arguments": "{\"cmd\":\"pwd\"}"
+                        }
+                    }]
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 10,
+                "completion_tokens": 5
+            }
+        });
+
+        let out = chat_json_to_anthropic_json(input, "claude-bridge");
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "thinking");
+        assert_eq!(out["content"][1]["type"], "text");
+        assert_eq!(out["content"][2]["type"], "tool_use");
+        assert_eq!(out["content"][2]["input"]["cmd"], "pwd");
     }
 
     #[test]

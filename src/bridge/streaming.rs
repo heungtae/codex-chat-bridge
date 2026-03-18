@@ -3,7 +3,7 @@ use async_stream::stream;
 use axum::body::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use tracing::{debug, warn};
 
 use crate::{
@@ -49,6 +49,236 @@ where
                 }
             }
         }
+    }
+}
+
+pub(crate) fn translate_chat_stream_to_anthropic<S>(
+    upstream_stream: S,
+    router_name: String,
+    verbose_logging: bool,
+    model: String,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    stream! {
+        let mut upstream_stream = Box::pin(upstream_stream);
+        let mut parser = SseParser::default();
+        let message_id = format!("msg_{}", uuid::Uuid::now_v7());
+        let mut next_index = 0usize;
+        let mut thinking_index = None;
+        let mut text_index = None;
+        let mut tool_blocks: BTreeMap<usize, AnthropicToolBlockState> = BTreeMap::new();
+        let mut saw_done_marker = false;
+        let mut finish_reason = "end_turn".to_string();
+        let mut usage = json!({
+            "input_tokens": 0,
+            "output_tokens": 0,
+        });
+
+        yield Ok(anthropic_sse_event(
+            "message_start",
+            &json!({
+                "type": "message_start",
+                "message": {
+                    "id": message_id,
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [],
+                    "model": model,
+                    "stop_reason": null,
+                    "stop_sequence": null,
+                    "usage": usage,
+                }
+            }),
+        ));
+
+        while let Some(chunk_result) = upstream_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    yield Ok(anthropic_sse_event(
+                        "error",
+                        &json!({
+                            "type": "error",
+                            "error": {
+                                "type": "api_error",
+                                "message": err.to_string(),
+                            }
+                        }),
+                    ));
+                    return;
+                }
+            };
+
+            if verbose_logging {
+                debug!(
+                    "upstream response payload stream chunk (router={}, chat->anthropic): {}",
+                    router_name,
+                    String::from_utf8_lossy(&chunk)
+                );
+            }
+
+            let text = String::from_utf8_lossy(&chunk);
+            let events = parser.feed(&text);
+            for data in events {
+                if data == "[DONE]" {
+                    saw_done_marker = true;
+                    continue;
+                }
+                let Ok(chat_chunk) = serde_json::from_str::<ChatChunk>(&data) else {
+                    warn!("failed to decode upstream chat chunk for anthropic stream");
+                    continue;
+                };
+
+                if let Some(chat_usage) = chat_chunk.usage {
+                    usage = json!({
+                        "input_tokens": chat_usage.prompt_tokens,
+                        "output_tokens": chat_usage.completion_tokens,
+                    });
+                }
+
+                for choice in chat_chunk.choices {
+                    if let Some(reason) = choice.finish_reason.as_deref() {
+                        finish_reason = map_chat_finish_reason_to_anthropic_stop_reason(reason).to_string();
+                    }
+
+                    let Some(delta) = choice.delta else {
+                        continue;
+                    };
+
+                    if let Some(reasoning) = delta.reasoning_content
+                        && !reasoning.is_empty()
+                    {
+                        if let Some(index) = text_index.take() {
+                            yield Ok(anthropic_content_block_stop(index));
+                        }
+                        let index = *thinking_index.get_or_insert_with(|| {
+                            let index = next_index;
+                            next_index += 1;
+                            index
+                        });
+                        if thinking_index == Some(index) && index + 1 == next_index {
+                            yield Ok(anthropic_content_block_start(index, "thinking", json!({"type":"thinking","thinking":""})));
+                        } else if !tool_blocks.is_empty() || text_index.is_none() {
+                            // no-op, block already open or first block started earlier
+                        }
+                        yield Ok(anthropic_content_block_delta(index, "thinking_delta", &reasoning));
+                    }
+
+                    if let Some(content) = delta.content
+                        && !content.is_empty()
+                    {
+                        if let Some(index) = thinking_index.take() {
+                            yield Ok(anthropic_content_block_stop(index));
+                        }
+                        let index = *text_index.get_or_insert_with(|| {
+                            let index = next_index;
+                            next_index += 1;
+                            index
+                        });
+                        if text_index == Some(index) && index + 1 == next_index {
+                            yield Ok(anthropic_content_block_start(index, "text", json!({"type":"text","text":""})));
+                        }
+                        yield Ok(anthropic_content_block_delta(index, "text_delta", &content));
+                    }
+
+                    if let Some(tool_calls) = delta.tool_calls {
+                        if let Some(index) = thinking_index.take() {
+                            yield Ok(anthropic_content_block_stop(index));
+                        }
+                        if let Some(index) = text_index.take() {
+                            yield Ok(anthropic_content_block_stop(index));
+                        }
+
+                        for tool_call in tool_calls {
+                            let tool_index = tool_call.index.unwrap_or(tool_blocks.len());
+                            let state = tool_blocks.entry(tool_index).or_default();
+                            if let Some(id) = tool_call.id {
+                                state.id = id;
+                            }
+                            if let Some(function) = tool_call.function {
+                                if let Some(name) = function.name {
+                                    state.name = name;
+                                }
+                                if let Some(arguments) = function.arguments
+                                    && !arguments.is_empty()
+                                {
+                                    state.arguments.push_str(&arguments);
+                                }
+                            }
+                            if !state.started {
+                                state.started = true;
+                                state.block_index = next_index;
+                                next_index += 1;
+                                yield Ok(anthropic_content_block_start(
+                                    state.block_index,
+                                    "tool_use",
+                                    json!({
+                                        "type": "tool_use",
+                                        "id": state.id,
+                                        "name": state.name,
+                                        "input": {},
+                                    }),
+                                ));
+                            }
+                            if !state.arguments.is_empty() {
+                                yield Ok(anthropic_content_block_delta(
+                                    state.block_index,
+                                    "input_json_delta",
+                                    &state.arguments,
+                                ));
+                                state.arguments.clear();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if !saw_done_marker {
+            yield Ok(anthropic_sse_event(
+                "error",
+                &json!({
+                    "type": "error",
+                    "error": {
+                        "type": "api_error",
+                        "message": "upstream stream ended before terminal marker",
+                    }
+                }),
+            ));
+            return;
+        }
+
+        if let Some(index) = thinking_index {
+            yield Ok(anthropic_content_block_stop(index));
+        }
+        if let Some(index) = text_index {
+            yield Ok(anthropic_content_block_stop(index));
+        }
+        for (_, state) in tool_blocks {
+            if state.started {
+                yield Ok(anthropic_content_block_stop(state.block_index));
+            }
+        }
+
+        yield Ok(anthropic_sse_event(
+            "message_delta",
+            &json!({
+                "type": "message_delta",
+                "delta": {
+                    "stop_reason": finish_reason,
+                    "stop_sequence": null,
+                },
+                "usage": usage,
+            }),
+        ));
+        yield Ok(anthropic_sse_event(
+            "message_stop",
+            &json!({
+                "type": "message_stop",
+            }),
+        ));
     }
 }
 
@@ -508,8 +738,76 @@ pub(crate) fn sse_event(event_name: &str, payload: &Value) -> Bytes {
     Bytes::from(format!("event: {event_name}\ndata: {json_payload}\n\n"))
 }
 
+pub(crate) fn anthropic_sse_event(event_name: &str, payload: &Value) -> Bytes {
+    let json_payload = serde_json::to_string(payload).unwrap_or_else(|_| {
+        "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"internal serialization error\"}}".to_string()
+    });
+    Bytes::from(format!("event: {event_name}\ndata: {json_payload}\n\n"))
+}
+
+fn anthropic_content_block_start(index: usize, _block_type: &str, content_block: Value) -> Bytes {
+    anthropic_sse_event(
+        "content_block_start",
+        &json!({
+            "type": "content_block_start",
+            "index": index,
+            "content_block": content_block,
+        }),
+    )
+}
+
+fn anthropic_content_block_delta(index: usize, delta_type: &str, value: &str) -> Bytes {
+    let delta = match delta_type {
+        "thinking_delta" => json!({"type":"thinking_delta","thinking": value}),
+        "input_json_delta" => json!({"type":"input_json_delta","partial_json": value}),
+        _ => json!({"type":"text_delta","text": value}),
+    };
+    anthropic_sse_event(
+        "content_block_delta",
+        &json!({
+            "type": "content_block_delta",
+            "index": index,
+            "delta": delta,
+        }),
+    )
+}
+
+fn anthropic_content_block_stop(index: usize) -> Bytes {
+    anthropic_sse_event(
+        "content_block_stop",
+        &json!({
+            "type": "content_block_stop",
+            "index": index,
+        }),
+    )
+}
+
+#[derive(Default)]
+struct AnthropicToolBlockState {
+    block_index: usize,
+    id: String,
+    name: String,
+    arguments: String,
+    started: bool,
+}
+
+fn map_chat_finish_reason_to_anthropic_stop_reason(reason: &str) -> &'static str {
+    match reason {
+        "length" => "max_tokens",
+        "tool_calls" => "tool_use",
+        _ => "end_turn",
+    }
+}
+
 impl SseParser {
     pub(crate) fn feed(&mut self, chunk: &str) -> Vec<String> {
+        self.feed_with_event_names(chunk)
+            .into_iter()
+            .map(|(_, data)| data)
+            .collect()
+    }
+
+    pub(crate) fn feed_with_event_names(&mut self, chunk: &str) -> Vec<(Option<String>, String)> {
         self.buffer.push_str(chunk);
         let mut events = Vec::new();
 
@@ -523,9 +821,17 @@ impl SseParser {
 
             if line.is_empty() {
                 if !self.current_data_lines.is_empty() {
-                    events.push(self.current_data_lines.join("\n"));
+                    events.push((
+                        self.current_event_name.take(),
+                        self.current_data_lines.join("\n"),
+                    ));
                     self.current_data_lines.clear();
                 }
+                continue;
+            }
+
+            if let Some(rest) = line.strip_prefix("event:") {
+                self.current_event_name = Some(rest.trim().to_string());
                 continue;
             }
 

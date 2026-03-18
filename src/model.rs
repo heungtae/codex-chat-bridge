@@ -20,6 +20,7 @@ pub(crate) enum ToolTransformMode {
 pub(crate) enum IncomingApi {
     Responses,
     Chat,
+    Anthropic,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

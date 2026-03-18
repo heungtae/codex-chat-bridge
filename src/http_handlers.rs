@@ -17,6 +17,7 @@ use crate::state::AppState;
 
 pub(crate) fn build_app(state: Arc<AppState>) -> Router {
     Router::new()
+        .route("/v1/messages", post(handle_anthropic_messages))
         .route("/v1/responses", post(handle_responses))
         .route("/v1/chat/completions", post(handle_chat_completions))
         .route("/healthz", get(healthz))
@@ -58,6 +59,14 @@ async fn handle_responses(
     body: String,
 ) -> Response {
     crate::handle_incoming(state, headers, body, Some(IncomingApi::Responses), None).await
+}
+
+async fn handle_anthropic_messages(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    crate::handle_incoming(state, headers, body, Some(IncomingApi::Anthropic), None).await
 }
 
 async fn handle_chat_completions(

@@ -3,6 +3,7 @@ use anyhow::anyhow;
 use serde_json::Value;
 use std::collections::HashSet;
 
+use crate::bridge::mapping::map_anthropic_messages_to_chat_request;
 use crate::bridge::mapping::map_chat_to_responses_request;
 use crate::bridge::mapping::map_responses_to_chat_request_with_stream;
 use crate::model::IncomingApi;
@@ -21,6 +22,7 @@ pub(crate) fn stream_default_for_api(incoming_api: IncomingApi) -> bool {
     match incoming_api {
         IncomingApi::Responses => true,
         IncomingApi::Chat => false,
+        IncomingApi::Anthropic => true,
     }
 }
 
@@ -57,6 +59,7 @@ pub(crate) fn apply_request_filters(
         let tool_type = match incoming_api {
             IncomingApi::Responses => tool.get("type").and_then(Value::as_str),
             IncomingApi::Chat => tool.get("type").and_then(Value::as_str),
+            IncomingApi::Anthropic => tool.get("type").and_then(Value::as_str),
         };
         !tool_type.is_some_and(|t| drop_tool_types.contains(t))
     });
@@ -135,6 +138,11 @@ pub(crate) fn build_upstream_payload(
         }
         (IncomingApi::Chat, WireApi::Chat) => request.clone(),
         (IncomingApi::Chat, WireApi::Responses) => map_chat_to_responses_request(request, stream)?,
+        (IncomingApi::Anthropic, WireApi::Chat) => map_anthropic_messages_to_chat_request(request)?,
+        (IncomingApi::Anthropic, WireApi::Responses) => {
+            let chat_request = map_anthropic_messages_to_chat_request(request);
+            map_chat_to_responses_request(&chat_request?, stream)?
+        }
     };
     set_stream_flag(&mut payload, stream);
     Ok(payload)

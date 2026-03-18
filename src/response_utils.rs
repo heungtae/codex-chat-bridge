@@ -9,6 +9,8 @@ use serde_json::json;
 use uuid::Uuid;
 
 use crate::bridge::streaming::sse_event;
+use crate::bridge::streaming::anthropic_sse_event;
+use crate::model::IncomingApi;
 
 #[derive(Debug)]
 pub(crate) struct NormalizedUpstreamError {
@@ -104,11 +106,50 @@ pub(crate) fn sse_error_response(code: &str, message: &str) -> Response {
         .into_response()
 }
 
-pub(crate) fn error_response_for_stream(stream: bool, code: &str, message: &str) -> Response {
-    if stream {
-        sse_error_response(code, message)
-    } else {
-        json_error_response(code, message)
+pub(crate) fn anthropic_sse_error_response(code: &str, message: &str) -> Response {
+    let body = anthropic_sse_event(
+        "error",
+        &json!({
+            "type": "error",
+            "error": {
+                "type": code,
+                "message": message,
+            }
+        }),
+    );
+
+    (
+        StatusCode::OK,
+        [
+            (CONTENT_TYPE, HeaderValue::from_static("text/event-stream")),
+            (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
+        ],
+        body,
+    )
+        .into_response()
+}
+
+pub(crate) fn error_response_for_api(
+    incoming_api: IncomingApi,
+    stream: bool,
+    code: &str,
+    message: &str,
+) -> Response {
+    match incoming_api {
+        IncomingApi::Anthropic => {
+            if stream {
+                anthropic_sse_error_response(code, message)
+            } else {
+                anthropic_json_error_response(code, message)
+            }
+        }
+        _ => {
+            if stream {
+                sse_error_response(code, message)
+            } else {
+                json_error_response(code, message)
+            }
+        }
     }
 }
 
@@ -124,6 +165,16 @@ pub(crate) fn json_success_response(payload: Value) -> Response {
 
 pub(crate) fn json_error_response(code: &str, message: &str) -> Response {
     json_success_response(json!({
+        "error": {
+            "type": code,
+            "message": message,
+        }
+    }))
+}
+
+pub(crate) fn anthropic_json_error_response(code: &str, message: &str) -> Response {
+    json_success_response(json!({
+        "type": "error",
         "error": {
             "type": code,
             "message": message,

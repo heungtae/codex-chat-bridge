@@ -54,6 +54,7 @@ npm install -g @heungtae/codex-chat-bridge
 - Supports feature flags globally (`[features]`) and per-router (`[routers.<name>.features]`)
 - Supports host-aware routing when routers use absolute `incoming_url` values
 - Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
+- Supports Anthropic `POST /v1/messages` input for Claude Code compatible routing
 - For chat upstream streaming, emits Responses-style SSE events:
   - `response.created`
   - `response.in_progress` (when `enable_extended_stream_events=true`)
@@ -113,6 +114,7 @@ Available router fields:
 - `incoming_url`: Incoming URL/path bound to this router (for example `http://127.0.0.1:8787/research/v1/responses`)
   - Absolute URL entries define listener addresses. The bridge listens on every unique `host:port` found in `routers.*.incoming_url`.
   - Path-only entries participate in route matching but do not create listeners.
+  - `incoming_url` must include the final request path, not just the base URL. For Claude Code this means `/v1/messages`, not only `/v1`.
 
 ## Feature Flags (Global + Router Override)
 
@@ -221,6 +223,42 @@ codex exec \
 
 To switch routes, change `model_provider` to another bridge provider name.
 
+## Claude Code Guide
+
+Claude Code uses Anthropic `POST /v1/messages`. If you set:
+
+```bash
+ANTHROPIC_BASE_URL=http://127.0.0.1:8787/claude
+```
+
+Claude Code will call:
+
+```text
+http://127.0.0.1:8787/claude/v1/messages
+```
+
+So the router `incoming_url` must include that exact final path:
+
+```toml
+[routers.claude]
+incoming_url = "http://127.0.0.1:8787/claude/v1/messages"
+upstream_url = "http://localhost:8080/v1/chat/completions"
+upstream_wire = "chat"
+```
+
+Important points:
+- Do not set `incoming_url` to only `http://127.0.0.1:8787/claude` or `.../v1`.
+- For Claude Code streaming, use `upstream_wire = "chat"`.
+- Anthropic `/v1/messages` to upstream `responses` streaming is not supported yet.
+
+Example:
+
+```bash
+ANTHROPIC_BASE_URL="http://127.0.0.1:8787/claude" \
+ANTHROPIC_AUTH_TOKEN="dummy" \
+claude
+```
+
 ## Wrapper script
 
 Use `scripts/run_codex_with_bridge.sh` to run the bridge and `codex exec` together:
@@ -245,6 +283,7 @@ npm run pack:check
 ## Endpoints
 
 - `POST /{*incoming_path}`: Process by `routers.*.incoming_url` match
+- `POST /v1/messages`: Anthropic/Claude Code compatible routed entrypoint
 - `POST /v1/responses`: Routed request entrypoint (requires matching router `incoming_url`)
 - `POST /v1/chat/completions`: Routed request entrypoint (requires matching router `incoming_url`)
 - `GET /healthz`: Health check

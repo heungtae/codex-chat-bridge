@@ -288,6 +288,7 @@ fn resolve_incoming_route(incoming_api_hint: Option<IncomingApi>, incoming_path:
     incoming_path.unwrap_or_else(|| match incoming_api_hint {
         Some(IncomingApi::Chat) => "/v1/chat/completions".to_string(),
         Some(IncomingApi::Responses) => "/v1/responses".to_string(),
+        Some(IncomingApi::Anthropic) => "/v1/messages".to_string(),
         None => "/v1/responses".to_string(),
     })
 }
@@ -325,7 +326,8 @@ fn parse_and_prepare_request(
     let mut request_value: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(err) => {
-            return Err(error_response_for_stream(
+            return Err(error_response_for_api(
+                fallback_incoming_api,
                 stream_default_for_api(fallback_incoming_api),
                 "invalid_request",
                 &format!("failed to parse request JSON: {err}"),
@@ -360,7 +362,8 @@ fn parse_and_prepare_request(
         route_target.feature_flags.enable_extended_input_types,
         &request_value,
     ) {
-        return Err(error_response_for_stream(
+        return Err(error_response_for_api(
+            incoming_api,
             wants_stream,
             "unsupported_feature",
             &err.to_string(),
@@ -393,7 +396,8 @@ async fn build_upstream_payload_with_session(
     ) {
         Ok(v) => v,
         Err(err) => {
-            return Err(error_response_for_stream(
+            return Err(error_response_for_api(
+                incoming_api,
                 wants_stream,
                 "invalid_request",
                 &err.to_string(),
@@ -410,7 +414,8 @@ async fn build_upstream_payload_with_session(
             match resolve_previous_messages_for_request(request_value, &sessions) {
                 Ok(v) => v,
                 Err(err) => {
-                    return Err(error_response_for_stream(
+                    return Err(error_response_for_api(
+                        incoming_api,
                         wants_stream,
                         "invalid_request",
                         &err.to_string(),
@@ -421,7 +426,8 @@ async fn build_upstream_payload_with_session(
         if let Some(messages) = previous_messages
             && let Err(err) = merge_previous_messages(&mut upstream_payload, messages)
         {
-            return Err(error_response_for_stream(
+            return Err(error_response_for_api(
+                incoming_api,
                 wants_stream,
                 "invalid_request",
                 &err.to_string(),
@@ -500,19 +506,39 @@ async fn finalize_upstream_response(
             );
         }
         let normalized = normalize_upstream_error_payload(status, &body);
-        return error_response_for_stream(wants_stream, &normalized.code, &normalized.message);
+        return error_response_for_api(incoming_api, wants_stream, &normalized.code, &normalized.message);
     }
 
     if wants_stream {
+        if incoming_api == IncomingApi::Anthropic && route_target.upstream_wire == WireApi::Responses {
+            return error_response_for_api(
+                incoming_api,
+                true,
+                "unsupported_feature",
+                "anthropic `/v1/messages` streaming currently requires `upstream_wire = \"chat\"`",
+            );
+        }
         let body = match route_target.upstream_wire {
-            WireApi::Chat => Body::from_stream(translate_chat_stream(
-                upstream_response.bytes_stream(),
-                response_id,
-                route_target.router_name.clone(),
-                verbose_logging,
-                tool_call_kinds_by_name,
-                route_target.feature_flags,
-            )),
+            WireApi::Chat => {
+                if incoming_api == IncomingApi::Anthropic {
+                    let model = "claude-bridge".to_string();
+                    Body::from_stream(translate_chat_stream_to_anthropic(
+                        upstream_response.bytes_stream(),
+                        route_target.router_name.clone(),
+                        verbose_logging,
+                        model,
+                    ))
+                } else {
+                    Body::from_stream(translate_chat_stream(
+                        upstream_response.bytes_stream(),
+                        response_id,
+                        route_target.router_name.clone(),
+                        verbose_logging,
+                        tool_call_kinds_by_name,
+                        route_target.feature_flags,
+                    ))
+                }
+            }
             WireApi::Responses => Body::from_stream(passthrough_responses_stream(
                 upstream_response.bytes_stream(),
                 route_target.router_name.clone(),
@@ -523,7 +549,10 @@ async fn finalize_upstream_response(
         return (
             StatusCode::OK,
             [
-                (CONTENT_TYPE, HeaderValue::from_static("text/event-stream")),
+                (
+                    CONTENT_TYPE,
+                    HeaderValue::from_static("text/event-stream"),
+                ),
                 (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
                 (
                     HeaderName::from_static("x-accel-buffering"),
@@ -538,7 +567,9 @@ async fn finalize_upstream_response(
     let upstream_json = match upstream_response.json::<Value>().await {
         Ok(v) => v,
         Err(err) => {
-            return json_error_response(
+            return error_response_for_api(
+                incoming_api,
+                false,
                 "upstream_decode_error",
                 &format!("failed to decode upstream JSON: {err}"),
             );
@@ -555,13 +586,25 @@ async fn finalize_upstream_response(
     }
 
     let response_json = match route_target.upstream_wire {
-        WireApi::Chat => chat_json_to_responses_json(
-            upstream_json,
-            response_id,
-            &tool_call_kinds_by_name,
-            route_target.feature_flags.enable_provider_specific_fields,
-        ),
-        WireApi::Responses => upstream_json,
+        WireApi::Chat => {
+            if incoming_api == IncomingApi::Anthropic {
+                chat_json_to_anthropic_json(upstream_json, "claude-bridge")
+            } else {
+                chat_json_to_responses_json(
+                    upstream_json,
+                    response_id,
+                    &tool_call_kinds_by_name,
+                    route_target.feature_flags.enable_provider_specific_fields,
+                )
+            }
+        }
+        WireApi::Responses => {
+            if incoming_api == IncomingApi::Anthropic {
+                responses_json_to_anthropic_json(upstream_json, "claude-bridge")
+            } else {
+                upstream_json
+            }
+        }
     };
 
     json_success_response(response_json)
@@ -666,7 +709,8 @@ pub(crate) async fn handle_incoming(
     let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
-            return error_response_for_stream(
+            return error_response_for_api(
+                incoming_api,
                 wants_stream,
                 "upstream_transport_error",
                 &format!("failed to call upstream endpoint: {err}"),
