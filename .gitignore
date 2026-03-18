@@ -27,3 +27,7 @@ dist
 build
 litellm
 opencode
+codex
+codex/
+claude-code
+free-claude-code
