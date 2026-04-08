@@ -81,10 +81,7 @@ pub(crate) struct Args {
     )]
     pub(crate) router: Option<String>,
 
-    #[arg(
-        long,
-        help = "list available routers from config file and exit"
-    )]
+    #[arg(long, help = "list available routers from config file and exit")]
     pub(crate) list_routers: bool,
 }
 
@@ -109,6 +106,11 @@ pub(crate) struct FileConfig {
 pub(crate) struct RouterConfig {
     pub(crate) upstream_url: Option<String>,
     pub(crate) upstream_wire: Option<WireApi>,
+    #[serde(alias = "model")]
+    pub(crate) upstream_model: Option<String>,
+    pub(crate) upstream_model_opus: Option<String>,
+    pub(crate) upstream_model_sonnet: Option<String>,
+    pub(crate) upstream_model_haiku: Option<String>,
     #[serde(alias = "http_headers")]
     pub(crate) upstream_http_headers: Option<BTreeMap<String, String>>,
     pub(crate) forward_incoming_headers: Option<Vec<String>>,
@@ -116,6 +118,8 @@ pub(crate) struct RouterConfig {
     pub(crate) drop_request_fields: Option<Vec<String>>,
     pub(crate) features: Option<FeatureFlagsConfig>,
     pub(crate) incoming_url: Option<String>,
+    pub(crate) anthropic_preserve_thinking: Option<bool>,
+    pub(crate) anthropic_enable_openrouter_reasoning: Option<bool>,
 }
 
 #[derive(Debug, Clone)]
@@ -160,11 +164,17 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # [routers.default]
 # upstream_url = "https://api.openai.com/v1/chat/completions"
 # upstream_wire = "chat"
+# upstream_model = "provider/model-id" # optional, overrides incoming request model for this router
+# upstream_model_opus = "provider/claude-opus-model" # optional, overrides only Claude Opus requests
+# upstream_model_sonnet = "provider/claude-sonnet-model" # optional, overrides only Claude Sonnet requests
+# upstream_model_haiku = "provider/claude-haiku-model" # optional, overrides only Claude Haiku requests
 # upstream_http_headers = {}
 # forward_incoming_headers = []
 # drop_tool_types = []
 # drop_request_fields = []
 # incoming_url = "http://<host>:<port>/v1/messages"
+# anthropic_preserve_thinking = true # optional, also copies assistant thinking blocks into chat message content
+# anthropic_enable_openrouter_reasoning = true # optional, injects reasoning.enabled=true for Anthropic requests
 # [routers.default.features]
 # enable_reasoning_stream_events = false
 # tool_transform_mode = "legacy_convert"
@@ -185,8 +195,8 @@ pub(crate) fn load_file_config(path: &Path) -> Result<Option<FileConfig>> {
 
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("reading config file {}", path.display()))?;
-    let parsed: FileConfig = toml::from_str(&raw)
-        .with_context(|| format!("parsing config file {}", path.display()))?;
+    let parsed: FileConfig =
+        toml::from_str(&raw).with_context(|| format!("parsing config file {}", path.display()))?;
     info!("loaded config file {}", path.display());
     Ok(Some(parsed))
 }
@@ -196,8 +206,8 @@ pub(crate) fn resolve_config_path(cli_path: Option<PathBuf>) -> Result<PathBuf> 
         return Ok(path);
     }
 
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| anyhow!("HOME environment variable is not set"))?;
+    let home =
+        std::env::var_os("HOME").ok_or_else(|| anyhow!("HOME environment variable is not set"))?;
     Ok(PathBuf::from(home)
         .join(".config")
         .join("codex-chat-bridge")
@@ -220,7 +230,10 @@ pub(crate) fn ensure_default_config_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn resolve_config(args: Args, file_config: Option<FileConfig>) -> Result<ResolvedConfig> {
+pub(crate) fn resolve_config(
+    args: Args,
+    file_config: Option<FileConfig>,
+) -> Result<ResolvedConfig> {
     let file_config = file_config.unwrap_or_default();
     let feature_flags = FeatureFlags::default().with_overrides(file_config.features.as_ref());
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
@@ -293,7 +306,9 @@ fn normalize_drop_request_fields(fields: Vec<String>) -> Vec<String> {
     normalized
 }
 
-pub(crate) fn parse_upstream_http_header_arg(raw: &str) -> std::result::Result<UpstreamHeader, String> {
+pub(crate) fn parse_upstream_http_header_arg(
+    raw: &str,
+) -> std::result::Result<UpstreamHeader, String> {
     let (name, value) = raw
         .split_once('=')
         .ok_or_else(|| "expected NAME=VALUE format".to_string())?;

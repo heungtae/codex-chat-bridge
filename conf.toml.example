@@ -32,6 +32,10 @@ tool_transform_mode = "legacy_convert" # passthrough | legacy_convert
 incoming_url = "http://127.0.0.1:8787/default/v1/responses"
 upstream_url = "https://api.openai.com/v1/chat/completions"
 upstream_wire = "chat"
+upstream_model = "provider/model-id" # optional, forces this upstream model for the route
+upstream_model_opus = "provider/claude-opus-model" # optional, only for Claude Opus requests
+upstream_model_sonnet = "provider/claude-sonnet-model" # optional, only for Claude Sonnet requests
+upstream_model_haiku = "provider/claude-haiku-model" # optional, only for Claude Haiku requests
 upstream_http_headers = {
   "x-router" = "default"
 }
@@ -39,6 +43,8 @@ upstream_http_headers = {
 forward_incoming_headers = ["x-codex-turn-state", "x-request-id"]
 drop_tool_types = []
 drop_request_fields = []
+anthropic_preserve_thinking = true # optional, copies assistant thinking into chat message content
+anthropic_enable_openrouter_reasoning = true # optional, injects reasoning.enabled=true when Anthropic thinking is enabled
 
 [routers.default.features]
 enable_previous_response_id = true
@@ -53,6 +59,8 @@ tool_transform_mode = "legacy_convert"
 incoming_url = "http://127.0.0.1:8787/research/v1/responses"
 upstream_url = "https://api.openai.com/v1/responses"
 upstream_wire = "responses"
+# upstream_model = "provider/model-id"
+# upstream_model_sonnet = "provider/claude-sonnet-model"
 upstream_http_headers = {
   "x-router" = "research"
 }

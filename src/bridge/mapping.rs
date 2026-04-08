@@ -4,8 +4,8 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use tracing::warn;
 use uuid::Uuid;
 
-use crate::{BridgeRequest, ResponsesToolCallKind, ToolTransformMode};
 use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
+use crate::{BridgeRequest, ResponsesToolCallKind, ToolTransformMode};
 
 pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Result<Value> {
     let model = request
@@ -91,7 +91,10 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
     Ok(out)
 }
 
-pub(crate) fn map_anthropic_messages_to_chat_request(request: &Value) -> Result<Value> {
+pub(crate) fn map_anthropic_messages_to_chat_request(
+    request: &Value,
+    preserve_thinking: bool,
+) -> Result<Value> {
     let model = request
         .get("model")
         .and_then(Value::as_str)
@@ -114,9 +117,10 @@ pub(crate) fn map_anthropic_messages_to_chat_request(request: &Value) -> Result<
             .unwrap_or("user");
         match role {
             "assistant" => {
-                if let Some(chat_message) =
-                    anthropic_assistant_message_to_chat_message(message.get("content"))
-                {
+                if let Some(chat_message) = anthropic_assistant_message_to_chat_message(
+                    message.get("content"),
+                    preserve_thinking,
+                ) {
                     chat_messages.push(chat_message);
                 }
             }
@@ -186,7 +190,8 @@ pub(crate) fn map_anthropic_messages_to_chat_request(request: &Value) -> Result<
         }
     }
 
-    if let Some(tool_choice) = anthropic_tool_choice_to_chat_tool_choice(request.get("tool_choice")) {
+    if let Some(tool_choice) = anthropic_tool_choice_to_chat_tool_choice(request.get("tool_choice"))
+    {
         obj.insert("tool_choice".to_string(), tool_choice);
     }
 
@@ -215,7 +220,10 @@ fn anthropic_system_to_chat_message(system: Option<&Value>) -> Option<Value> {
     }
 }
 
-fn anthropic_assistant_message_to_chat_message(content: Option<&Value>) -> Option<Value> {
+fn anthropic_assistant_message_to_chat_message(
+    content: Option<&Value>,
+    preserve_thinking: bool,
+) -> Option<Value> {
     let mut content_parts = Vec::new();
     let mut reasoning_parts = Vec::new();
     let mut tool_calls = Vec::new();
@@ -279,9 +287,21 @@ fn anthropic_assistant_message_to_chat_message(content: Option<&Value>) -> Optio
         return None;
     }
 
+    let mut assistant_content = if content_parts.is_empty() {
+        String::new()
+    } else {
+        content_parts.join("\n\n")
+    };
+    if preserve_thinking && !reasoning_parts.is_empty() {
+        assistant_content = append_preserved_thinking_to_chat_content(
+            &assistant_content,
+            &reasoning_parts.join("\n\n"),
+        );
+    }
+
     let mut message = json!({
         "role": "assistant",
-        "content": if content_parts.is_empty() { Value::String(String::new()) } else { Value::String(content_parts.join("\n\n")) },
+        "content": assistant_content,
     });
     if let Some(obj) = message.as_object_mut() {
         if !tool_calls.is_empty() {
@@ -295,6 +315,17 @@ fn anthropic_assistant_message_to_chat_message(content: Option<&Value>) -> Optio
         }
     }
     Some(message)
+}
+
+fn append_preserved_thinking_to_chat_content(content: &str, thinking: &str) -> String {
+    let thinking = thinking.trim();
+    if thinking.is_empty() {
+        return content.to_string();
+    }
+    if content.trim().is_empty() {
+        return format!("<thinking>\n{thinking}\n</thinking>");
+    }
+    format!("<thinking>\n{thinking}\n</thinking>\n\n{content}")
 }
 
 fn anthropic_user_message_to_chat_messages(content: Option<&Value>) -> Vec<Value> {
@@ -478,7 +509,9 @@ pub(crate) fn chat_message_content_to_input_items(content: Option<&Value>) -> Ve
     }
 }
 
-pub(crate) fn responses_tool_call_kind_by_name(request: &Value) -> HashMap<String, ResponsesToolCallKind> {
+pub(crate) fn responses_tool_call_kind_by_name(
+    request: &Value,
+) -> HashMap<String, ResponsesToolCallKind> {
     request
         .get("tools")
         .and_then(Value::as_array)
@@ -927,10 +960,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
             }
             "reasoning" => {}
             "function_call" => {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                 if name.is_empty() {
                     warn!("ignoring function_call item with empty name");
                     continue;
@@ -962,10 +992,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                 pending_tool_call_ids.push_back(call_id);
             }
             "custom_tool_call" => {
-                let name = item
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
+                let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
                 if name.is_empty() {
                     warn!("ignoring custom_tool_call item with empty name");
                     continue;
@@ -1105,9 +1132,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
         "parallel_tool_calls": parallel_tool_calls,
     });
 
-    if !stream
-        && let Some(obj) = chat_request.as_object_mut()
-    {
+    if !stream && let Some(obj) = chat_request.as_object_mut() {
         obj.remove("stream_options");
     }
 
@@ -1127,7 +1152,10 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
     Ok(BridgeRequest { chat_request })
 }
 
-fn resolve_tool_output_call_id(item: &Value, pending_tool_call_ids: &mut VecDeque<String>) -> Result<String> {
+fn resolve_tool_output_call_id(
+    item: &Value,
+    pending_tool_call_ids: &mut VecDeque<String>,
+) -> Result<String> {
     let incoming_call_id = item
         .get("call_id")
         .and_then(Value::as_str)
@@ -1410,7 +1438,10 @@ pub(crate) fn normalize_chat_tools(
         .collect()
 }
 
-pub(crate) fn normalize_tool_choice(tool_choice: Value, tool_transform_mode: ToolTransformMode) -> Value {
+pub(crate) fn normalize_tool_choice(
+    tool_choice: Value,
+    tool_transform_mode: ToolTransformMode,
+) -> Value {
     if let Some(s) = tool_choice.as_str() {
         return Value::String(s.to_string());
     }

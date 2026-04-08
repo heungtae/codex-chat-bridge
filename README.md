@@ -106,10 +106,14 @@ Router resolution and overrides:
 Available router fields:
 - `upstream_url`: Override upstream URL for this router
   - Upstream API type is inferred automatically from URL suffix (`.../v1/chat/completions` -> chat, `.../v1/responses` -> responses)
+- `upstream_model`: Override the incoming request model for this router
+- `upstream_model_opus` / `upstream_model_sonnet` / `upstream_model_haiku`: Claude-family-specific upstream model overrides applied before the generic `upstream_model` fallback
 - `upstream_http_headers`: Static headers for this router
 - `forward_incoming_headers`: Forwarded headers for this router
 - `drop_tool_types`: Tool types to drop for this router
 - `drop_request_fields`: Top-level request fields to drop before forwarding (for example `["prompt_cache_key"]`)
+- `anthropic_preserve_thinking`: For Anthropic `/v1/messages` requests, also copies assistant `thinking` blocks into chat message `content`
+- `anthropic_enable_openrouter_reasoning`: For Anthropic `/v1/messages` requests that enable `thinking`, injects `reasoning.enabled = true` into the upstream payload
 - `features`: Router-specific feature flag overrides (for example `[routers.research.features]`)
 - `incoming_url`: Incoming URL/path bound to this router (for example `http://127.0.0.1:8787/research/v1/responses`)
   - Absolute URL entries define listener addresses. The bridge listens on every unique `host:port` found in `routers.*.incoming_url`.
@@ -244,11 +248,23 @@ So the router `incoming_url` must include that exact final path:
 incoming_url = "http://127.0.0.1:8787/claude/v1/messages"
 upstream_url = "http://localhost:8080/v1/chat/completions"
 upstream_wire = "chat"
+# Optional: force a provider-valid model ID instead of forwarding Claude Code's model string.
+# upstream_model = "provider/model-id"
+# Optional: Claude family-specific overrides take precedence over `upstream_model`.
+# upstream_model_sonnet = "openrouter/anthropic/claude-sonnet-4"
+# upstream_model_opus = "openrouter/anthropic/claude-opus-4"
+# upstream_model_haiku = "openrouter/anthropic/claude-haiku-4"
+# Optional: preserve Anthropic thinking blocks in assistant content and enable OpenRouter reasoning.
+# anthropic_preserve_thinking = true
+# anthropic_enable_openrouter_reasoning = true
 ```
 
 Important points:
 - Do not set `incoming_url` to only `http://127.0.0.1:8787/claude` or `.../v1`.
 - For Claude Code streaming, use `upstream_wire = "chat"`.
+- If your upstream rejects Claude-native model names, set `upstream_model` or the Claude-family-specific overrides on the router to provider-valid model IDs.
+- Enable `anthropic_preserve_thinking` when the upstream model benefits from seeing prior Claude thinking blocks inside assistant content.
+- Enable `anthropic_enable_openrouter_reasoning` when routing Anthropic requests with `thinking` enabled to OpenRouter chat models that expect `reasoning.enabled`.
 - Anthropic `/v1/messages` to upstream `responses` streaming is not supported yet.
 
 Example:

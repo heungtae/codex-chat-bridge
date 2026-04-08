@@ -27,6 +27,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::info;
+use tracing::warn;
 use uuid::Uuid;
 
 mod bridge;
@@ -69,9 +70,7 @@ fn init_tracing(verbose_logging: bool) {
         }
     });
 
-    tracing_subscriber::fmt()
-        .with_env_filter(env_filter)
-        .init();
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 }
 
 fn load_runtime_config(args: &Args) -> Result<(ResolvedConfig, BTreeMap<String, RouterConfig>)> {
@@ -117,7 +116,11 @@ fn build_router_manager(
     )
 }
 
-fn log_runtime_startup(config: &ResolvedConfig, router_manager: &RouterManager, listen_addrs: &[String]) {
+fn log_runtime_startup(
+    config: &ResolvedConfig,
+    router_manager: &RouterManager,
+    listen_addrs: &[String],
+) {
     let router_defaults = router_manager.get_default_log_snapshot();
     info!(
         "startup: listen_addrs={:?} router_count={}",
@@ -146,13 +149,20 @@ fn log_runtime_startup(config: &ResolvedConfig, router_manager: &RouterManager, 
             name,
             active,
             incoming_url,
+            non_local_incoming_host,
             upstream_wire,
             override_upstream_url,
             override_upstream_wire,
+            override_upstream_model,
+            override_upstream_model_opus,
+            override_upstream_model_sonnet,
+            override_upstream_model_haiku,
             override_upstream_http_headers,
             override_forward_incoming_headers,
             override_drop_tool_types,
             override_drop_request_fields,
+            override_anthropic_preserve_thinking,
+            override_anthropic_enable_openrouter_reasoning,
         } = snapshot;
 
         let mut overrides = Vec::new();
@@ -161,6 +171,18 @@ fn log_runtime_startup(config: &ResolvedConfig, router_manager: &RouterManager, 
         }
         if let Some(v) = override_upstream_wire {
             overrides.push(format!("upstream_wire={v:?}"));
+        }
+        if let Some(v) = override_upstream_model {
+            overrides.push(format!("upstream_model={v}"));
+        }
+        if let Some(v) = override_upstream_model_opus {
+            overrides.push(format!("upstream_model_opus={v}"));
+        }
+        if let Some(v) = override_upstream_model_sonnet {
+            overrides.push(format!("upstream_model_sonnet={v}"));
+        }
+        if let Some(v) = override_upstream_model_haiku {
+            overrides.push(format!("upstream_model_haiku={v}"));
         }
         if let Some(v) = override_upstream_http_headers {
             overrides.push(format!("upstream_http_headers={v:?}"));
@@ -174,6 +196,12 @@ fn log_runtime_startup(config: &ResolvedConfig, router_manager: &RouterManager, 
         if let Some(v) = override_drop_request_fields {
             overrides.push(format!("drop_request_fields={v:?}"));
         }
+        if override_anthropic_preserve_thinking == Some(true) {
+            overrides.push("anthropic_preserve_thinking=true".to_string());
+        }
+        if override_anthropic_enable_openrouter_reasoning == Some(true) {
+            overrides.push("anthropic_enable_openrouter_reasoning=true".to_string());
+        }
         let override_summary = if overrides.is_empty() {
             "none".to_string()
         } else {
@@ -184,10 +212,20 @@ fn log_runtime_startup(config: &ResolvedConfig, router_manager: &RouterManager, 
             "router: name={}, active={}, incoming_url={:?}, upstream_wire={:?}, overrides={}",
             name, active, incoming_url, upstream_wire, override_summary
         );
+        if let Some(host) = non_local_incoming_host {
+            warn!(
+                "router `{}` incoming_url host `{}` is not loopback/local. codex-chat-bridge is typically intended for local-only use; consider binding to localhost/127.0.0.1 or adding network controls.",
+                name, host
+            );
+        }
     }
 }
 
-async fn run_server(app: Router, listen_addrs: &[String], server_info: Option<&Path>) -> Result<()> {
+async fn run_server(
+    app: Router,
+    listen_addrs: &[String],
+    server_info: Option<&Path>,
+) -> Result<()> {
     let mut bound_ports = Vec::new();
     let mut join_set = tokio::task::JoinSet::new();
     for bind_addr in listen_addrs {
@@ -284,13 +322,114 @@ fn write_server_info(path: &Path, ports: &[u16]) -> Result<()> {
     Ok(())
 }
 
-fn resolve_incoming_route(incoming_api_hint: Option<IncomingApi>, incoming_path: Option<String>) -> String {
-    incoming_path.unwrap_or_else(|| match incoming_api_hint {
-        Some(IncomingApi::Chat) => "/v1/chat/completions".to_string(),
-        Some(IncomingApi::Responses) => "/v1/responses".to_string(),
-        Some(IncomingApi::Anthropic) => "/v1/messages".to_string(),
-        None => "/v1/responses".to_string(),
-    })
+fn resolve_incoming_route(
+    incoming_api_hint: Option<IncomingApi>,
+    incoming_path: Option<&str>,
+) -> String {
+    incoming_path
+        .map(str::to_string)
+        .unwrap_or_else(|| match incoming_api_hint {
+            Some(IncomingApi::Chat) => "/v1/chat/completions".to_string(),
+            Some(IncomingApi::Responses) => "/v1/responses".to_string(),
+            Some(IncomingApi::Anthropic) => "/v1/messages".to_string(),
+            None => "/v1/responses".to_string(),
+        })
+}
+
+fn infer_incoming_api_from_hint_or_path(
+    incoming_api_hint: Option<IncomingApi>,
+    incoming_path: Option<&str>,
+    request_value: &Value,
+) -> IncomingApi {
+    if let Some(api) = incoming_api_hint {
+        return api;
+    }
+
+    if let Some(path) = incoming_path {
+        let normalized_path = normalize_request_path(path);
+        if normalized_path.ends_with("/v1/messages") {
+            return IncomingApi::Anthropic;
+        }
+        if normalized_path.ends_with("/v1/chat/completions") {
+            return IncomingApi::Chat;
+        }
+        if normalized_path.ends_with("/v1/responses") {
+            return IncomingApi::Responses;
+        }
+    }
+
+    infer_incoming_api(request_value)
+}
+
+fn select_upstream_model_override<'a>(
+    requested_model: Option<&str>,
+    route_target: &'a RouteTarget,
+) -> Option<&'a str> {
+    let requested_model = requested_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    let family_override = if requested_model.contains("opus") {
+        route_target.upstream_model_opus.as_deref()
+    } else if requested_model.contains("sonnet") {
+        route_target.upstream_model_sonnet.as_deref()
+    } else if requested_model.contains("haiku") {
+        route_target.upstream_model_haiku.as_deref()
+    } else {
+        None
+    };
+
+    family_override.or(route_target.upstream_model.as_deref())
+}
+
+fn apply_upstream_model_override(payload: &mut Value, route_target: &RouteTarget) {
+    let requested_model = payload.get("model").and_then(Value::as_str);
+    let Some(model) = select_upstream_model_override(requested_model, route_target) else {
+        return;
+    };
+    if let Some(obj) = payload.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.to_string()));
+    }
+}
+
+fn inject_openrouter_reasoning(payload: &mut Value) {
+    let Some(obj) = payload.as_object_mut() else {
+        return;
+    };
+
+    match obj.get_mut("reasoning") {
+        Some(Value::Object(reasoning)) => {
+            reasoning
+                .entry("enabled".to_string())
+                .or_insert(Value::Bool(true));
+        }
+        Some(_) => {}
+        None => {
+            obj.insert(
+                "reasoning".to_string(),
+                serde_json::json!({"enabled": true}),
+            );
+        }
+    }
+}
+
+fn anthropic_request_enables_thinking(request: &Value) -> bool {
+    match request.get("thinking") {
+        Some(Value::Bool(enabled)) => *enabled,
+        Some(Value::String(mode)) => mode.eq_ignore_ascii_case("enabled"),
+        Some(Value::Object(thinking)) => match thinking.get("type").and_then(Value::as_str) {
+            Some(kind) if kind.eq_ignore_ascii_case("disabled") => false,
+            Some(kind) if kind.eq_ignore_ascii_case("enabled") => true,
+            Some(_) => false,
+            None => thinking
+                .get("enabled")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        },
+        _ => false,
+    }
 }
 
 async fn resolve_route_target(
@@ -319,9 +458,18 @@ async fn resolve_route_target(
 fn parse_and_prepare_request(
     body: &str,
     incoming_api_hint: Option<IncomingApi>,
+    incoming_path: Option<&str>,
     route_target: &RouteTarget,
     verbose_logging: bool,
-) -> std::result::Result<(IncomingApi, bool, Value, HashMap<String, ResponsesToolCallKind>), Response> {
+) -> std::result::Result<
+    (
+        IncomingApi,
+        bool,
+        Value,
+        HashMap<String, ResponsesToolCallKind>,
+    ),
+    Response,
+> {
     let fallback_incoming_api = incoming_api_hint.unwrap_or(IncomingApi::Responses);
     let mut request_value: Value = match serde_json::from_str(body) {
         Ok(v) => v,
@@ -348,7 +496,8 @@ fn parse_and_prepare_request(
         );
     }
 
-    let incoming_api = incoming_api_hint.unwrap_or_else(|| infer_incoming_api(&request_value));
+    let incoming_api =
+        infer_incoming_api_from_hint_or_path(incoming_api_hint, incoming_path, &request_value);
     let wants_stream = stream_flag_for_request(incoming_api, &request_value);
     apply_request_filters(
         incoming_api,
@@ -375,7 +524,12 @@ fn parse_and_prepare_request(
         HashMap::new()
     };
 
-    Ok((incoming_api, wants_stream, request_value, tool_call_kinds_by_name))
+    Ok((
+        incoming_api,
+        wants_stream,
+        request_value,
+        tool_call_kinds_by_name,
+    ))
 }
 
 async fn build_upstream_payload_with_session(
@@ -393,6 +547,7 @@ async fn build_upstream_payload_with_session(
         wants_stream,
         route_target.feature_flags.enable_extended_input_types,
         route_target.feature_flags.tool_transform_mode,
+        route_target.anthropic_preserve_thinking,
     ) {
         Ok(v) => v,
         Err(err) => {
@@ -404,6 +559,13 @@ async fn build_upstream_payload_with_session(
             ));
         }
     };
+    apply_upstream_model_override(&mut upstream_payload, route_target);
+    if incoming_api == IncomingApi::Anthropic
+        && route_target.anthropic_enable_openrouter_reasoning
+        && anthropic_request_enables_thinking(request_value)
+    {
+        inject_openrouter_reasoning(&mut upstream_payload);
+    }
 
     if route_target.feature_flags.enable_previous_response_id
         && incoming_api == IncomingApi::Responses
@@ -500,17 +662,22 @@ async fn finalize_upstream_response(
         if verbose_logging {
             debug!(
                 "upstream response payload error (router={}, {:?}<-{:?}): {body}",
-                route_target.router_name,
-                incoming_api,
-                route_target.upstream_wire
+                route_target.router_name, incoming_api, route_target.upstream_wire
             );
         }
         let normalized = normalize_upstream_error_payload(status, &body);
-        return error_response_for_api(incoming_api, wants_stream, &normalized.code, &normalized.message);
+        return error_response_for_api(
+            incoming_api,
+            wants_stream,
+            &normalized.code,
+            &normalized.message,
+        );
     }
 
     if wants_stream {
-        if incoming_api == IncomingApi::Anthropic && route_target.upstream_wire == WireApi::Responses {
+        if incoming_api == IncomingApi::Anthropic
+            && route_target.upstream_wire == WireApi::Responses
+        {
             return error_response_for_api(
                 incoming_api,
                 true,
@@ -549,10 +716,7 @@ async fn finalize_upstream_response(
         return (
             StatusCode::OK,
             [
-                (
-                    CONTENT_TYPE,
-                    HeaderValue::from_static("text/event-stream"),
-                ),
+                (CONTENT_TYPE, HeaderValue::from_static("text/event-stream")),
                 (CACHE_CONTROL, HeaderValue::from_static("no-cache")),
                 (
                     HeaderName::from_static("x-accel-buffering"),
@@ -578,10 +742,7 @@ async fn finalize_upstream_response(
     if verbose_logging {
         debug!(
             "upstream response payload (router={}, {:?}<-{:?}): {}",
-            route_target.router_name,
-            incoming_api,
-            route_target.upstream_wire,
-            upstream_json
+            route_target.router_name, incoming_api, route_target.upstream_wire, upstream_json
         );
     }
 
@@ -617,12 +778,13 @@ pub(crate) async fn handle_incoming(
     incoming_api_hint: Option<IncomingApi>,
     incoming_path: Option<String>,
 ) -> Response {
-    let route_target = match resolve_route_target(&state, &headers, incoming_path.as_deref()).await {
+    let route_target = match resolve_route_target(&state, &headers, incoming_path.as_deref()).await
+    {
         Ok(target) => target,
         Err(response) => return response,
     };
     let verbose_logging = state.verbose_logging;
-    let incoming_route = resolve_incoming_route(incoming_api_hint, incoming_path);
+    let incoming_route = resolve_incoming_route(incoming_api_hint, incoming_path.as_deref());
 
     debug!(
         "request routed: router={}, incoming_route={}, upstream_url={}, upstream_wire={:?}",
@@ -645,7 +807,13 @@ pub(crate) async fn handle_incoming(
     }
 
     let (incoming_api, wants_stream, request_value, tool_call_kinds_by_name) =
-        match parse_and_prepare_request(&body, incoming_api_hint, &route_target, verbose_logging) {
+        match parse_and_prepare_request(
+            &body,
+            incoming_api_hint,
+            incoming_path.as_deref(),
+            &route_target,
+            verbose_logging,
+        ) {
             Ok(v) => v,
             Err(response) => return response,
         };
@@ -705,7 +873,8 @@ pub(crate) async fn handle_incoming(
         );
     }
 
-    let upstream_request = build_upstream_request(&state, &route_target, &headers, &upstream_payload);
+    let upstream_request =
+        build_upstream_request(&state, &route_target, &headers, &upstream_payload);
     let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
@@ -714,7 +883,7 @@ pub(crate) async fn handle_incoming(
                 wants_stream,
                 "upstream_transport_error",
                 &format!("failed to call upstream endpoint: {err}"),
-            )
+            );
         }
     };
 

@@ -84,7 +84,9 @@ pub(crate) fn validate_capability_gate(
         && !value.is_null()
         && !value.is_number()
     {
-        return Err(anyhow!("`max_output_tokens` must be a number when provided"));
+        return Err(anyhow!(
+            "`max_output_tokens` must be a number when provided"
+        ));
     }
 
     if let Some(value) = request.get("metadata")
@@ -123,6 +125,7 @@ pub(crate) fn build_upstream_payload(
     stream: bool,
     enable_extended_input_types: bool,
     tool_transform_mode: ToolTransformMode,
+    anthropic_preserve_thinking: bool,
 ) -> Result<Value> {
     let mut payload = match (incoming_api, upstream_wire) {
         (IncomingApi::Responses, WireApi::Responses) => request.clone(),
@@ -138,9 +141,12 @@ pub(crate) fn build_upstream_payload(
         }
         (IncomingApi::Chat, WireApi::Chat) => request.clone(),
         (IncomingApi::Chat, WireApi::Responses) => map_chat_to_responses_request(request, stream)?,
-        (IncomingApi::Anthropic, WireApi::Chat) => map_anthropic_messages_to_chat_request(request)?,
+        (IncomingApi::Anthropic, WireApi::Chat) => {
+            map_anthropic_messages_to_chat_request(request, anthropic_preserve_thinking)?
+        }
         (IncomingApi::Anthropic, WireApi::Responses) => {
-            let chat_request = map_anthropic_messages_to_chat_request(request);
+            let chat_request =
+                map_anthropic_messages_to_chat_request(request, anthropic_preserve_thinking);
             map_chat_to_responses_request(&chat_request?, stream)?
         }
     };

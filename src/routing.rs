@@ -5,6 +5,7 @@ use axum::http::uri::Authority;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashSet;
+use std::net::IpAddr;
 
 use crate::config::RouterConfig;
 use crate::config::resolve_upstream_wire;
@@ -34,11 +35,17 @@ pub(crate) struct RouteTarget {
     pub(crate) router_name: String,
     pub(crate) upstream_url: String,
     pub(crate) upstream_wire: WireApi,
+    pub(crate) upstream_model: Option<String>,
+    pub(crate) upstream_model_opus: Option<String>,
+    pub(crate) upstream_model_sonnet: Option<String>,
+    pub(crate) upstream_model_haiku: Option<String>,
     pub(crate) upstream_http_headers: Vec<UpstreamHeader>,
     pub(crate) forward_incoming_headers: Vec<String>,
     pub(crate) drop_tool_types: HashSet<String>,
     pub(crate) drop_request_fields: HashSet<String>,
     pub(crate) feature_flags: FeatureFlags,
+    pub(crate) anthropic_preserve_thinking: bool,
+    pub(crate) anthropic_enable_openrouter_reasoning: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -56,13 +63,20 @@ pub(crate) struct RouterDeltaLogSnapshot {
     pub(crate) name: String,
     pub(crate) active: bool,
     pub(crate) incoming_url: Option<String>,
+    pub(crate) non_local_incoming_host: Option<String>,
     pub(crate) upstream_wire: WireApi,
     pub(crate) override_upstream_url: Option<String>,
     pub(crate) override_upstream_wire: Option<WireApi>,
+    pub(crate) override_upstream_model: Option<String>,
+    pub(crate) override_upstream_model_opus: Option<String>,
+    pub(crate) override_upstream_model_sonnet: Option<String>,
+    pub(crate) override_upstream_model_haiku: Option<String>,
     pub(crate) override_upstream_http_headers: Option<Vec<UpstreamHeader>>,
     pub(crate) override_forward_incoming_headers: Option<Vec<String>>,
     pub(crate) override_drop_tool_types: Option<Vec<String>>,
     pub(crate) override_drop_request_fields: Option<Vec<String>>,
+    pub(crate) override_anthropic_preserve_thinking: Option<bool>,
+    pub(crate) override_anthropic_enable_openrouter_reasoning: Option<bool>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -75,6 +89,7 @@ struct IncomingRouteKey {
 struct ParsedIncomingUrl {
     route_key: IncomingRouteKey,
     bind_addr: Option<String>,
+    bind_host: Option<String>,
 }
 
 impl RouterManager {
@@ -203,31 +218,38 @@ impl RouterManager {
             )
             .ok()
             .unwrap_or(self.default_upstream_wire);
-            let override_upstream_wire =
-                (resolved_upstream_wire != self.default_upstream_wire).then_some(resolved_upstream_wire);
+            let override_upstream_wire = (resolved_upstream_wire != self.default_upstream_wire)
+                .then_some(resolved_upstream_wire);
+            let override_upstream_model =
+                normalize_optional_router_model(router_cfg.upstream_model.as_deref());
+            let override_upstream_model_opus =
+                normalize_optional_router_model(router_cfg.upstream_model_opus.as_deref());
+            let override_upstream_model_sonnet =
+                normalize_optional_router_model(router_cfg.upstream_model_sonnet.as_deref());
+            let override_upstream_model_haiku =
+                normalize_optional_router_model(router_cfg.upstream_model_haiku.as_deref());
 
-            let override_upstream_http_headers =
-                router_cfg
-                    .upstream_http_headers
-                    .as_ref()
-                    .and_then(|router_headers| {
-                        let mut overrides = Vec::new();
-                        for (header_name, header_value) in router_headers {
-                            let key = header_name.to_ascii_lowercase();
-                            if default_headers.get(&key) == Some(header_value) {
-                                continue;
-                            }
-                            overrides.push(UpstreamHeader {
-                                name: header_name.clone(),
-                                value: header_value.clone(),
-                            });
+            let override_upstream_http_headers = router_cfg
+                .upstream_http_headers
+                .as_ref()
+                .and_then(|router_headers| {
+                    let mut overrides = Vec::new();
+                    for (header_name, header_value) in router_headers {
+                        let key = header_name.to_ascii_lowercase();
+                        if default_headers.get(&key) == Some(header_value) {
+                            continue;
                         }
-                        if overrides.is_empty() {
-                            None
-                        } else {
-                            Some(overrides)
-                        }
-                    });
+                        overrides.push(UpstreamHeader {
+                            name: header_name.clone(),
+                            value: header_value.clone(),
+                        });
+                    }
+                    if overrides.is_empty() {
+                        None
+                    } else {
+                        Some(overrides)
+                    }
+                });
 
             let override_forward_incoming_headers = router_cfg
                 .forward_incoming_headers
@@ -276,13 +298,29 @@ impl RouterManager {
                 name: name.clone(),
                 active,
                 incoming_url: router_cfg.incoming_url.clone(),
+                non_local_incoming_host: router_cfg
+                    .incoming_url
+                    .as_deref()
+                    .and_then(|incoming_url| parse_incoming_url(incoming_url).ok())
+                    .and_then(|parsed| parsed.bind_host)
+                    .filter(|host| !is_local_incoming_host(host)),
                 upstream_wire: resolved_upstream_wire,
                 override_upstream_url,
                 override_upstream_wire,
+                override_upstream_model,
+                override_upstream_model_opus,
+                override_upstream_model_sonnet,
+                override_upstream_model_haiku,
                 override_upstream_http_headers,
                 override_forward_incoming_headers,
                 override_drop_tool_types,
                 override_drop_request_fields,
+                override_anthropic_preserve_thinking: router_cfg
+                    .anthropic_preserve_thinking
+                    .filter(|enabled| *enabled),
+                override_anthropic_enable_openrouter_reasoning: router_cfg
+                    .anthropic_enable_openrouter_reasoning
+                    .filter(|enabled| *enabled),
             });
         }
 
@@ -340,6 +378,15 @@ impl RouterManager {
             self.default_upstream_wire,
             &format!("router '{name}'"),
         )?;
+        let upstream_model =
+            normalize_optional_router_model(router.and_then(|r| r.upstream_model.as_deref()));
+        let upstream_model_opus =
+            normalize_optional_router_model(router.and_then(|r| r.upstream_model_opus.as_deref()));
+        let upstream_model_sonnet = normalize_optional_router_model(
+            router.and_then(|r| r.upstream_model_sonnet.as_deref()),
+        );
+        let upstream_model_haiku =
+            normalize_optional_router_model(router.and_then(|r| r.upstream_model_haiku.as_deref()));
 
         let mut upstream_http_headers = self.default_upstream_http_headers.clone();
         if let Some(router_headers) = router.and_then(|r| r.upstream_http_headers.clone()) {
@@ -375,19 +422,29 @@ impl RouterManager {
                 }
             }
         }
-        let feature_flags =
-            self.default_feature_flags
-                .with_overrides(router.and_then(|r| r.features.as_ref()));
+        let feature_flags = self
+            .default_feature_flags
+            .with_overrides(router.and_then(|r| r.features.as_ref()));
 
         Ok(RouteTarget {
             router_name: name.to_string(),
             upstream_url,
             upstream_wire,
+            upstream_model,
+            upstream_model_opus,
+            upstream_model_sonnet,
+            upstream_model_haiku,
             upstream_http_headers,
             forward_incoming_headers,
             drop_tool_types,
             drop_request_fields,
             feature_flags,
+            anthropic_preserve_thinking: router
+                .and_then(|r| r.anthropic_preserve_thinking)
+                .unwrap_or(false),
+            anthropic_enable_openrouter_reasoning: router
+                .and_then(|r| r.anthropic_enable_openrouter_reasoning)
+                .unwrap_or(false),
         })
     }
 }
@@ -403,6 +460,12 @@ fn normalize_host_port(host: &str, port: u16) -> String {
     } else {
         format!("{}:{}", normalized_host, port)
     }
+}
+
+fn normalize_optional_router_model(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToString::to_string)
 }
 
 fn normalize_host_header_to_authority(raw: &str) -> Option<String> {
@@ -432,10 +495,12 @@ fn parse_incoming_url(raw: &str) -> Result<ParsedIncomingUrl> {
                 path: normalized_path,
             },
             bind_addr: None,
+            bind_host: None,
         });
     }
 
-    let parsed = reqwest::Url::parse(trimmed).map_err(|err| anyhow!("failed to parse URL: {err}"))?;
+    let parsed =
+        reqwest::Url::parse(trimmed).map_err(|err| anyhow!("failed to parse URL: {err}"))?;
     if parsed.scheme() != "http" {
         return Err(anyhow!(
             "incoming_url scheme must be `http` for listener binding: {}",
@@ -457,7 +522,16 @@ fn parse_incoming_url(raw: &str) -> Result<ParsedIncomingUrl> {
             path: normalized_path,
         },
         bind_addr: Some(authority),
+        bind_host: Some(host.to_string()),
     })
+}
+
+fn is_local_incoming_host(host: &str) -> bool {
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+
+    host.parse::<IpAddr>().is_ok_and(|ip| ip.is_loopback())
 }
 
 pub(crate) fn normalize_incoming_url_to_path(raw: &str) -> Result<String> {
