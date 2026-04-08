@@ -250,10 +250,6 @@ upstream_url = "http://localhost:8080/v1/chat/completions"
 upstream_wire = "chat"
 # Optional: force a provider-valid model ID instead of forwarding Claude Code's model string.
 # upstream_model = "provider/model-id"
-# Optional: Claude family-specific overrides take precedence over `upstream_model`.
-# upstream_model_sonnet = "openrouter/anthropic/claude-sonnet-4"
-# upstream_model_opus = "openrouter/anthropic/claude-opus-4"
-# upstream_model_haiku = "openrouter/anthropic/claude-haiku-4"
 # Optional: preserve Anthropic thinking blocks in assistant content and enable OpenRouter reasoning.
 # anthropic_preserve_thinking = true
 # anthropic_enable_openrouter_reasoning = true

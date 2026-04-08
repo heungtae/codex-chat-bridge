@@ -5,20 +5,20 @@ use serde_json::Value;
 use crate::model::UpstreamHeader;
 use crate::model::WireApi;
 
-pub(crate) fn upstream_messages_for_logging(upstream_wire: WireApi, payload: &Value) -> Option<Value> {
+pub(crate) fn upstream_messages_for_logging(
+    upstream_wire: WireApi,
+    payload: &Value,
+) -> Option<Value> {
     match upstream_wire {
         WireApi::Chat => payload.get("messages").cloned(),
-        WireApi::Responses => payload
-            .get("input")
-            .and_then(Value::as_array)
-            .map(|items| {
-                let messages = items
-                    .iter()
-                    .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
-                    .cloned()
-                    .collect();
-                Value::Array(messages)
-            }),
+        WireApi::Responses => payload.get("input").and_then(Value::as_array).map(|items| {
+            let messages = items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("message"))
+                .cloned()
+                .collect();
+            Value::Array(messages)
+        }),
     }
 }
 
@@ -128,14 +128,8 @@ pub(crate) fn headers_for_logging(headers: &HeaderMap) -> Value {
             || header_name.eq_ignore_ascii_case("cookie")
             || header_name.eq_ignore_ascii_case("set-cookie")
         {
-            redact_for_logging(
-                value
-                    .to_str()
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or("x"),
-            )
-            .to_string()
+            redact_for_logging(value.to_str().ok().filter(|v| !v.is_empty()).unwrap_or("x"))
+                .to_string()
         } else {
             value
                 .to_str()

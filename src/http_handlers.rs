@@ -1,3 +1,4 @@
+use axum::Router;
 use axum::extract::Path as AxumPath;
 use axum::extract::State;
 use axum::http::HeaderMap;
@@ -6,7 +7,6 @@ use axum::response::IntoResponse;
 use axum::response::Response;
 use axum::routing::get;
 use axum::routing::post;
-use axum::Router;
 use serde_json::json;
 use std::sync::Arc;
 

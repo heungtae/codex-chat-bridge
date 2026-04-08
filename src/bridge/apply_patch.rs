@@ -81,9 +81,7 @@ fn repair_add_file_lines(input: &str) -> (String, Vec<String>) {
                 } else {
                     "added missing '+' prefix for add-file content line"
                 };
-                repairs.push(format!(
-                    "{repair_kind} ({file}:{add_file_line_no})"
-                ));
+                repairs.push(format!("{repair_kind} ({file}:{add_file_line_no})"));
                 output.push(format!("+{line}"));
             } else {
                 output.push(line.to_string());
@@ -106,11 +104,7 @@ fn repair_add_file_lines(input: &str) -> (String, Vec<String>) {
 fn is_patch_header(line: &str) -> bool {
     matches!(
         line,
-        "*** End Patch"
-            | "@@"
-            | "*** Add File: "
-            | "*** Delete File: "
-            | "*** Update File: "
+        "*** End Patch" | "@@" | "*** Add File: " | "*** Delete File: " | "*** Update File: "
     ) || line.starts_with("@@ ")
         || line.starts_with("*** Add File: ")
         || line.starts_with("*** Delete File: ")
