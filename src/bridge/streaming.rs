@@ -68,6 +68,8 @@ where
         let mut next_index = 0usize;
         let mut thinking_index = None;
         let mut text_index = None;
+        let mut thinking_started = false;
+        let mut text_started = false;
         let mut tool_blocks: BTreeMap<usize, AnthropicToolBlockState> = BTreeMap::new();
         let mut think_parser = ThinkTagParser::default();
         let mut heuristic_tool_parser = HeuristicToolParser::default();
@@ -142,7 +144,9 @@ where
                                             &mut emitted,
                                             &mut next_index,
                                             &mut thinking_index,
+                                            &mut thinking_started,
                                             &mut text_index,
+                                            &mut text_started,
                                             thinking,
                                         );
                                     }
@@ -153,7 +157,9 @@ where
                                             &mut emitted,
                                             &mut next_index,
                                             &mut thinking_index,
+                                            &mut thinking_started,
                                             &mut text_index,
+                                            &mut text_started,
                                             signature,
                                         );
                                     }
@@ -161,9 +167,11 @@ where
                                 "redacted_thinking" => {
                                     if let Some(index) = thinking_index.take() {
                                         emitted.push(anthropic_content_block_stop(index));
+                                        thinking_started = false;
                                     }
                                     if let Some(index) = text_index.take() {
                                         emitted.push(anthropic_content_block_stop(index));
+                                        text_started = false;
                                     }
                                     let block_index = next_index;
                                     next_index += 1;
@@ -188,7 +196,9 @@ where
                             &mut emitted,
                             &mut next_index,
                             &mut thinking_index,
+                            &mut thinking_started,
                             &mut text_index,
+                            &mut text_started,
                             &reasoning,
                         );
                     }
@@ -199,7 +209,9 @@ where
                                 &mut emitted,
                                 &mut next_index,
                                 &mut thinking_index,
+                                &mut thinking_started,
                                 &mut text_index,
+                                &mut text_started,
                                 &reasoning,
                             );
                         }
@@ -212,7 +224,9 @@ where
                             &mut emitted,
                             &mut next_index,
                             &mut thinking_index,
+                            &mut thinking_started,
                             &mut text_index,
+                            &mut text_started,
                             signature,
                         );
                     }
@@ -228,7 +242,9 @@ where
                                     &mut emitted,
                                     &mut next_index,
                                     &mut thinking_index,
+                                    &mut thinking_started,
                                     &mut text_index,
+                                    &mut text_started,
                                     &mut heuristic_tool_parser,
                                     &parsed.content,
                                 );
@@ -238,7 +254,9 @@ where
                                     &mut emitted,
                                     &mut next_index,
                                     &mut thinking_index,
+                                    &mut thinking_started,
                                     &mut text_index,
+                                    &mut text_started,
                                     &parsed.content,
                                 );
                             }
@@ -249,9 +267,11 @@ where
                 if let Some(tool_calls) = delta.tool_calls {
                     if let Some(index) = thinking_index.take() {
                         emitted.push(anthropic_content_block_stop(index));
+                        thinking_started = false;
                     }
                     if let Some(index) = text_index.take() {
                         emitted.push(anthropic_content_block_stop(index));
+                        text_started = false;
                     }
 
                     for tool_call in tool_calls {
@@ -349,7 +369,9 @@ where
                         &mut emitted,
                         &mut next_index,
                         &mut thinking_index,
+                        &mut thinking_started,
                         &mut text_index,
+                        &mut text_started,
                         &mut heuristic_tool_parser,
                         &remaining.content,
                     );
@@ -359,7 +381,9 @@ where
                         &mut emitted,
                         &mut next_index,
                         &mut thinking_index,
+                        &mut thinking_started,
                         &mut text_index,
+                        &mut text_started,
                         &remaining.content,
                     );
                 }
@@ -373,18 +397,20 @@ where
         if !heuristic_flush_text.is_empty() {
             if let Some(index) = thinking_index.take() {
                 yield Ok(anthropic_content_block_stop(index));
+                thinking_started = false;
             }
             let index = *text_index.get_or_insert_with(|| {
                 let index = next_index;
                 next_index += 1;
                 index
             });
-            if text_index == Some(index) && index + 1 == next_index {
+            if !text_started {
                 yield Ok(anthropic_content_block_start(
                     index,
                     "text",
                     json!({"type":"text","text":""}),
                 ));
+                text_started = true;
             }
             yield Ok(anthropic_content_block_delta(
                 index,
@@ -398,7 +424,9 @@ where
                 &mut emitted,
                 &mut next_index,
                 &mut thinking_index,
+                &mut thinking_started,
                 &mut text_index,
+                &mut text_started,
                 heuristic_call,
             );
             for event in emitted {
@@ -1205,7 +1233,9 @@ fn emit_text_segment(
     emitted: &mut Vec<Bytes>,
     next_index: &mut usize,
     thinking_index: &mut Option<usize>,
+    thinking_started: &mut bool,
     text_index: &mut Option<usize>,
+    text_started: &mut bool,
     heuristic_tool_parser: &mut HeuristicToolParser,
     segment: &str,
 ) {
@@ -1214,20 +1244,25 @@ fn emit_text_segment(
     }
     if let Some(index) = thinking_index.take() {
         emitted.push(anthropic_content_block_stop(index));
+        *thinking_started = false;
+    }
+    let (filtered_text, tool_calls) = heuristic_tool_parser.feed(segment);
+    if filtered_text.is_empty() && tool_calls.is_empty() {
+        return;
     }
     let index = *text_index.get_or_insert_with(|| {
         let index = *next_index;
         *next_index += 1;
         index
     });
-    if matches!(*text_index, Some(current) if current == index) && index + 1 == *next_index {
+    if !*text_started {
         emitted.push(anthropic_content_block_start(
             index,
             "text",
             json!({"type":"text","text":""}),
         ));
+        *text_started = true;
     }
-    let (filtered_text, tool_calls) = heuristic_tool_parser.feed(segment);
     if !filtered_text.is_empty() {
         emitted.push(anthropic_content_block_delta(
             index,
@@ -1240,7 +1275,9 @@ fn emit_text_segment(
             emitted,
             next_index,
             thinking_index,
+            thinking_started,
             text_index,
+            text_started,
             heuristic_call,
         );
     }
@@ -1250,7 +1287,9 @@ fn emit_thinking_segment(
     emitted: &mut Vec<Bytes>,
     next_index: &mut usize,
     thinking_index: &mut Option<usize>,
+    thinking_started: &mut bool,
     text_index: &mut Option<usize>,
+    text_started: &mut bool,
     segment: &str,
 ) {
     if segment.is_empty() {
@@ -1258,18 +1297,20 @@ fn emit_thinking_segment(
     }
     if let Some(index) = text_index.take() {
         emitted.push(anthropic_content_block_stop(index));
+        *text_started = false;
     }
     let index = *thinking_index.get_or_insert_with(|| {
         let index = *next_index;
         *next_index += 1;
         index
     });
-    if matches!(*thinking_index, Some(current) if current == index) && index + 1 == *next_index {
+    if !*thinking_started {
         emitted.push(anthropic_content_block_start(
             index,
             "thinking",
             json!({"type":"thinking","thinking":""}),
         ));
+        *thinking_started = true;
     }
     emitted.push(anthropic_content_block_delta(
         index,
@@ -1282,7 +1323,9 @@ fn emit_thinking_signature(
     emitted: &mut Vec<Bytes>,
     next_index: &mut usize,
     thinking_index: &mut Option<usize>,
+    thinking_started: &mut bool,
     text_index: &mut Option<usize>,
+    text_started: &mut bool,
     signature: &str,
 ) {
     if signature.is_empty() {
@@ -1290,18 +1333,20 @@ fn emit_thinking_signature(
     }
     if let Some(index) = text_index.take() {
         emitted.push(anthropic_content_block_stop(index));
+        *text_started = false;
     }
     let index = *thinking_index.get_or_insert_with(|| {
         let index = *next_index;
         *next_index += 1;
         index
     });
-    if matches!(*thinking_index, Some(current) if current == index) && index + 1 == *next_index {
+    if !*thinking_started {
         emitted.push(anthropic_content_block_start(
             index,
             "thinking",
             json!({"type":"thinking","thinking":""}),
         ));
+        *thinking_started = true;
     }
     emitted.push(anthropic_content_block_delta(
         index,
@@ -1482,14 +1527,18 @@ fn emit_heuristic_tool_call(
     emitted: &mut Vec<Bytes>,
     next_index: &mut usize,
     thinking_index: &mut Option<usize>,
+    thinking_started: &mut bool,
     text_index: &mut Option<usize>,
+    text_started: &mut bool,
     call: HeuristicToolCall,
 ) {
     if let Some(index) = thinking_index.take() {
         emitted.push(anthropic_content_block_stop(index));
+        *thinking_started = false;
     }
     if let Some(index) = text_index.take() {
         emitted.push(anthropic_content_block_stop(index));
+        *text_started = false;
     }
 
     let block_index = *next_index;

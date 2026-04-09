@@ -2627,9 +2627,10 @@ async fn anthropic_stream_accepts_terminal_finish_reason_without_done_marker() {
     }
 
     assert!(payload.contains("event: message_start"));
-    assert!(payload.contains("event: content_block_start"));
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
     assert!(payload.contains("event: content_block_delta"));
     assert!(payload.contains("\"text\":\"Hi\""));
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
     assert!(payload.contains("event: message_delta"));
     assert!(payload.contains("event: message_stop"));
     assert!(!payload.contains("event: error"));
@@ -2658,6 +2659,8 @@ async fn anthropic_stream_splits_think_tags_in_content() {
     assert!(payload.contains("\"type\":\"text_delta\""));
     assert!(payload.contains("\"text\":\"before \""));
     assert!(payload.contains("\"text\":\" after\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 3);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 3);
 }
 
 #[tokio::test]
@@ -2679,6 +2682,8 @@ async fn stream_emits_thinking_from_reasoning_details() {
     }
 
     assert!(payload.contains("\"thinking\":\"step one\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
     assert!(payload.contains("event: message_stop"));
 }
 
@@ -2728,6 +2733,62 @@ async fn anthropic_stream_handles_trailing_done_without_newline() {
     }
 
     assert!(payload.contains("\"text\":\"Hi\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
     assert!(payload.contains("event: message_stop"));
     assert!(!payload.contains("event: error"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_opens_text_block_only_once_across_multiple_deltas() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"llo\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
+    assert_eq!(payload.matches("\"type\":\"text_delta\"").count(), 2);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
+    assert!(payload.contains("\"text\":\"He\""));
+    assert!(payload.contains("\"text\":\"llo\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_opens_thinking_block_only_once_across_multiple_deltas() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"step \"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"one\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
+    assert_eq!(payload.matches("\"type\":\"thinking_delta\"").count(), 2);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
+    assert!(payload.contains("\"thinking\":\"step \""));
+    assert!(payload.contains("\"thinking\":\"one\""));
 }
