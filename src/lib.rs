@@ -62,13 +62,17 @@ struct ServerInfo {
 }
 
 fn init_tracing(verbose_logging: bool) {
-    let env_filter = tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| {
-        if verbose_logging {
-            tracing_subscriber::EnvFilter::new("debug")
-        } else {
-            tracing_subscriber::EnvFilter::new("info")
-        }
-    });
+    let default_filter = if verbose_logging { "debug" } else { "info" };
+    let mut env_filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    let crate_directive = if verbose_logging {
+        "codex_chat_bridge=debug"
+    } else {
+        "codex_chat_bridge=info"
+    };
+    if let Ok(directive) = crate_directive.parse() {
+        env_filter = env_filter.add_directive(directive);
+    }
 
     tracing_subscriber::fmt().with_env_filter(env_filter).init();
 }
@@ -435,6 +439,7 @@ fn anthropic_request_enables_thinking(request: &Value) -> bool {
 async fn resolve_route_target(
     state: &Arc<AppState>,
     headers: &HeaderMap,
+    incoming_route: &str,
     incoming_path: Option<&str>,
 ) -> std::result::Result<RouteTarget, Response> {
     let routers = state.routers.read().await;
@@ -442,10 +447,28 @@ async fn resolve_route_target(
     let route_target = match incoming_path {
         Some(path) => match routers.get_target_for_incoming_route(path, host_header) {
             Ok(Some(target)) => target,
-            Ok(None) => return Err((StatusCode::NOT_FOUND, "not found").into_response()),
-            Err(err) => return Err(json_error_response("router_error", &err.to_string())),
+            Ok(None) => {
+                warn!(
+                    "router miss: host={:?}, incoming_route={}, router_names={:?}",
+                    host_header,
+                    incoming_route,
+                    routers.get_router_names()
+                );
+                return Err((StatusCode::NOT_FOUND, "not found").into_response());
+            }
+            Err(err) => {
+                warn!(
+                    "router resolution failed: host={:?}, incoming_route={}, error={}",
+                    host_header, incoming_route, err
+                );
+                return Err(json_error_response("router_error", &err.to_string()));
+            }
         },
         None => {
+            warn!(
+                "router resolution failed: host={:?}, incoming_route={}, error=missing incoming path",
+                host_header, incoming_route
+            );
             return Err(json_error_response(
                 "router_error",
                 "routing requires POST /{incoming_path} that matches routers.*.incoming_url",
@@ -474,6 +497,10 @@ fn parse_and_prepare_request(
     let mut request_value: Value = match serde_json::from_str(body) {
         Ok(v) => v,
         Err(err) => {
+            warn!(
+                "request parse failed: router={}, incoming_path={:?}, error={}",
+                route_target.router_name, incoming_path, err
+            );
             return Err(error_response_for_api(
                 fallback_incoming_api,
                 stream_default_for_api(fallback_incoming_api),
@@ -511,6 +538,10 @@ fn parse_and_prepare_request(
         route_target.feature_flags.enable_extended_input_types,
         &request_value,
     ) {
+        warn!(
+            "request capability gate rejected: router={}, incoming_api={:?}, upstream_wire={:?}, error={}",
+            route_target.router_name, incoming_api, route_target.upstream_wire, err
+        );
         return Err(error_response_for_api(
             incoming_api,
             wants_stream,
@@ -551,6 +582,10 @@ async fn build_upstream_payload_with_session(
     ) {
         Ok(v) => v,
         Err(err) => {
+            warn!(
+                "request mapping failed: router={}, incoming_api={:?}, upstream_wire={:?}, error={}",
+                route_target.router_name, incoming_api, route_target.upstream_wire, err
+            );
             return Err(error_response_for_api(
                 incoming_api,
                 wants_stream,
@@ -576,6 +611,10 @@ async fn build_upstream_payload_with_session(
             match resolve_previous_messages_for_request(request_value, &sessions) {
                 Ok(v) => v,
                 Err(err) => {
+                    warn!(
+                        "previous response lookup failed: router={}, response_id={}, error={}",
+                        route_target.router_name, response_id, err
+                    );
                     return Err(error_response_for_api(
                         incoming_api,
                         wants_stream,
@@ -588,6 +627,10 @@ async fn build_upstream_payload_with_session(
         if let Some(messages) = previous_messages
             && let Err(err) = merge_previous_messages(&mut upstream_payload, messages)
         {
+            warn!(
+                "previous response merge failed: router={}, response_id={}, error={}",
+                route_target.router_name, response_id, err
+            );
             return Err(error_response_for_api(
                 incoming_api,
                 wants_stream,
@@ -666,6 +709,15 @@ async fn finalize_upstream_response(
             );
         }
         let normalized = normalize_upstream_error_payload(status, &body);
+        warn!(
+            "upstream error: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, code={}, message={}",
+            route_target.router_name,
+            incoming_api,
+            route_target.upstream_wire,
+            status,
+            normalized.code,
+            normalized.message
+        );
         return error_response_for_api(
             incoming_api,
             wants_stream,
@@ -778,13 +830,27 @@ pub(crate) async fn handle_incoming(
     incoming_api_hint: Option<IncomingApi>,
     incoming_path: Option<String>,
 ) -> Response {
-    let route_target = match resolve_route_target(&state, &headers, incoming_path.as_deref()).await
-    {
-        Ok(target) => target,
-        Err(response) => return response,
-    };
     let verbose_logging = state.verbose_logging;
     let incoming_route = resolve_incoming_route(incoming_api_hint, incoming_path.as_deref());
+    let host_header = headers.get(HOST).and_then(|h| h.to_str().ok());
+
+    if verbose_logging {
+        debug!(
+            "incoming request received: hinted_api={:?}, incoming_route={}, host={:?}, body_bytes={}",
+            incoming_api_hint,
+            incoming_route,
+            host_header,
+            body.len()
+        );
+    }
+
+    let route_target =
+        match resolve_route_target(&state, &headers, &incoming_route, incoming_path.as_deref())
+            .await
+        {
+            Ok(target) => target,
+            Err(response) => return response,
+        };
 
     debug!(
         "request routed: router={}, incoming_route={}, upstream_url={}, upstream_wire={:?}",
@@ -878,6 +944,10 @@ pub(crate) async fn handle_incoming(
     let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
+            warn!(
+                "upstream transport failed: router={}, incoming_route={}, upstream_url={}, error={}",
+                route_target.router_name, incoming_route, route_target.upstream_url, err
+            );
             return error_response_for_api(
                 incoming_api,
                 wants_stream,

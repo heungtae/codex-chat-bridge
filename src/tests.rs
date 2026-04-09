@@ -1,11 +1,13 @@
 use super::*;
 use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
-use axum::body::Bytes;
+use axum::body::{Body, Bytes, to_bytes};
+use axum::http::Request;
 use futures::StreamExt;
 use futures::stream;
 use serde_json::json;
 use std::collections::HashSet;
 use std::path::PathBuf;
+use tower::ServiceExt;
 
 #[test]
 fn maps_responses_request_to_chat_request_with_function_tool() {
@@ -2287,6 +2289,108 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
 
     assert_eq!(collected.len(), 1);
     assert_eq!(collected[0], "from-upstream-http-headers");
+}
+
+fn test_state_with_router(
+    incoming_url: &str,
+    upstream_url: &str,
+    upstream_wire: WireApi,
+) -> Arc<AppState> {
+    let mut routers = BTreeMap::new();
+    routers.insert(
+        "default".to_string(),
+        RouterConfig {
+            incoming_url: Some(incoming_url.to_string()),
+            upstream_url: Some(upstream_url.to_string()),
+            upstream_wire: Some(upstream_wire),
+            ..Default::default()
+        },
+    );
+    let router_manager = RouterManager::new(
+        routers,
+        "https://api.openai.com/v1/chat/completions".to_string(),
+        WireApi::Chat,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        FeatureFlags::default(),
+    )
+    .expect("router manager");
+
+    Arc::new(AppState {
+        client: Client::new(),
+        api_key: "test-key".to_string(),
+        http_shutdown: false,
+        verbose_logging: true,
+        routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
+        sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+    })
+}
+
+#[tokio::test]
+async fn direct_anthropic_endpoint_routes_using_request_path() {
+    let app = build_app(test_state_with_router(
+        "http://127.0.0.1:8787/v1/messages",
+        "http://127.0.0.1:9/v1/chat/completions",
+        WireApi::Chat,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "upstream_transport_error");
+}
+
+#[tokio::test]
+async fn direct_responses_endpoint_routes_using_request_path() {
+    let app = build_app(test_state_with_router(
+        "http://127.0.0.1:8787/v1/responses",
+        "http://127.0.0.1:9/v1/responses",
+        WireApi::Responses,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4.1","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+
+    assert_eq!(json["error"]["type"], "upstream_transport_error");
 }
 
 #[tokio::test]

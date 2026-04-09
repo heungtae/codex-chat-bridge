@@ -58,7 +58,14 @@ async fn handle_responses(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    crate::handle_incoming(state, headers, body, Some(IncomingApi::Responses), None).await
+    crate::handle_incoming(
+        state,
+        headers,
+        body,
+        Some(IncomingApi::Responses),
+        Some("/v1/responses".to_string()),
+    )
+    .await
 }
 
 async fn handle_anthropic_messages(
@@ -66,7 +73,14 @@ async fn handle_anthropic_messages(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    crate::handle_incoming(state, headers, body, Some(IncomingApi::Anthropic), None).await
+    crate::handle_incoming(
+        state,
+        headers,
+        body,
+        Some(IncomingApi::Anthropic),
+        Some("/v1/messages".to_string()),
+    )
+    .await
 }
 
 async fn handle_chat_completions(
@@ -74,7 +88,14 @@ async fn handle_chat_completions(
     headers: HeaderMap,
     body: String,
 ) -> Response {
-    crate::handle_incoming(state, headers, body, Some(IncomingApi::Chat), None).await
+    crate::handle_incoming(
+        state,
+        headers,
+        body,
+        Some(IncomingApi::Chat),
+        Some("/v1/chat/completions".to_string()),
+    )
+    .await
 }
 
 async fn handle_routed_incoming(
