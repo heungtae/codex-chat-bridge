@@ -2713,6 +2713,88 @@ async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
 }
 
 #[tokio::test]
+async fn anthropic_stream_strips_control_tokens_from_text_content() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"alpha<|message|>beta<|constrain|>gamma\"}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"text\":\"alphabetagamma\""));
+    assert!(!payload.contains("<|message|>"));
+    assert!(!payload.contains("<|constrain|>"));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_keeps_non_tool_thinking_trace_as_text() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"● <thinking<|message|>Create next tasks.\\n\\n● <thinking<|message|>Create remaining tasks similarly.<thinking\\n\\nto=functions.TaskCreate<|constrain|>json<|message|>{\\\"description\\\":\\\"Create a guide\\\"}\"}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("Create next tasks."));
+    assert!(payload.contains("Create remaining tasks similarly."));
+    assert!(payload.contains("to=functions.TaskCreatejson"));
+    assert!(!payload.contains("<|message|>"));
+    assert!(!payload.contains("<|constrain|>"));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_keeps_split_non_tool_thinking_trace_as_text() {
+    let upstream = stream::iter(vec![
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"● <thinking<|mes\"}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"sage|>Create next tasks. to=functions.TaskCreate<|con\"}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"strain|>json\"}}]}\n\n\
+             data: [DONE]\n\n",
+        )),
+    ]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("Create next tasks. to=functions.TaskCreatejson"));
+    assert!(!payload.contains("<|message|>"));
+    assert!(!payload.contains("<|constrain|>"));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+}
+
+#[tokio::test]
 async fn anthropic_stream_handles_trailing_done_without_newline() {
     let upstream = stream::iter(vec![
         Ok::<Bytes, reqwest::Error>(Bytes::from(

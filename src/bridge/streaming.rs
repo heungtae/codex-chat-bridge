@@ -1380,8 +1380,12 @@ struct HeuristicToolCall {
 }
 
 impl HeuristicToolParser {
+    const CONTROL_TOKEN_START: &'static str = "<|";
+    const CONTROL_TOKEN_END: &'static str = "|>";
+
     fn feed(&mut self, text: &str) -> (String, Vec<HeuristicToolCall>) {
         self.buffer.push_str(text);
+        self.strip_control_tokens();
         let mut emitted_text = String::new();
         let mut detected = Vec::new();
 
@@ -1389,6 +1393,10 @@ impl HeuristicToolParser {
             match self.state {
                 HeuristicToolParserState::Text => {
                     let Some(bullet_pos) = self.buffer.find('●') else {
+                        if let Some(safe_prefix) = self.split_incomplete_control_token_tail() {
+                            emitted_text.push_str(&safe_prefix);
+                            break;
+                        }
                         emitted_text.push_str(&self.buffer);
                         self.buffer.clear();
                         break;
@@ -1399,80 +1407,46 @@ impl HeuristicToolParser {
                     self.state = HeuristicToolParserState::MatchingFunction;
                 }
                 HeuristicToolParserState::MatchingFunction => {
-                    let Some(function_pos) = self.buffer.find("<function=") else {
-                        if self.buffer.len() > 96 {
-                            self.buffer.drain(..'●'.len_utf8());
+                    if let Some(function_name) = self.try_match_function_start() {
+                        self.current_tool_id =
+                            Some(format!("toolu_heuristic_{}", uuid::Uuid::now_v7()));
+                        self.current_function_name = Some(function_name);
+                        self.current_parameters.clear();
+                        self.state = HeuristicToolParserState::ParsingParameters;
+                        continue;
+                    }
+
+                    if self.buffer.len() > 100 {
+                        if let Some(first_char) = self.buffer.chars().next() {
+                            emitted_text.push(first_char);
+                            self.buffer.drain(..first_char.len_utf8());
                             self.state = HeuristicToolParserState::Text;
                         }
-                        break;
-                    };
-
-                    if function_pos > 0 {
-                        self.buffer.drain(..function_pos);
                         continue;
                     }
-
-                    let Some(close_pos) = self.buffer.find('>') else {
-                        break;
-                    };
-                    if close_pos <= "<function=".len() {
-                        break;
-                    }
-
-                    let name = self.buffer["<function=".len()..close_pos].trim();
-                    if name.is_empty() {
-                        emitted_text.push_str(&self.buffer[..close_pos + 1]);
-                        self.buffer.drain(..close_pos + 1);
-                        self.state = HeuristicToolParserState::Text;
-                        continue;
-                    }
-
-                    self.current_tool_id = Some(format!("toolu_heuristic_{}", uuid::Uuid::now_v7()));
-                    self.current_function_name = Some(name.to_string());
-                    self.current_parameters.clear();
-                    self.buffer.drain(..close_pos + 1);
-                    self.state = HeuristicToolParserState::ParsingParameters;
+                    break;
                 }
                 HeuristicToolParserState::ParsingParameters => {
-                    while let Some(param_start) = self.buffer.find("<parameter=") {
-                        if param_start > 0 {
-                            emitted_text.push_str(&self.buffer[..param_start]);
-                            self.buffer.drain(..param_start);
-                        }
-
-                        let Some(param_close) = self.buffer.find('>') else {
-                            break;
-                        };
-                        if param_close <= "<parameter=".len() {
-                            break;
-                        }
-                        let key = self.buffer["<parameter=".len()..param_close].trim();
-                        if key.is_empty() {
-                            break;
-                        }
-
-                        let end_tag = "</parameter>";
-                        let Some(param_end) = self.buffer[param_close + 1..].find(end_tag) else {
-                            break;
-                        };
-
-                        let value_start = param_close + 1;
-                        let value_end = value_start + param_end;
-                        let value = self.buffer[value_start..value_end].to_string();
-                        self.current_parameters.insert(key.to_string(), value);
-                        self.buffer.drain(..value_end + end_tag.len());
-                    }
+                    self.consume_complete_parameters(&mut emitted_text);
 
                     if self.current_function_name.is_none() {
                         break;
                     }
 
-                    let should_emit = self.buffer.starts_with('●')
-                        || (!self.buffer.is_empty()
-                            && !self.buffer.starts_with("<parameter=")
-                            && !self.buffer.starts_with("</parameter>"));
+                    let finished_tool_call = if self.buffer.find('●').is_some() {
+                        true
+                    } else if !self.buffer.is_empty() && !self.buffer.trim_start().starts_with('<')
+                    {
+                        if !self.buffer.contains("<parameter=") {
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
 
-                    if should_emit {
+                    if finished_tool_call {
                         detected.push(self.finish_tool_call());
                         self.state = HeuristicToolParserState::Text;
                         break;
@@ -1487,6 +1461,7 @@ impl HeuristicToolParser {
     }
 
     fn flush(&mut self) -> (String, Vec<HeuristicToolCall>) {
+        self.strip_control_tokens();
         let mut emitted_text = String::new();
         let mut detected = Vec::new();
         match self.state {
@@ -1498,6 +1473,7 @@ impl HeuristicToolParser {
             }
             HeuristicToolParserState::ParsingParameters => {
                 if self.current_function_name.is_some() {
+                    self.consume_partial_parameters();
                     detected.push(self.finish_tool_call());
                 } else {
                     emitted_text.push_str(&self.buffer);
@@ -1507,6 +1483,124 @@ impl HeuristicToolParser {
         self.buffer.clear();
         self.state = HeuristicToolParserState::Text;
         (emitted_text, detected)
+    }
+
+    fn strip_control_tokens(&mut self) {
+        let mut output = String::with_capacity(self.buffer.len());
+        let mut rest = self.buffer.as_str();
+
+        while let Some(start) = rest.find(Self::CONTROL_TOKEN_START) {
+            output.push_str(&rest[..start]);
+            let tail = &rest[start + Self::CONTROL_TOKEN_START.len()..];
+            if let Some(end) = tail.find(Self::CONTROL_TOKEN_END) {
+                let token_body = &tail[..end];
+                if !token_body.is_empty()
+                    && token_body.len() <= 80
+                    && !token_body.contains('|')
+                    && !token_body.contains('>')
+                {
+                    rest = &tail[end + Self::CONTROL_TOKEN_END.len()..];
+                } else {
+                    output.push_str(Self::CONTROL_TOKEN_START);
+                    rest = tail;
+                }
+            } else {
+                output.push_str(&rest[start..]);
+                rest = "";
+            }
+        }
+
+        output.push_str(rest);
+        self.buffer = output;
+    }
+
+    fn split_incomplete_control_token_tail(&mut self) -> Option<String> {
+        let start = self.buffer.rfind(Self::CONTROL_TOKEN_START)?;
+        if self.buffer[start..].contains(Self::CONTROL_TOKEN_END) {
+            return None;
+        }
+        let prefix = self.buffer[..start].to_string();
+        self.buffer.drain(..start);
+        Some(prefix)
+    }
+
+    fn try_match_function_start(&mut self) -> Option<String> {
+        if !self.buffer.starts_with('●') {
+            return None;
+        }
+
+        let bullet_len = '●'.len_utf8();
+        let after_bullet = &self.buffer[bullet_len..];
+        let whitespace_len = after_bullet.len() - after_bullet.trim_start_matches(char::is_whitespace).len();
+        let trimmed_start = bullet_len + whitespace_len;
+        let trimmed = &self.buffer[trimmed_start..];
+        if !trimmed.starts_with("<function=") {
+            return None;
+        }
+
+        let close_pos = trimmed.find('>')?;
+        if close_pos <= "<function=".len() {
+            return None;
+        }
+
+        let name = trimmed["<function=".len()..close_pos].trim().to_string();
+        if name.is_empty() {
+            return None;
+        }
+
+        let consumed = trimmed_start + close_pos + 1;
+        self.buffer.drain(..consumed);
+        Some(name)
+    }
+
+    fn consume_complete_parameters(&mut self, emitted_text: &mut String) {
+        while let Some(param_start) = self.buffer.find("<parameter=") {
+            if param_start > 0 {
+                emitted_text.push_str(&self.buffer[..param_start]);
+                self.buffer.drain(..param_start);
+            }
+
+            let Some(param_close) = self.buffer.find('>') else {
+                break;
+            };
+            if param_close <= "<parameter=".len() {
+                break;
+            }
+            let key = self.buffer["<parameter=".len()..param_close].trim();
+            if key.is_empty() {
+                break;
+            }
+
+            let end_tag = "</parameter>";
+            let Some(param_end) = self.buffer[param_close + 1..].find(end_tag) else {
+                break;
+            };
+
+            let value_start = param_close + 1;
+            let value_end = value_start + param_end;
+            let value = self.buffer[value_start..value_end].trim().to_string();
+            self.current_parameters.insert(key.to_string(), value);
+            self.buffer.drain(..value_end + end_tag.len());
+        }
+    }
+
+    fn consume_partial_parameters(&mut self) {
+        while let Some(param_start) = self.buffer.find("<parameter=") {
+            let tail = &self.buffer[param_start..];
+            let Some(param_close) = tail.find('>') else {
+                break;
+            };
+            if param_close <= "<parameter=".len() {
+                break;
+            }
+            let key = tail["<parameter=".len()..param_close].trim();
+            if key.is_empty() {
+                break;
+            }
+            let value = tail[param_close + 1..].trim().to_string();
+            self.current_parameters.insert(key.to_string(), value);
+            break;
+        }
     }
 
     fn finish_tool_call(&mut self) -> HeuristicToolCall {
