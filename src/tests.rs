@@ -757,6 +757,34 @@ fn chat_json_to_anthropic_json_splits_think_tags_in_content() {
 }
 
 #[test]
+fn chat_json_to_anthropic_json_preserves_thinking_blocks_and_signature() {
+    let input = json!({
+        "choices": [{
+            "message": {
+                "thinking_blocks": [
+                    {
+                        "type": "thinking",
+                        "thinking": "step one",
+                        "signature": "sig_1"
+                    },
+                    {
+                        "type": "redacted_thinking",
+                        "data": "redacted_payload"
+                    }
+                ]
+            }
+        }]
+    });
+
+    let out = chat_json_to_anthropic_json(input, "claude-bridge");
+    assert_eq!(out["content"][0]["type"], "thinking");
+    assert_eq!(out["content"][0]["thinking"], "step one");
+    assert_eq!(out["content"][0]["signature"], "sig_1");
+    assert_eq!(out["content"][1]["type"], "redacted_thinking");
+    assert_eq!(out["content"][1]["data"], "redacted_payload");
+}
+
+#[test]
 fn normalize_chat_tools_converts_custom_tool_to_function() {
     let tools = vec![json!({
         "type": "custom",
@@ -2495,6 +2523,89 @@ async fn stream_emits_reasoning_summary_events() {
     assert!(payload.contains("event: response.reasoning_summary_text.done"));
     assert!(payload.contains("\"text\":\"think step\""));
     assert!(!payload.contains("[reasoning_summary]"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_handles_split_think_tags_across_chunks() {
+    let upstream = stream::iter(vec![
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"before <thi\"}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"nk>internal</thi\"}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"nk> after\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+        )),
+    ]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"text\":\"before \""));
+    assert!(payload.contains("\"type\":\"thinking_delta\""));
+    assert!(payload.contains("\"thinking\":\"internal\""));
+    assert!(payload.contains("\"text\":\" after\""));
+    assert!(!payload.contains("<thi"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_preserves_signature_delta_from_thinking_blocks() {
+    let upstream = stream::iter(vec![
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"thinking_blocks\":[{\"type\":\"thinking\",\"thinking\":\"step one\",\"signature\":\"sig_1\"}]}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
+    ]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"thinking_delta\""));
+    assert!(payload.contains("\"thinking\":\"step one\""));
+    assert!(payload.contains("\"type\":\"signature_delta\""));
+    assert!(payload.contains("\"signature\":\"sig_1\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_preserves_redacted_thinking_blocks() {
+    let upstream = stream::iter(vec![
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"thinking_blocks\":[{\"type\":\"redacted_thinking\",\"data\":\"secret\"}]}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from("data: [DONE]\n\n")),
+    ]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"redacted_thinking\""));
+    assert!(!payload.contains("response.failed"));
 }
 
 #[tokio::test]

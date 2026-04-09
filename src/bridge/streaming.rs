@@ -69,6 +69,7 @@ where
         let mut thinking_index = None;
         let mut text_index = None;
         let mut tool_blocks: BTreeMap<usize, AnthropicToolBlockState> = BTreeMap::new();
+        let mut think_parser = ThinkTagParser::default();
         let mut heuristic_tool_parser = HeuristicToolParser::default();
         let mut saw_done_marker = false;
         let mut saw_terminal_finish_reason = false;
@@ -127,153 +128,121 @@ where
                     continue;
                 };
 
-                if let Some(reasoning) = delta.reasoning_content
-                    && !reasoning.is_empty()
-                {
-                    if let Some(index) = text_index.take() {
-                        emitted.push(anthropic_content_block_stop(index));
+                if let Some(thinking_blocks) = delta.thinking_blocks.as_ref() {
+                    if let Some(blocks) = thinking_blocks.as_array() {
+                        for block in blocks {
+                            match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+                                "thinking" => {
+                                    let thinking = block
+                                        .get("thinking")
+                                        .and_then(Value::as_str)
+                                        .unwrap_or_default();
+                                    if !thinking.is_empty() {
+                                        emit_thinking_segment(
+                                            &mut emitted,
+                                            &mut next_index,
+                                            &mut thinking_index,
+                                            &mut text_index,
+                                            thinking,
+                                        );
+                                    }
+                                    if let Some(signature) = block.get("signature").and_then(Value::as_str)
+                                        && !signature.is_empty()
+                                    {
+                                        emit_thinking_signature(
+                                            &mut emitted,
+                                            &mut next_index,
+                                            &mut thinking_index,
+                                            &mut text_index,
+                                            signature,
+                                        );
+                                    }
+                                }
+                                "redacted_thinking" => {
+                                    if let Some(index) = thinking_index.take() {
+                                        emitted.push(anthropic_content_block_stop(index));
+                                    }
+                                    if let Some(index) = text_index.take() {
+                                        emitted.push(anthropic_content_block_stop(index));
+                                    }
+                                    let block_index = next_index;
+                                    next_index += 1;
+                                    emitted.push(anthropic_content_block_start(
+                                        block_index,
+                                        "redacted_thinking",
+                                        json!({
+                                            "type": "redacted_thinking",
+                                        }),
+                                    ));
+                                    emitted.push(anthropic_content_block_stop(block_index));
+                                }
+                                _ => {}
+                            }
+                        }
                     }
-                    let index = *thinking_index.get_or_insert_with(|| {
-                        let index = next_index;
-                        next_index += 1;
-                        index
-                    });
-                    if thinking_index == Some(index) && index + 1 == next_index {
-                        emitted.push(anthropic_content_block_start(
-                            index,
-                            "thinking",
-                            json!({"type":"thinking","thinking":""}),
-                        ));
+                } else {
+                    if let Some(reasoning) = delta.reasoning_content
+                        && !reasoning.is_empty()
+                    {
+                        emit_thinking_segment(
+                            &mut emitted,
+                            &mut next_index,
+                            &mut thinking_index,
+                            &mut text_index,
+                            &reasoning,
+                        );
                     }
-                    emitted.push(anthropic_content_block_delta(
-                        index,
-                        "thinking_delta",
-                        &reasoning,
-                    ));
+
+                    if let Some(details) = delta.reasoning_details.as_ref() {
+                        for reasoning in reasoning_details_texts(details) {
+                            emit_thinking_segment(
+                                &mut emitted,
+                                &mut next_index,
+                                &mut thinking_index,
+                                &mut text_index,
+                                &reasoning,
+                            );
+                        }
+                    }
+
+                    if let Some(signature) = delta.signature.as_deref()
+                        && !signature.is_empty()
+                    {
+                        emit_thinking_signature(
+                            &mut emitted,
+                            &mut next_index,
+                            &mut thinking_index,
+                            &mut text_index,
+                            signature,
+                        );
+                    }
                 }
 
                 if let Some(content) = delta.content
                     && !content.is_empty()
                 {
-                    if let Some(segments) = split_think_tagged_text_segments(&content) {
-                        for (is_thinking, segment) in segments {
-                            if segment.is_empty() {
-                                continue;
+                    for parsed in think_parser.feed(&content) {
+                        match parsed.kind {
+                            ThinkContentKind::Text => {
+                                emit_text_segment(
+                                    &mut emitted,
+                                    &mut next_index,
+                                    &mut thinking_index,
+                                    &mut text_index,
+                                    &mut heuristic_tool_parser,
+                                    &parsed.content,
+                                );
                             }
-                            if is_thinking {
-                                if let Some(index) = text_index.take() {
-                                    emitted.push(anthropic_content_block_stop(index));
-                                }
-                                let index = *thinking_index.get_or_insert_with(|| {
-                                    let index = next_index;
-                                    next_index += 1;
-                                    index
-                                });
-                                if thinking_index == Some(index) && index + 1 == next_index {
-                                    emitted.push(anthropic_content_block_start(
-                                        index,
-                                        "thinking",
-                                        json!({"type":"thinking","thinking":""}),
-                                    ));
-                                }
-                                emitted.push(anthropic_content_block_delta(
-                                    index,
-                                    "thinking_delta",
-                                    &segment,
-                                ));
-                            } else {
-                                if let Some(index) = thinking_index.take() {
-                                    emitted.push(anthropic_content_block_stop(index));
-                                }
-                                let index = *text_index.get_or_insert_with(|| {
-                                    let index = next_index;
-                                    next_index += 1;
-                                    index
-                                });
-                                if text_index == Some(index) && index + 1 == next_index {
-                                    emitted.push(anthropic_content_block_start(
-                                        index,
-                                        "text",
-                                        json!({"type":"text","text":""}),
-                                    ));
-                                }
-                                let (filtered_text, tool_calls) = heuristic_tool_parser.feed(&segment);
-                                if !filtered_text.is_empty() {
-                                    emitted.push(anthropic_content_block_delta(
-                                        index,
-                                        "text_delta",
-                                        &filtered_text,
-                                    ));
-                                }
-                                for heuristic_call in tool_calls {
-                                    emit_heuristic_tool_call(
-                                        &mut emitted,
-                                        &mut next_index,
-                                        &mut thinking_index,
-                                        &mut text_index,
-                                        heuristic_call,
-                                    );
-                                }
+                            ThinkContentKind::Thinking => {
+                                emit_thinking_segment(
+                                    &mut emitted,
+                                    &mut next_index,
+                                    &mut thinking_index,
+                                    &mut text_index,
+                                    &parsed.content,
+                                );
                             }
                         }
-                    } else {
-                        if let Some(index) = thinking_index.take() {
-                            emitted.push(anthropic_content_block_stop(index));
-                        }
-                        let index = *text_index.get_or_insert_with(|| {
-                            let index = next_index;
-                            next_index += 1;
-                            index
-                        });
-                        if text_index == Some(index) && index + 1 == next_index {
-                            emitted.push(anthropic_content_block_start(
-                                index,
-                                "text",
-                                json!({"type":"text","text":""}),
-                            ));
-                        }
-                        let (filtered_text, tool_calls) = heuristic_tool_parser.feed(&content);
-                        if !filtered_text.is_empty() {
-                            emitted.push(anthropic_content_block_delta(
-                                index,
-                                "text_delta",
-                                &filtered_text,
-                            ));
-                        }
-                        for heuristic_call in tool_calls {
-                            emit_heuristic_tool_call(
-                                &mut emitted,
-                                &mut next_index,
-                                &mut thinking_index,
-                                &mut text_index,
-                                heuristic_call,
-                            );
-                        }
-                    }
-                }
-
-                if let Some(details) = delta.reasoning_details.as_ref() {
-                    for reasoning in reasoning_details_texts(details) {
-                        if let Some(index) = text_index.take() {
-                            emitted.push(anthropic_content_block_stop(index));
-                        }
-                        let index = *thinking_index.get_or_insert_with(|| {
-                            let index = next_index;
-                            next_index += 1;
-                            index
-                        });
-                        if thinking_index == Some(index) && index + 1 == next_index {
-                            emitted.push(anthropic_content_block_start(
-                                index,
-                                "thinking",
-                                json!({"type":"thinking","thinking":""}),
-                            ));
-                        }
-                        emitted.push(anthropic_content_block_delta(
-                            index,
-                            "thinking_delta",
-                            &reasoning,
-                        ));
                     }
                 }
 
@@ -368,6 +337,34 @@ where
 
         if let Some(data) = parser.finish() {
             for event in process_event(data) {
+                yield Ok(event);
+            }
+        }
+
+        if let Some(remaining) = think_parser.flush() {
+            let mut emitted = Vec::new();
+            match remaining.kind {
+                ThinkContentKind::Text => {
+                    emit_text_segment(
+                        &mut emitted,
+                        &mut next_index,
+                        &mut thinking_index,
+                        &mut text_index,
+                        &mut heuristic_tool_parser,
+                        &remaining.content,
+                    );
+                }
+                ThinkContentKind::Thinking => {
+                    emit_thinking_segment(
+                        &mut emitted,
+                        &mut next_index,
+                        &mut thinking_index,
+                        &mut text_index,
+                        &remaining.content,
+                    );
+                }
+            }
+            for event in emitted {
                 yield Ok(event);
             }
         }
@@ -934,6 +931,7 @@ fn anthropic_content_block_start(index: usize, _block_type: &str, content_block:
 fn anthropic_content_block_delta(index: usize, delta_type: &str, value: &str) -> Bytes {
     let delta = match delta_type {
         "thinking_delta" => json!({"type":"thinking_delta","thinking": value}),
+        "signature_delta" => json!({"type":"signature_delta","signature": value}),
         "input_json_delta" => json!({"type":"input_json_delta","partial_json": value}),
         _ => json!({"type":"text_delta","text": value}),
     };
@@ -974,6 +972,7 @@ fn map_chat_finish_reason_to_anthropic_stop_reason(reason: &str) -> &'static str
     }
 }
 
+#[allow(dead_code)]
 fn split_think_tagged_text_segments(text: &str) -> Option<Vec<(bool, String)>> {
     if !text.contains("<think>")
         && !text.contains("</think>")
@@ -1035,6 +1034,280 @@ fn reasoning_details_texts(value: &Value) -> Vec<String> {
         .filter(|text| !text.trim().is_empty())
         .map(ToString::to_string)
         .collect()
+}
+
+#[derive(Debug, Default)]
+struct ThinkTagParser {
+    buffer: String,
+    in_think_tag: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThinkContentKind {
+    Text,
+    Thinking,
+}
+
+#[derive(Debug, Clone)]
+struct ThinkContentChunk {
+    kind: ThinkContentKind,
+    content: String,
+}
+
+impl ThinkTagParser {
+    const OPEN_TAG: &'static str = "<think>";
+    const CLOSE_TAG: &'static str = "</think>";
+    const ALT_OPEN_TAG: &'static str = "<thinking>";
+    const ALT_CLOSE_TAG: &'static str = "</thinking>";
+
+    fn feed(&mut self, content: &str) -> Vec<ThinkContentChunk> {
+        self.buffer.push_str(content);
+        let mut chunks = Vec::new();
+
+        loop {
+            let prev_len = self.buffer.len();
+            let chunk = if self.in_think_tag {
+                self.parse_inside_think()
+            } else {
+                self.parse_outside_think()
+            };
+
+            if let Some(chunk) = chunk {
+                chunks.push(chunk);
+            } else if self.buffer.len() == prev_len {
+                break;
+            }
+        }
+
+        chunks
+    }
+
+    fn parse_outside_think(&mut self) -> Option<ThinkContentChunk> {
+        let think_start = next_think_open(&self.buffer);
+        let orphan_close = next_think_close(&self.buffer);
+
+        if let Some(close_pos) = orphan_close
+            && think_start.map_or(true, |start| close_pos < start)
+        {
+            let prefix = self.buffer[..close_pos].to_string();
+            self.buffer.drain(..close_pos + think_close_len(&self.buffer[close_pos..]));
+            if prefix.is_empty() {
+                return None;
+            }
+            return Some(ThinkContentChunk {
+                kind: ThinkContentKind::Text,
+                content: prefix,
+            });
+        }
+
+        if let Some(open_pos) = think_start {
+            let prefix = self.buffer[..open_pos].to_string();
+            let open_len = think_open_len(&self.buffer[open_pos..]);
+            self.buffer.drain(..open_pos + open_len);
+            self.in_think_tag = true;
+            if prefix.is_empty() {
+                None
+            } else {
+                Some(ThinkContentChunk {
+                    kind: ThinkContentKind::Text,
+                    content: prefix,
+                })
+            }
+        } else if let Some(last_bracket) = self.buffer.rfind('<') {
+            let potential = &self.buffer[last_bracket..];
+            if Self::OPEN_TAG.starts_with(potential) && potential.len() < Self::OPEN_TAG.len()
+                || Self::ALT_OPEN_TAG.starts_with(potential)
+                    && potential.len() < Self::ALT_OPEN_TAG.len()
+                || Self::CLOSE_TAG.starts_with(potential) && potential.len() < Self::CLOSE_TAG.len()
+                || Self::ALT_CLOSE_TAG.starts_with(potential)
+                    && potential.len() < Self::ALT_CLOSE_TAG.len()
+            {
+                let prefix = self.buffer[..last_bracket].to_string();
+                self.buffer.drain(..last_bracket);
+                if prefix.is_empty() {
+                    return None;
+                }
+                return Some(ThinkContentChunk {
+                    kind: ThinkContentKind::Text,
+                    content: prefix,
+                });
+            }
+            self.flush_text_like(ThinkContentKind::Text)
+        } else {
+            self.flush_text_like(ThinkContentKind::Text)
+        }
+    }
+
+    fn parse_inside_think(&mut self) -> Option<ThinkContentChunk> {
+        if let Some(close_pos) = next_think_close(&self.buffer) {
+            let close_len = think_close_len(&self.buffer[close_pos..]);
+            let thinking = self.buffer[..close_pos].to_string();
+            self.buffer.drain(..close_pos + close_len);
+            self.in_think_tag = false;
+            if thinking.is_empty() {
+                None
+            } else {
+                Some(ThinkContentChunk {
+                    kind: ThinkContentKind::Thinking,
+                    content: thinking,
+                })
+            }
+        } else if let Some(last_bracket) = self.buffer.rfind('<') {
+            let potential = &self.buffer[last_bracket..];
+            if Self::CLOSE_TAG.starts_with(potential) && potential.len() < Self::CLOSE_TAG.len()
+                || Self::ALT_CLOSE_TAG.starts_with(potential)
+                    && potential.len() < Self::ALT_CLOSE_TAG.len()
+            {
+                let emit = self.buffer[..last_bracket].to_string();
+                self.buffer.drain(..last_bracket);
+                if emit.is_empty() {
+                    return None;
+                }
+                return Some(ThinkContentChunk {
+                    kind: ThinkContentKind::Thinking,
+                    content: emit,
+                });
+            }
+            self.flush_text_like(ThinkContentKind::Thinking)
+        } else {
+            self.flush_text_like(ThinkContentKind::Thinking)
+        }
+    }
+
+    fn flush_text_like(&mut self, kind: ThinkContentKind) -> Option<ThinkContentChunk> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        Some(ThinkContentChunk {
+            kind,
+            content: std::mem::take(&mut self.buffer),
+        })
+    }
+
+    fn flush(&mut self) -> Option<ThinkContentChunk> {
+        if self.buffer.is_empty() {
+            return None;
+        }
+        let kind = if self.in_think_tag {
+            ThinkContentKind::Thinking
+        } else {
+            ThinkContentKind::Text
+        };
+        self.in_think_tag = false;
+        Some(ThinkContentChunk {
+            kind,
+            content: std::mem::take(&mut self.buffer),
+        })
+    }
+}
+
+fn emit_text_segment(
+    emitted: &mut Vec<Bytes>,
+    next_index: &mut usize,
+    thinking_index: &mut Option<usize>,
+    text_index: &mut Option<usize>,
+    heuristic_tool_parser: &mut HeuristicToolParser,
+    segment: &str,
+) {
+    if segment.is_empty() {
+        return;
+    }
+    if let Some(index) = thinking_index.take() {
+        emitted.push(anthropic_content_block_stop(index));
+    }
+    let index = *text_index.get_or_insert_with(|| {
+        let index = *next_index;
+        *next_index += 1;
+        index
+    });
+    if matches!(*text_index, Some(current) if current == index) && index + 1 == *next_index {
+        emitted.push(anthropic_content_block_start(
+            index,
+            "text",
+            json!({"type":"text","text":""}),
+        ));
+    }
+    let (filtered_text, tool_calls) = heuristic_tool_parser.feed(segment);
+    if !filtered_text.is_empty() {
+        emitted.push(anthropic_content_block_delta(
+            index,
+            "text_delta",
+            &filtered_text,
+        ));
+    }
+    for heuristic_call in tool_calls {
+        emit_heuristic_tool_call(
+            emitted,
+            next_index,
+            thinking_index,
+            text_index,
+            heuristic_call,
+        );
+    }
+}
+
+fn emit_thinking_segment(
+    emitted: &mut Vec<Bytes>,
+    next_index: &mut usize,
+    thinking_index: &mut Option<usize>,
+    text_index: &mut Option<usize>,
+    segment: &str,
+) {
+    if segment.is_empty() {
+        return;
+    }
+    if let Some(index) = text_index.take() {
+        emitted.push(anthropic_content_block_stop(index));
+    }
+    let index = *thinking_index.get_or_insert_with(|| {
+        let index = *next_index;
+        *next_index += 1;
+        index
+    });
+    if matches!(*thinking_index, Some(current) if current == index) && index + 1 == *next_index {
+        emitted.push(anthropic_content_block_start(
+            index,
+            "thinking",
+            json!({"type":"thinking","thinking":""}),
+        ));
+    }
+    emitted.push(anthropic_content_block_delta(
+        index,
+        "thinking_delta",
+        segment,
+    ));
+}
+
+fn emit_thinking_signature(
+    emitted: &mut Vec<Bytes>,
+    next_index: &mut usize,
+    thinking_index: &mut Option<usize>,
+    text_index: &mut Option<usize>,
+    signature: &str,
+) {
+    if signature.is_empty() {
+        return;
+    }
+    if let Some(index) = text_index.take() {
+        emitted.push(anthropic_content_block_stop(index));
+    }
+    let index = *thinking_index.get_or_insert_with(|| {
+        let index = *next_index;
+        *next_index += 1;
+        index
+    });
+    if matches!(*thinking_index, Some(current) if current == index) && index + 1 == *next_index {
+        emitted.push(anthropic_content_block_start(
+            index,
+            "thinking",
+            json!({"type":"thinking","thinking":""}),
+        ));
+    }
+    emitted.push(anthropic_content_block_delta(
+        index,
+        "signature_delta",
+        signature,
+    ));
 }
 
 #[derive(Debug, Default)]

@@ -402,6 +402,43 @@ fn split_think_tagged_text(text: &str) -> Option<Vec<Value>> {
     Some(blocks)
 }
 
+fn push_anthropic_thinking_block(content: &mut Vec<Value>, block: &Value) {
+    match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+        "thinking" => {
+            let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or_default();
+            let signature = block.get("signature").and_then(Value::as_str).unwrap_or_default();
+            if thinking.trim().is_empty() && signature.trim().is_empty() {
+                return;
+            }
+            let mut item = json!({
+                "type": "thinking",
+                "thinking": thinking,
+            });
+            if !signature.trim().is_empty()
+                && let Some(obj) = item.as_object_mut()
+            {
+                obj.insert(
+                    "signature".to_string(),
+                    Value::String(signature.to_string()),
+                );
+            }
+            content.push(item);
+        }
+        "redacted_thinking" => {
+            let mut item = json!({
+                "type": "redacted_thinking",
+            });
+            if let Some(data) = block.get("data") {
+                if let Some(obj) = item.as_object_mut() {
+                    obj.insert("data".to_string(), data.clone());
+                }
+            }
+            content.push(item);
+        }
+        _ => {}
+    }
+}
+
 fn next_think_open(text: &str) -> Option<usize> {
     match (text.find("<think>"), text.find("<thinking>")) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -864,12 +901,31 @@ pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> 
         };
 
         if let Some(message) = choice.get("message") {
-            if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
+            if let Some(blocks) = message.get("thinking_blocks").and_then(Value::as_array) {
+                for block in blocks {
+                    push_anthropic_thinking_block(&mut content, block);
+                }
+            } else if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
                 && !reasoning.trim().is_empty()
             {
                 content.push(json!({
                     "type": "thinking",
                     "thinking": reasoning,
+                }));
+                if let Some(signature) = message.get("signature").and_then(Value::as_str)
+                    && !signature.trim().is_empty()
+                    && let Some(last) = content.last_mut()
+                    && let Some(obj) = last.as_object_mut()
+                {
+                    obj.insert("signature".to_string(), Value::String(signature.to_string()));
+                }
+            } else if let Some(signature) = message.get("signature").and_then(Value::as_str)
+                && !signature.trim().is_empty()
+            {
+                content.push(json!({
+                    "type": "thinking",
+                    "thinking": "",
+                    "signature": signature,
                 }));
             }
 
