@@ -39,6 +39,8 @@ pub(crate) struct ChatDelta {
     #[serde(default)]
     pub(crate) reasoning_content: Option<String>,
     #[serde(default)]
+    pub(crate) reasoning_details: Option<Value>,
+    #[serde(default)]
     pub(crate) tool_calls: Option<Vec<ChatToolCallDelta>>,
 }
 

@@ -230,7 +230,9 @@ fn anthropic_assistant_message_to_chat_message(
 
     match content {
         Some(Value::String(text)) => {
-            if !text.trim().is_empty() {
+            if split_think_tagged_text(text).is_some() {
+                // Split into blocks below.
+            } else if !text.trim().is_empty() {
                 content_parts.push(text.to_string());
             }
         }
@@ -283,6 +285,31 @@ fn anthropic_assistant_message_to_chat_message(
         None => {}
     }
 
+    if let Some(reconstructed) = content
+        .and_then(|value| value.as_str())
+        .and_then(split_think_tagged_text)
+    {
+        for block in reconstructed {
+            match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "text" => {
+                    if let Some(text) = block.get("text").and_then(Value::as_str)
+                        && !text.trim().is_empty()
+                    {
+                        content_parts.push(text.to_string());
+                    }
+                }
+                "thinking" => {
+                    if let Some(thinking) = block.get("thinking").and_then(Value::as_str)
+                        && !thinking.trim().is_empty()
+                    {
+                        reasoning_parts.push(thinking.to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     if content_parts.is_empty() && reasoning_parts.is_empty() && tool_calls.is_empty() {
         return None;
     }
@@ -315,6 +342,98 @@ fn anthropic_assistant_message_to_chat_message(
         }
     }
     Some(message)
+}
+
+fn split_think_tagged_text(text: &str) -> Option<Vec<Value>> {
+    if !text.contains("<think>")
+        && !text.contains("</think>")
+        && !text.contains("<thinking>")
+        && !text.contains("</thinking>")
+    {
+        return None;
+    }
+
+    let mut blocks = Vec::new();
+    let mut rest = text;
+
+    loop {
+        let open_pos = match next_think_open(rest) {
+            Some(pos) => pos,
+            None => {
+                if !rest.is_empty() {
+                    blocks.push(json!({
+                        "type": "text",
+                        "text": rest,
+                    }));
+                }
+                break;
+            }
+        };
+
+        let (prefix, after_open) = rest.split_at(open_pos);
+        if !prefix.is_empty() {
+            blocks.push(json!({
+                "type": "text",
+                "text": prefix,
+            }));
+        }
+
+        let after_open = &after_open[think_open_len(after_open)..];
+        let Some(close_pos) = next_think_close(after_open) else {
+            if !after_open.is_empty() {
+                blocks.push(json!({
+                    "type": "text",
+                    "text": after_open,
+                }));
+            }
+            break;
+        };
+
+        let (thinking, after_close) = after_open.split_at(close_pos);
+        if !thinking.is_empty() {
+            blocks.push(json!({
+                "type": "thinking",
+                "thinking": thinking,
+            }));
+        }
+        rest = &after_close[think_close_len(after_close)..];
+    }
+
+    Some(blocks)
+}
+
+fn next_think_open(text: &str) -> Option<usize> {
+    match (text.find("<think>"), text.find("<thinking>")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn think_open_len(text: &str) -> usize {
+    if text.starts_with("<thinking>") {
+        "<thinking>".len()
+    } else {
+        "<think>".len()
+    }
+}
+
+fn next_think_close(text: &str) -> Option<usize> {
+    match (text.find("</think>"), text.find("</thinking>")) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn think_close_len(text: &str) -> usize {
+    if text.starts_with("</thinking>") {
+        "</thinking>".len()
+    } else {
+        "</think>".len()
+    }
 }
 
 fn append_preserved_thinking_to_chat_content(content: &str, thinking: &str) -> String {
@@ -754,15 +873,45 @@ pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> 
                 }));
             }
 
-            let text = message
-                .get("content")
-                .map(function_output_to_text)
-                .unwrap_or_default();
-            if !text.trim().is_empty() {
-                content.push(json!({
-                    "type": "text",
-                    "text": text,
-                }));
+            if let Some(text) = message.get("content").and_then(Value::as_str) {
+                if let Some(segments) = split_think_tagged_text(text) {
+                    content.extend(segments);
+                } else if !text.trim().is_empty() {
+                    content.push(json!({
+                        "type": "text",
+                        "text": text,
+                    }));
+                }
+            } else {
+                let text = message
+                    .get("content")
+                    .map(function_output_to_text)
+                    .unwrap_or_default();
+                if let Some(segments) = split_think_tagged_text(&text) {
+                    content.extend(segments);
+                } else if !text.trim().is_empty() {
+                    content.push(json!({
+                        "type": "text",
+                        "text": text,
+                    }));
+                }
+            }
+
+            if let Some(details) = message.get("reasoning_details").and_then(Value::as_array) {
+                for text in details
+                    .iter()
+                    .filter_map(|item| {
+                        item.get("text")
+                            .and_then(Value::as_str)
+                            .or_else(|| item.get("content").and_then(Value::as_str))
+                    })
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    content.push(json!({
+                        "type": "thinking",
+                        "thinking": text,
+                    }));
+                }
             }
 
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {

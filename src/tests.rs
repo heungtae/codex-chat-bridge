@@ -738,6 +738,25 @@ fn chat_json_to_anthropic_json_maps_tool_calls() {
 }
 
 #[test]
+fn chat_json_to_anthropic_json_splits_think_tags_in_content() {
+    let input = json!({
+        "choices": [{
+            "message": {
+                "content": "before <think>internal</think> after"
+            }
+        }]
+    });
+
+    let out = chat_json_to_anthropic_json(input, "claude-bridge");
+    assert_eq!(out["content"][0]["type"], "text");
+    assert_eq!(out["content"][0]["text"], "before ");
+    assert_eq!(out["content"][1]["type"], "thinking");
+    assert_eq!(out["content"][1]["thinking"], "internal");
+    assert_eq!(out["content"][2]["type"], "text");
+    assert_eq!(out["content"][2]["text"], " after");
+}
+
+#[test]
 fn normalize_chat_tools_converts_custom_tool_to_function() {
     let tools = vec![json!({
         "type": "custom",
@@ -2476,4 +2495,128 @@ async fn stream_emits_reasoning_summary_events() {
     assert!(payload.contains("event: response.reasoning_summary_text.done"));
     assert!(payload.contains("\"text\":\"think step\""));
     assert!(!payload.contains("[reasoning_summary]"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_accepts_terminal_finish_reason_without_done_marker() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("event: message_start"));
+    assert!(payload.contains("event: content_block_start"));
+    assert!(payload.contains("event: content_block_delta"));
+    assert!(payload.contains("\"text\":\"Hi\""));
+    assert!(payload.contains("event: message_delta"));
+    assert!(payload.contains("event: message_stop"));
+    assert!(!payload.contains("event: error"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_splits_think_tags_in_content() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"before <think>internal</think> after\"}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"thinking_delta\""));
+    assert!(payload.contains("\"thinking\":\"internal\""));
+    assert!(payload.contains("\"type\":\"text_delta\""));
+    assert!(payload.contains("\"text\":\"before \""));
+    assert!(payload.contains("\"text\":\" after\""));
+}
+
+#[tokio::test]
+async fn stream_emits_thinking_from_reasoning_details() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"reasoning_details\":[{\"text\":\"step one\"}]}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"thinking\":\"step one\""));
+    assert!(payload.contains("event: message_stop"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"before ● <function=shell><parameter=cmd>pwd</parameter> after\"}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"name\":\"shell\""));
+    assert!(payload.contains("\"partial_json\":\"{\\\"cmd\\\":\\\"pwd\\\"}\""));
+    assert!(payload.contains("\"text\":\"before \""));
+    assert!(payload.contains("\"text\":\" after\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_handles_trailing_done_without_newline() {
+    let upstream = stream::iter(vec![
+        Ok::<Bytes, reqwest::Error>(Bytes::from(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"}}]}\n\n",
+        )),
+        Ok::<Bytes, reqwest::Error>(Bytes::from("data: [DONE]")),
+    ]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"text\":\"Hi\""));
+    assert!(payload.contains("event: message_stop"));
+    assert!(!payload.contains("event: error"));
 }
