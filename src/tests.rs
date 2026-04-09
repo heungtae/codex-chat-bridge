@@ -2544,6 +2544,7 @@ async fn anthropic_stream_handles_split_think_tags_across_chunks() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2571,6 +2572,7 @@ async fn anthropic_stream_preserves_signature_delta_from_thinking_blocks() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2597,6 +2599,7 @@ async fn anthropic_stream_preserves_redacted_thinking_blocks() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2619,6 +2622,7 @@ async fn anthropic_stream_accepts_terminal_finish_reason_without_done_marker() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2647,6 +2651,7 @@ async fn anthropic_stream_splits_think_tags_in_content() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2674,6 +2679,7 @@ async fn stream_emits_thinking_from_reasoning_details() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2690,7 +2696,7 @@ async fn stream_emits_thinking_from_reasoning_details() {
 #[tokio::test]
 async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"before ● <function=shell><parameter=cmd>pwd</parameter> after\"}}]}\n\n\
+        "data: {\"choices\":[{\"delta\":{\"content\":\"before shell(command='pwd') after\"}}]}\n\n\
              data: [DONE]\n\n",
     ))]);
     let mut output = Box::pin(translate_chat_stream_to_anthropic(
@@ -2698,6 +2704,7 @@ async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::from(["shell".to_string()]),
     ));
     let mut payload = String::new();
 
@@ -2707,7 +2714,7 @@ async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
 
     assert!(payload.contains("\"type\":\"tool_use\""));
     assert!(payload.contains("\"name\":\"shell\""));
-    assert!(payload.contains("\"partial_json\":\"{\\\"cmd\\\":\\\"pwd\\\"}\""));
+    assert!(payload.contains("\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\""));
     assert!(payload.contains("\"text\":\"before \""));
     assert!(payload.contains("\"text\":\" after\""));
 }
@@ -2723,6 +2730,7 @@ async fn anthropic_stream_strips_control_tokens_from_text_content() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2747,6 +2755,7 @@ async fn anthropic_stream_keeps_non_tool_thinking_trace_as_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2754,6 +2763,7 @@ async fn anthropic_stream_keeps_non_tool_thinking_trace_as_text() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
+    assert!(payload.contains("● <thinking"));
     assert!(payload.contains("Create next tasks."));
     assert!(payload.contains("Create remaining tasks similarly."));
     assert!(payload.contains("to=functions.TaskCreatejson"));
@@ -2781,6 +2791,7 @@ async fn anthropic_stream_keeps_split_non_tool_thinking_trace_as_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2788,9 +2799,59 @@ async fn anthropic_stream_keeps_split_non_tool_thinking_trace_as_text() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("Create next tasks. to=functions.TaskCreatejson"));
+    assert!(payload.contains("\"text\":\"● <thinking"));
+    assert!(payload.contains("Create next tasks."));
+    assert!(payload.contains("to=functions.TaskCreate"));
     assert!(!payload.contains("<|message|>"));
     assert!(!payload.contains("<|constrain|>"));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_parses_bare_python_style_ask_user_question() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"[AskUserQuestion(question=\\\"What's up?\\\", headers=['Hello!'], options=['A','B'], multiSelect=False, metadata={'priority': 1, 'active': True})]\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::from(["AskUserQuestion".to_string()]),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"name\":\"AskUserQuestion\""));
+    assert!(payload.contains("\"partial_json\":\"{\\\"headers\\\":[\\\"Hello!\\\"],\\\"metadata\\\":{\\\"active\\\":true,\\\"priority\\\":1},\\\"multiSelect\\\":false,\\\"options\\\":[\\\"A\\\",\\\"B\\\"],\\\"question\\\":\\\"What's up?\\\"}\""));
+    assert!(!payload.contains("\"type\":\"text_delta\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_keeps_unknown_bare_python_style_call_as_text() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"AskUserQuestion(question=\\\"What's up?\\\")\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::from(["OtherTool".to_string()]),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"text\":\"AskUserQuestion(question=\\\"What's up?\\\")\""));
     assert!(!payload.contains("\"type\":\"tool_use\""));
 }
 
@@ -2807,6 +2868,7 @@ async fn anthropic_stream_handles_trailing_done_without_newline() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2834,6 +2896,7 @@ async fn anthropic_stream_opens_text_block_only_once_across_multiple_deltas() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 
@@ -2861,6 +2924,7 @@ async fn anthropic_stream_opens_thinking_block_only_once_across_multiple_deltas(
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
+        HashSet::new(),
     ));
     let mut payload = String::new();
 

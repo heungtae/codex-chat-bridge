@@ -3,7 +3,7 @@ use async_stream::stream;
 use axum::body::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use tracing::{debug, warn};
 
 use crate::{
@@ -57,6 +57,7 @@ pub(crate) fn translate_chat_stream_to_anthropic<S>(
     router_name: String,
     verbose_logging: bool,
     model: String,
+    allowed_tool_names: HashSet<String>,
 ) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
 where
     S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
@@ -72,7 +73,7 @@ where
         let mut text_started = false;
         let mut tool_blocks: BTreeMap<usize, AnthropicToolBlockState> = BTreeMap::new();
         let mut think_parser = ThinkTagParser::default();
-        let mut heuristic_tool_parser = HeuristicToolParser::default();
+        let mut heuristic_tool_parser = HeuristicToolParser::new(allowed_tool_names);
         let mut saw_done_marker = false;
         let mut saw_terminal_finish_reason = false;
         let mut finish_reason = "end_turn".to_string();
@@ -393,45 +394,18 @@ where
             }
         }
 
-        let (heuristic_flush_text, heuristic_flush_calls) = heuristic_tool_parser.flush();
-        if !heuristic_flush_text.is_empty() {
-            if let Some(index) = thinking_index.take() {
-                yield Ok(anthropic_content_block_stop(index));
-                thinking_started = false;
-            }
-            let index = *text_index.get_or_insert_with(|| {
-                let index = next_index;
-                next_index += 1;
-                index
-            });
-            if !text_started {
-                yield Ok(anthropic_content_block_start(
-                    index,
-                    "text",
-                    json!({"type":"text","text":""}),
-                ));
-                text_started = true;
-            }
-            yield Ok(anthropic_content_block_delta(
-                index,
-                "text_delta",
-                &heuristic_flush_text,
-            ));
-        }
-        for heuristic_call in heuristic_flush_calls {
-            let mut emitted = Vec::new();
-            emit_heuristic_tool_call(
-                &mut emitted,
-                &mut next_index,
-                &mut thinking_index,
-                &mut thinking_started,
-                &mut text_index,
-                &mut text_started,
-                heuristic_call,
-            );
-            for event in emitted {
-                yield Ok(event);
-            }
+        let mut emitted = Vec::new();
+        emit_heuristic_fragments(
+            &mut emitted,
+            &mut next_index,
+            &mut thinking_index,
+            &mut thinking_started,
+            &mut text_index,
+            &mut text_started,
+            heuristic_tool_parser.flush(),
+        );
+        for event in emitted {
+            yield Ok(event);
         }
 
         if !saw_done_marker && !saw_terminal_finish_reason {
@@ -1246,40 +1220,63 @@ fn emit_text_segment(
         emitted.push(anthropic_content_block_stop(index));
         *thinking_started = false;
     }
-    let (filtered_text, tool_calls) = heuristic_tool_parser.feed(segment);
-    if filtered_text.is_empty() && tool_calls.is_empty() {
+    let fragments = heuristic_tool_parser.feed(segment);
+    if fragments.is_empty() {
         return;
     }
-    let index = *text_index.get_or_insert_with(|| {
-        let index = *next_index;
-        *next_index += 1;
-        index
-    });
-    if !*text_started {
-        emitted.push(anthropic_content_block_start(
-            index,
-            "text",
-            json!({"type":"text","text":""}),
-        ));
-        *text_started = true;
-    }
-    if !filtered_text.is_empty() {
-        emitted.push(anthropic_content_block_delta(
-            index,
-            "text_delta",
-            &filtered_text,
-        ));
-    }
-    for heuristic_call in tool_calls {
-        emit_heuristic_tool_call(
-            emitted,
-            next_index,
-            thinking_index,
-            thinking_started,
-            text_index,
-            text_started,
-            heuristic_call,
-        );
+    emit_heuristic_fragments(
+        emitted,
+        next_index,
+        thinking_index,
+        thinking_started,
+        text_index,
+        text_started,
+        fragments,
+    );
+}
+
+fn emit_heuristic_fragments(
+    emitted: &mut Vec<Bytes>,
+    next_index: &mut usize,
+    thinking_index: &mut Option<usize>,
+    thinking_started: &mut bool,
+    text_index: &mut Option<usize>,
+    text_started: &mut bool,
+    fragments: Vec<HeuristicFragment>,
+) {
+    for fragment in fragments {
+        match fragment {
+            HeuristicFragment::Text(text) => {
+                if text.is_empty() {
+                    continue;
+                }
+                let index = *text_index.get_or_insert_with(|| {
+                    let index = *next_index;
+                    *next_index += 1;
+                    index
+                });
+                if !*text_started {
+                    emitted.push(anthropic_content_block_start(
+                        index,
+                        "text",
+                        json!({"type":"text","text":""}),
+                    ));
+                    *text_started = true;
+                }
+                emitted.push(anthropic_content_block_delta(index, "text_delta", &text));
+            }
+            HeuristicFragment::ToolCall(call) => {
+                emit_heuristic_tool_call(
+                    emitted,
+                    next_index,
+                    thinking_index,
+                    thinking_started,
+                    text_index,
+                    text_started,
+                    call,
+                );
+            }
+        }
     }
 }
 
@@ -1355,21 +1352,9 @@ fn emit_thinking_signature(
     ));
 }
 
-#[derive(Debug, Default)]
 struct HeuristicToolParser {
-    state: HeuristicToolParserState,
     buffer: String,
-    current_tool_id: Option<String>,
-    current_function_name: Option<String>,
-    current_parameters: BTreeMap<String, String>,
-}
-
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum HeuristicToolParserState {
-    #[default]
-    Text,
-    MatchingFunction,
-    ParsingParameters,
+    allowed_tool_names: HashSet<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1379,110 +1364,103 @@ struct HeuristicToolCall {
     input: Value,
 }
 
+enum HeuristicFragment {
+    Text(String),
+    ToolCall(HeuristicToolCall),
+}
+
 impl HeuristicToolParser {
     const CONTROL_TOKEN_START: &'static str = "<|";
     const CONTROL_TOKEN_END: &'static str = "|>";
 
-    fn feed(&mut self, text: &str) -> (String, Vec<HeuristicToolCall>) {
-        self.buffer.push_str(text);
-        self.strip_control_tokens();
-        let mut emitted_text = String::new();
-        let mut detected = Vec::new();
-
-        loop {
-            match self.state {
-                HeuristicToolParserState::Text => {
-                    let Some(bullet_pos) = self.buffer.find('●') else {
-                        if let Some(safe_prefix) = self.split_incomplete_control_token_tail() {
-                            emitted_text.push_str(&safe_prefix);
-                            break;
-                        }
-                        emitted_text.push_str(&self.buffer);
-                        self.buffer.clear();
-                        break;
-                    };
-
-                    emitted_text.push_str(&self.buffer[..bullet_pos]);
-                    self.buffer.drain(..bullet_pos);
-                    self.state = HeuristicToolParserState::MatchingFunction;
-                }
-                HeuristicToolParserState::MatchingFunction => {
-                    if let Some(function_name) = self.try_match_function_start() {
-                        self.current_tool_id =
-                            Some(format!("toolu_heuristic_{}", uuid::Uuid::now_v7()));
-                        self.current_function_name = Some(function_name);
-                        self.current_parameters.clear();
-                        self.state = HeuristicToolParserState::ParsingParameters;
-                        continue;
-                    }
-
-                    if self.buffer.len() > 100 {
-                        if let Some(first_char) = self.buffer.chars().next() {
-                            emitted_text.push(first_char);
-                            self.buffer.drain(..first_char.len_utf8());
-                            self.state = HeuristicToolParserState::Text;
-                        }
-                        continue;
-                    }
-                    break;
-                }
-                HeuristicToolParserState::ParsingParameters => {
-                    self.consume_complete_parameters(&mut emitted_text);
-
-                    if self.current_function_name.is_none() {
-                        break;
-                    }
-
-                    let finished_tool_call = if self.buffer.find('●').is_some() {
-                        true
-                    } else if !self.buffer.is_empty() && !self.buffer.trim_start().starts_with('<')
-                    {
-                        if !self.buffer.contains("<parameter=") {
-                            true
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
-
-                    if finished_tool_call {
-                        detected.push(self.finish_tool_call());
-                        self.state = HeuristicToolParserState::Text;
-                        break;
-                    }
-
-                    break;
-                }
-            }
+    fn new(allowed_tool_names: HashSet<String>) -> Self {
+        Self {
+            buffer: String::new(),
+            allowed_tool_names,
         }
-
-        (emitted_text, detected)
     }
 
-    fn flush(&mut self) -> (String, Vec<HeuristicToolCall>) {
+    fn feed(&mut self, text: &str) -> Vec<HeuristicFragment> {
+        self.buffer.push_str(text);
         self.strip_control_tokens();
-        let mut emitted_text = String::new();
-        let mut detected = Vec::new();
-        match self.state {
-            HeuristicToolParserState::Text => {
-                emitted_text.push_str(&self.buffer);
+        let mut emitted = Vec::new();
+
+        loop {
+            if self.buffer.is_empty() {
+                break;
             }
-            HeuristicToolParserState::MatchingFunction => {
-                emitted_text.push_str(&self.buffer);
-            }
-            HeuristicToolParserState::ParsingParameters => {
-                if self.current_function_name.is_some() {
-                    self.consume_partial_parameters();
-                    detected.push(self.finish_tool_call());
-                } else {
-                    emitted_text.push_str(&self.buffer);
+
+            if let Some(candidate_pos) = self.find_candidate_start() {
+                if candidate_pos > 0 {
+                    let prefix = self.buffer[..candidate_pos].to_string();
+                    if !prefix.is_empty() {
+                        emitted.push(HeuristicFragment::Text(prefix));
+                    }
+                    self.buffer.drain(..candidate_pos);
+                    continue;
                 }
+
+                if let Some((calls, consumed)) =
+                    try_parse_python_tool_call_prefix(&self.buffer, &self.allowed_tool_names)
+                {
+                    emitted.extend(calls.into_iter().map(HeuristicFragment::ToolCall));
+                    self.buffer.drain(..consumed);
+                    continue;
+                }
+
+                if self.looks_like_bare_tool_prefix() {
+                    break;
+                }
+            } else {
+                if self.looks_like_bare_tool_prefix() {
+                    break;
+                }
+                if !self.buffer.is_empty() {
+                    emitted.push(HeuristicFragment::Text(std::mem::take(&mut self.buffer)));
+                }
+                break;
+            }
+
+            if let Some(first_char) = self.buffer.chars().next() {
+                emitted.push(HeuristicFragment::Text(first_char.to_string()));
+                self.buffer.drain(..first_char.len_utf8());
             }
         }
-        self.buffer.clear();
-        self.state = HeuristicToolParserState::Text;
-        (emitted_text, detected)
+
+        emitted
+    }
+
+    fn flush(&mut self) -> Vec<HeuristicFragment> {
+        self.strip_control_tokens();
+        let mut emitted = Vec::new();
+
+        while !self.buffer.is_empty() {
+            if let Some(candidate_pos) = self.find_candidate_start() {
+                if candidate_pos > 0 {
+                    let prefix = self.buffer[..candidate_pos].to_string();
+                    if !prefix.is_empty() {
+                        emitted.push(HeuristicFragment::Text(prefix));
+                    }
+                    self.buffer.drain(..candidate_pos);
+                    continue;
+                }
+
+                if let Some((calls, consumed)) =
+                    try_parse_python_tool_call_prefix(&self.buffer, &self.allowed_tool_names)
+                {
+                    emitted.extend(calls.into_iter().map(HeuristicFragment::ToolCall));
+                    self.buffer.drain(..consumed);
+                    continue;
+                }
+            }
+
+            if let Some(first_char) = self.buffer.chars().next() {
+                emitted.push(HeuristicFragment::Text(first_char.to_string()));
+                self.buffer.drain(..first_char.len_utf8());
+            }
+        }
+
+        emitted
     }
 
     fn strip_control_tokens(&mut self) {
@@ -1514,107 +1492,395 @@ impl HeuristicToolParser {
         self.buffer = output;
     }
 
-    fn split_incomplete_control_token_tail(&mut self) -> Option<String> {
-        let start = self.buffer.rfind(Self::CONTROL_TOKEN_START)?;
-        if self.buffer[start..].contains(Self::CONTROL_TOKEN_END) {
-            return None;
+    fn find_candidate_start(&self) -> Option<usize> {
+        let mut candidate = None;
+        candidate = min_option(candidate, self.find_wrapped_python_call_start());
+
+        for name in &self.allowed_tool_names {
+            if let Some(pos) = find_function_name_start(&self.buffer, name) {
+                candidate = min_option(candidate, Some(pos));
+            }
         }
-        let prefix = self.buffer[..start].to_string();
-        self.buffer.drain(..start);
-        Some(prefix)
+
+        candidate
     }
 
-    fn try_match_function_start(&mut self) -> Option<String> {
-        if !self.buffer.starts_with('●') {
-            return None;
+    fn find_wrapped_python_call_start(&self) -> Option<usize> {
+        let mut start = 0;
+        while let Some(idx) = self.buffer[start..].find('[') {
+            let pos = start + idx;
+            let inner = self.buffer[pos + 1..].trim_start_matches(char::is_whitespace);
+            if self
+                .allowed_tool_names
+                .iter()
+                .any(|name| inner.starts_with(&format!("{name}(")))
+            {
+                return Some(pos);
+            }
+            start = pos + 1;
         }
-
-        let bullet_len = '●'.len_utf8();
-        let after_bullet = &self.buffer[bullet_len..];
-        let whitespace_len = after_bullet.len() - after_bullet.trim_start_matches(char::is_whitespace).len();
-        let trimmed_start = bullet_len + whitespace_len;
-        let trimmed = &self.buffer[trimmed_start..];
-        if !trimmed.starts_with("<function=") {
-            return None;
-        }
-
-        let close_pos = trimmed.find('>')?;
-        if close_pos <= "<function=".len() {
-            return None;
-        }
-
-        let name = trimmed["<function=".len()..close_pos].trim().to_string();
-        if name.is_empty() {
-            return None;
-        }
-
-        let consumed = trimmed_start + close_pos + 1;
-        self.buffer.drain(..consumed);
-        Some(name)
+        None
     }
 
-    fn consume_complete_parameters(&mut self, emitted_text: &mut String) {
-        while let Some(param_start) = self.buffer.find("<parameter=") {
-            if param_start > 0 {
-                emitted_text.push_str(&self.buffer[..param_start]);
-                self.buffer.drain(..param_start);
-            }
+    fn looks_like_bare_tool_prefix(&self) -> bool {
+        let trimmed = self.buffer.trim_start_matches(char::is_whitespace);
 
-            let Some(param_close) = self.buffer.find('>') else {
-                break;
-            };
-            if param_close <= "<parameter=".len() {
-                break;
-            }
-            let key = self.buffer["<parameter=".len()..param_close].trim();
-            if key.is_empty() {
-                break;
-            }
-
-            let end_tag = "</parameter>";
-            let Some(param_end) = self.buffer[param_close + 1..].find(end_tag) else {
-                break;
-            };
-
-            let value_start = param_close + 1;
-            let value_end = value_start + param_end;
-            let value = self.buffer[value_start..value_end].trim().to_string();
-            self.current_parameters.insert(key.to_string(), value);
-            self.buffer.drain(..value_end + end_tag.len());
+        if trimmed.starts_with('[') {
+            let inner = trimmed[1..].trim_start_matches(char::is_whitespace);
+            return self
+                .allowed_tool_names
+                .iter()
+                .any(|name| inner.starts_with(&format!("{name}(")));
         }
+
+        self.allowed_tool_names
+            .iter()
+            .any(|name| trimmed.starts_with(&format!("{name}(")))
+    }
+}
+
+fn min_option(current: Option<usize>, candidate: Option<usize>) -> Option<usize> {
+    match (current, candidate) {
+        (Some(a), Some(b)) => Some(a.min(b)),
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+fn find_function_name_start(text: &str, name: &str) -> Option<usize> {
+    let pattern = format!("{name}(");
+    let mut start = 0;
+    while let Some(idx) = text[start..].find(&pattern) {
+        let pos = start + idx;
+        let before = text[..pos].chars().next_back();
+        if before.is_none_or(|ch| ch.is_whitespace() || ch == '[' || ch == ',' || ch == '(') {
+            return Some(pos);
+        }
+        start = pos + 1;
+    }
+    None
+}
+
+fn try_parse_python_tool_call_prefix(
+    text: &str,
+    allowed_tool_names: &HashSet<String>,
+) -> Option<(Vec<HeuristicToolCall>, usize)> {
+    let trimmed = text.trim_start_matches(char::is_whitespace);
+    let consumed_prefix = text.len() - trimmed.len();
+    let (calls, consumed) = parse_python_tool_calls_prefix(trimmed, allowed_tool_names)?;
+    let heuristic_calls = calls
+        .into_iter()
+        .map(|(name, input)| HeuristicToolCall {
+            id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
+            name,
+            input,
+        })
+        .collect();
+    Some((heuristic_calls, consumed_prefix + consumed))
+}
+
+fn parse_python_tool_calls_prefix(
+    content: &str,
+    allowed_tool_names: &HashSet<String>,
+) -> Option<(Vec<(String, Value)>, usize)> {
+    let original = content;
+    let trimmed = content.trim_start_matches(char::is_whitespace);
+    let leading_ws = original.len() - trimmed.len();
+    let mut content = trimmed;
+    let mut consumed = 0;
+    let mut wrapped = false;
+
+    if content.starts_with('[') {
+        wrapped = true;
+        content = &content[1..];
+        consumed += 1;
     }
 
-    fn consume_partial_parameters(&mut self) {
-        while let Some(param_start) = self.buffer.find("<parameter=") {
-            let tail = &self.buffer[param_start..];
-            let Some(param_close) = tail.find('>') else {
-                break;
-            };
-            if param_close <= "<parameter=".len() {
+    let mut calls = Vec::new();
+    let mut remaining = content;
+
+    loop {
+        remaining = remaining.trim_start_matches(char::is_whitespace);
+        if wrapped && remaining.starts_with(']') {
+            consumed += 1;
+            break;
+        }
+        if remaining.is_empty() {
+            break;
+        }
+        if remaining.starts_with(',') {
+            remaining = remaining[1..].trim_start_matches(char::is_whitespace);
+            consumed += 1;
+            if remaining.is_empty() {
                 break;
             }
-            let key = tail["<parameter=".len()..param_close].trim();
-            if key.is_empty() {
-                break;
-            }
-            let value = tail[param_close + 1..].trim().to_string();
-            self.current_parameters.insert(key.to_string(), value);
+        }
+
+        let paren_idx = remaining.find('(')?;
+        let func_name = remaining[..paren_idx].trim();
+        if func_name.is_empty() {
+            return None;
+        }
+        if !allowed_tool_names.is_empty() && !allowed_tool_names.contains(func_name) {
+            return None;
+        }
+
+        let close_idx = find_matching_paren(remaining, paren_idx)?;
+        let args_str = &remaining[paren_idx + 1..close_idx];
+        let arguments = parse_python_args(args_str)?;
+        let json_map = arguments.into_iter().collect::<serde_json::Map<String, Value>>();
+        calls.push((func_name.to_string(), Value::Object(json_map)));
+
+        consumed += remaining[..close_idx + 1].len();
+        remaining = &remaining[close_idx + 1..];
+
+        if !wrapped {
             break;
         }
     }
 
-    fn finish_tool_call(&mut self) -> HeuristicToolCall {
-        HeuristicToolCall {
-            id: self.current_tool_id.take().unwrap_or_else(|| {
-                format!("toolu_heuristic_{}", uuid::Uuid::now_v7())
-            }),
-            name: self
-                .current_function_name
-                .take()
-                .unwrap_or_else(|| "unknown_function".to_string()),
-            input: serde_json::to_value(&self.current_parameters).unwrap_or_else(|_| json!({})),
+    if calls.is_empty() {
+        return None;
+    }
+
+    Some((calls, leading_ws + consumed))
+}
+
+fn find_matching_paren(s: &str, open_idx: usize) -> Option<usize> {
+    let mut depth = 1;
+    let mut i = open_idx + 1;
+    let bytes = s.as_bytes();
+    while i < s.len() && depth > 0 {
+        match bytes[i] as char {
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+            '\'' | '"' => {
+                let quote = bytes[i] as char;
+                i += 1;
+                while i < s.len() {
+                    let ch = bytes[i] as char;
+                    if ch == '\\' && i + 1 < s.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if ch == quote {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+fn parse_python_args(args: &str) -> Option<BTreeMap<String, Value>> {
+    let mut out = BTreeMap::new();
+    let bytes = args.as_bytes();
+    let mut i = 0;
+    while i < args.len() {
+        while i < args.len() && ((bytes[i] as char) == ',' || (bytes[i] as char).is_whitespace()) {
+            i += 1;
+        }
+        if i >= args.len() {
+            break;
+        }
+        let key_start = i;
+        while i < args.len() && (bytes[i] as char) != '=' && (bytes[i] as char) != ',' {
+            i += 1;
+        }
+        if i >= args.len() || (bytes[i] as char) != '=' {
+            return None;
+        }
+        let key = args[key_start..i].trim();
+        if key.is_empty() {
+            return None;
+        }
+        i += 1;
+        while i < args.len() && (bytes[i] as char).is_whitespace() {
+            i += 1;
+        }
+        let (value, next) = parse_python_arg_value(args, i)?;
+        out.insert(key.to_string(), value);
+        i = next;
+        if i < args.len() && (bytes[i] as char) == ',' {
+            i += 1;
         }
     }
+    Some(out)
+}
+
+fn parse_python_arg_value(s: &str, mut i: usize) -> Option<(Value, usize)> {
+    if i >= s.len() {
+        return None;
+    }
+    let bytes = s.as_bytes();
+    let current = bytes[i] as char;
+    if current == '\'' || current == '"' {
+        let quote = current;
+        i += 1;
+        let start = i;
+        while i < s.len() {
+            let ch = bytes[i] as char;
+            if ch == '\\' && i + 1 < s.len() {
+                i += 2;
+                continue;
+            }
+            if ch == quote {
+                return Some((Value::String(s[start..i].to_string()), i + 1));
+            }
+            i += 1;
+        }
+        return None;
+    }
+
+    let start = i;
+    let mut depth_paren = 0;
+    let mut depth_square = 0;
+    let mut depth_curly = 0;
+    let mut in_string = false;
+    let mut quote = '\0';
+    let mut escaped = false;
+
+    while i < s.len() {
+        let ch = bytes[i] as char;
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == quote {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                in_string = true;
+                quote = ch;
+            }
+            '(' => depth_paren += 1,
+            ')' => {
+                if depth_paren > 0 {
+                    depth_paren -= 1;
+                }
+            }
+            '[' => depth_square += 1,
+            ']' => {
+                if depth_square > 0 {
+                    depth_square -= 1;
+                }
+            }
+            '{' => depth_curly += 1,
+            '}' => {
+                if depth_curly > 0 {
+                    depth_curly -= 1;
+                }
+            }
+            ',' if depth_paren == 0 && depth_square == 0 && depth_curly == 0 => {
+                let token = s[start..i].trim();
+                return parse_python_literal(token).map(|value| (value, i));
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+
+    let token = s[start..i].trim();
+    parse_python_literal(token).map(|value| (value, i))
+}
+
+fn parse_python_literal(token: &str) -> Option<Value> {
+    match token {
+        "" => return Some(Value::String(String::new())),
+        "true" | "True" => return Some(Value::Bool(true)),
+        "false" | "False" => return Some(Value::Bool(false)),
+        "null" | "None" => return Some(Value::Null),
+        _ => {}
+    }
+
+    if let Ok(v) = token.parse::<i64>() {
+        return Some(json!(v));
+    }
+    if let Ok(v) = token.parse::<f64>() {
+        return Some(json!(v));
+    }
+
+    if token.starts_with('[') || token.starts_with('{') {
+        if let Ok(value) = serde_json::from_str::<Value>(token) {
+            return Some(value);
+        }
+        if let Some(converted) = python_literal_to_json(token)
+            && let Ok(value) = serde_json::from_str::<Value>(&converted)
+        {
+            return Some(value);
+        }
+    }
+
+    Some(Value::String(token.to_string()))
+}
+
+fn python_literal_to_json(s: &str) -> Option<String> {
+    let mut out = String::with_capacity(s.len() + s.len() / 8);
+    let mut in_string = false;
+    let mut quote = '\0';
+    let mut escaped = false;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let ch = chars[i];
+        if in_string {
+            if escaped {
+                out.push(ch);
+                escaped = false;
+            } else if ch == '\\' {
+                out.push(ch);
+                escaped = true;
+            } else if ch == quote {
+                out.push('"');
+                in_string = false;
+            } else {
+                out.push(ch);
+            }
+            i += 1;
+            continue;
+        }
+
+        match ch {
+            '\'' | '"' => {
+                in_string = true;
+                quote = ch;
+                out.push('"');
+            }
+            'T' if chars[i..].starts_with(&['T', 'r', 'u', 'e']) => {
+                out.push_str("true");
+                i += 3;
+            }
+            'F' if chars[i..].starts_with(&['F', 'a', 'l', 's', 'e']) => {
+                out.push_str("false");
+                i += 4;
+            }
+            'N' if chars[i..].starts_with(&['N', 'o', 'n', 'e']) => {
+                out.push_str("null");
+                i += 3;
+            }
+            _ => out.push(ch),
+        }
+        i += 1;
+    }
+
+    Some(out)
 }
 
 fn emit_heuristic_tool_call(

@@ -19,6 +19,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Write;
@@ -694,6 +695,7 @@ async fn finalize_upstream_response(
     wants_stream: bool,
     response_id: String,
     tool_call_kinds_by_name: HashMap<String, ResponsesToolCallKind>,
+    allowed_tool_names: HashSet<String>,
     verbose_logging: bool,
 ) -> Response {
     if !upstream_response.status().is_success() {
@@ -746,6 +748,7 @@ async fn finalize_upstream_response(
                         route_target.router_name.clone(),
                         verbose_logging,
                         model,
+                        allowed_tool_names,
                     ))
                 } else {
                     Body::from_stream(translate_chat_stream(
@@ -821,6 +824,27 @@ async fn finalize_upstream_response(
     };
 
     json_success_response(response_json)
+}
+
+fn extract_allowed_tool_names(payload: &Value) -> HashSet<String> {
+    payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|tool| {
+            tool.get("function")
+                .and_then(Value::as_object)
+                .and_then(|function| function.get("name"))
+                .and_then(Value::as_str)
+                .map(ToString::to_string)
+                .or_else(|| {
+                    tool.get("name")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+        })
+        .collect()
 }
 
 pub(crate) async fn handle_incoming(
@@ -980,6 +1004,7 @@ pub(crate) async fn handle_incoming(
         wants_stream,
         response_id,
         tool_call_kinds_by_name,
+        extract_allowed_tool_names(&upstream_payload),
         verbose_logging,
     )
     .await
