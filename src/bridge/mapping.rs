@@ -290,7 +290,11 @@ fn anthropic_assistant_message_to_chat_message(
         .and_then(split_think_tagged_text)
     {
         for block in reconstructed {
-            match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+            match block
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
                 "text" => {
                     if let Some(text) = block.get("text").and_then(Value::as_str)
                         && !text.trim().is_empty()
@@ -403,10 +407,20 @@ fn split_think_tagged_text(text: &str) -> Option<Vec<Value>> {
 }
 
 fn push_anthropic_thinking_block(content: &mut Vec<Value>, block: &Value) {
-    match block.get("type").and_then(Value::as_str).unwrap_or_default() {
+    match block
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+    {
         "thinking" => {
-            let thinking = block.get("thinking").and_then(Value::as_str).unwrap_or_default();
-            let signature = block.get("signature").and_then(Value::as_str).unwrap_or_default();
+            let thinking = block
+                .get("thinking")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            let signature = block
+                .get("signature")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if thinking.trim().is_empty() && signature.trim().is_empty() {
                 return;
             }
@@ -917,7 +931,10 @@ pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> 
                     && let Some(last) = content.last_mut()
                     && let Some(obj) = last.as_object_mut()
                 {
-                    obj.insert("signature".to_string(), Value::String(signature.to_string()));
+                    obj.insert(
+                        "signature".to_string(),
+                        Value::String(signature.to_string()),
+                    );
                 }
             } else if let Some(signature) = message.get("signature").and_then(Value::as_str)
                 && !signature.trim().is_empty()

@@ -1092,7 +1092,8 @@ impl ThinkTagParser {
             && think_start.map_or(true, |start| close_pos < start)
         {
             let prefix = self.buffer[..close_pos].to_string();
-            self.buffer.drain(..close_pos + think_close_len(&self.buffer[close_pos..]));
+            self.buffer
+                .drain(..close_pos + think_close_len(&self.buffer[close_pos..]));
             if prefix.is_empty() {
                 return None;
             }
@@ -1629,7 +1630,9 @@ fn parse_python_tool_calls_prefix(
         let close_idx = find_matching_paren(remaining, paren_idx)?;
         let args_str = &remaining[paren_idx + 1..close_idx];
         let arguments = parse_python_args(args_str)?;
-        let json_map = arguments.into_iter().collect::<serde_json::Map<String, Value>>();
+        let json_map = arguments
+            .into_iter()
+            .collect::<serde_json::Map<String, Value>>();
         calls.push((func_name.to_string(), Value::Object(json_map)));
 
         consumed += remaining[..close_idx + 1].len();

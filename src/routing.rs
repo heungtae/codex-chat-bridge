@@ -337,9 +337,11 @@ impl RouterManager {
         host_header: Option<&str>,
     ) -> Result<Option<RouteTarget>> {
         let normalized_path = normalize_request_path(path);
-        if let Some(authority) = host_header.and_then(normalize_host_header_to_authority) {
+        let normalized_authority = host_header.and_then(normalize_host_header_to_authority);
+
+        if let Some(authority) = normalized_authority.as_ref() {
             let key = IncomingRouteKey {
-                authority: Some(authority),
+                authority: Some(authority.clone()),
                 path: normalized_path.clone(),
             };
             if let Some(router_name) = self.incoming_route_to_router.get(&key) {
@@ -349,12 +351,49 @@ impl RouterManager {
 
         let key = IncomingRouteKey {
             authority: None,
-            path: normalized_path,
+            path: normalized_path.clone(),
         };
-        let Some(router_name) = self.incoming_route_to_router.get(&key) else {
-            return Ok(None);
-        };
-        self.resolve_target_for_router_name(router_name).map(Some)
+        if let Some(router_name) = self.incoming_route_to_router.get(&key) {
+            return self.resolve_target_for_router_name(router_name).map(Some);
+        }
+
+        if let Some(router_name) =
+            self.find_longest_prefix_route(normalized_authority.as_ref(), &normalized_path)
+        {
+            return self.resolve_target_for_router_name(router_name).map(Some);
+        }
+
+        if let Some(router_name) = self.find_longest_prefix_route(None, &normalized_path) {
+            return self.resolve_target_for_router_name(router_name).map(Some);
+        }
+
+        Ok(None)
+    }
+
+    fn find_longest_prefix_route(
+        &self,
+        authority: Option<&String>,
+        request_path: &str,
+    ) -> Option<&str> {
+        let mut best_router_name = None;
+        let mut best_path_len = 0usize;
+
+        for (route_key, router_name) in &self.incoming_route_to_router {
+            if route_key.authority.as_ref() != authority {
+                continue;
+            }
+            if !route_path_matches_prefix(request_path, &route_key.path) {
+                continue;
+            }
+
+            let route_len = route_key.path.len();
+            if route_len > best_path_len {
+                best_path_len = route_len;
+                best_router_name = Some(router_name.as_str());
+            }
+        }
+
+        best_router_name
     }
 
     fn resolve_target_for_router_name(&self, name: &str) -> Result<RouteTarget> {
@@ -479,6 +518,20 @@ fn describe_route_key(key: &IncomingRouteKey) -> String {
         Some(authority) => format!("http://{}{}", authority, key.path),
         None => key.path.clone(),
     }
+}
+
+fn route_path_matches_prefix(request_path: &str, route_path: &str) -> bool {
+    if request_path == route_path {
+        return true;
+    }
+    if !request_path.starts_with(route_path) {
+        return false;
+    }
+
+    request_path
+        .as_bytes()
+        .get(route_path.len())
+        .is_some_and(|next| *next == b'/')
 }
 
 fn parse_incoming_url(raw: &str) -> Result<ParsedIncomingUrl> {

@@ -229,7 +229,7 @@ To switch routes, change `model_provider` to another bridge provider name.
 
 ## Claude Code Guide
 
-Claude Code uses Anthropic `POST /v1/messages`. If you set:
+Claude Code uses Anthropic `POST /v1/messages` and also calls subpaths such as `POST /v1/messages/count_tokens`. If you set:
 
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8787/claude
@@ -241,7 +241,7 @@ Claude Code will call:
 http://127.0.0.1:8787/claude/v1/messages
 ```
 
-So the router `incoming_url` must include that exact final path:
+So the router `incoming_url` should point at the base Claude messages path:
 
 ```toml
 [routers.claude]
@@ -256,11 +256,13 @@ upstream_wire = "chat"
 ```
 
 Important points:
-- Do not set `incoming_url` to only `http://127.0.0.1:8787/claude` or `.../v1`.
+- Do not set `incoming_url` to only `http://127.0.0.1:8787/claude` or `.../v1`; use the Claude messages base path instead.
+- `incoming_url` matches exact paths first, then the longest matching path prefix, so `/claude/v1/messages/count_tokens` is routed to the same Claude router as `/claude/v1/messages`.
 - For Claude Code streaming, use `upstream_wire = "chat"`.
 - If your upstream rejects Claude-native model names, set `upstream_model` or the Claude-family-specific overrides on the router to provider-valid model IDs.
 - Enable `anthropic_preserve_thinking` when the upstream model benefits from seeing prior Claude thinking blocks inside assistant content.
 - Enable `anthropic_enable_openrouter_reasoning` when routing Anthropic requests with `thinking` enabled to OpenRouter chat models that expect `reasoning.enabled`.
+- `POST /v1/messages/count_tokens` is answered locally with a best-effort `input_tokens` estimate instead of being forwarded upstream.
 - Anthropic `/v1/messages` to upstream `responses` streaming is not supported yet.
 
 Example:

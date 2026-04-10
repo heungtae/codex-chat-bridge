@@ -1458,6 +1458,51 @@ fn router_manager_routes_by_incoming_url_path() {
 }
 
 #[test]
+fn router_manager_routes_prefix_paths_to_the_best_match() {
+    let mut routers = BTreeMap::new();
+    routers.insert(
+        "claude_root".to_string(),
+        RouterConfig {
+            incoming_url: Some("http://localhost:8080/claude".to_string()),
+            upstream_url: Some("http://upstream.local/v1/chat/completions".to_string()),
+            ..Default::default()
+        },
+    );
+    routers.insert(
+        "claude_messages".to_string(),
+        RouterConfig {
+            incoming_url: Some("http://localhost:8080/claude/v1/messages".to_string()),
+            upstream_url: Some("http://upstream.local/v1/chat/completions".to_string()),
+            ..Default::default()
+        },
+    );
+
+    let manager = RouterManager::new(
+        routers,
+        "https://api.openai.com/v1/chat/completions".to_string(),
+        WireApi::Chat,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        FeatureFlags::default(),
+    )
+    .expect("manager");
+
+    let exact_target = manager
+        .get_target_for_incoming_route("/claude/v1/messages", Some("localhost:8080"))
+        .expect("route lookup")
+        .expect("target");
+    assert_eq!(exact_target.router_name, "claude_messages");
+
+    let prefix_target = manager
+        .get_target_for_incoming_route("/claude/v1/messages/count_tokens", Some("localhost:8080"))
+        .expect("route lookup")
+        .expect("target");
+    assert_eq!(prefix_target.router_name, "claude_messages");
+}
+
+#[test]
 fn router_snapshot_marks_registered_route_as_active() {
     let mut routers = BTreeMap::new();
     routers.insert(
@@ -1765,6 +1810,9 @@ fn anthropic_request_enables_thinking_detects_enabled_payloads() {
         "thinking": {"type": "enabled", "budget_tokens": 2048}
     })));
     assert!(anthropic_request_enables_thinking(&json!({
+        "thinking": {"type": "adaptive", "budget_tokens": 2048}
+    })));
+    assert!(anthropic_request_enables_thinking(&json!({
         "thinking": {"enabled": true}
     })));
     assert!(anthropic_request_enables_thinking(&json!({
@@ -1781,6 +1829,32 @@ fn anthropic_request_enables_thinking_rejects_disabled_payloads() {
         "thinking": {"enabled": false}
     })));
     assert!(!anthropic_request_enables_thinking(&json!({})));
+}
+
+#[test]
+fn estimate_anthropic_count_tokens_ignores_assistant_thinking_blocks() {
+    let base = json!({
+        "messages": [
+            {"role": "assistant", "content": []},
+            {"role": "user", "content": "hello there"}
+        ]
+    });
+    let with_thinking = json!({
+        "messages": [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "internal chain"}
+                ]
+            },
+            {"role": "user", "content": "hello there"}
+        ]
+    });
+
+    assert_eq!(
+        estimate_anthropic_count_tokens(&base),
+        estimate_anthropic_count_tokens(&with_thinking)
+    );
 }
 
 #[test]
@@ -2406,6 +2480,39 @@ async fn direct_anthropic_endpoint_routes_using_request_path() {
 
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "upstream_transport_error");
+}
+
+#[tokio::test]
+async fn anthropic_count_tokens_is_handled_locally_for_subpaths() {
+    let app = build_app(test_state_with_router(
+        "http://127.0.0.1:8787/claude/v1/messages",
+        "http://127.0.0.1:9/v1/chat/completions",
+        WireApi::Chat,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/claude/v1/messages/count_tokens")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"claude-sonnet","messages":[{"role":"user","content":"hello there"}]}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+
+    assert_eq!(json["input_tokens"].as_i64().is_some(), true);
+    assert_eq!(json.get("error"), None);
 }
 
 #[tokio::test]

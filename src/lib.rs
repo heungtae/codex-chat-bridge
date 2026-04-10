@@ -352,6 +352,9 @@ fn infer_incoming_api_from_hint_or_path(
 
     if let Some(path) = incoming_path {
         let normalized_path = normalize_request_path(path);
+        if normalized_path.ends_with("/v1/messages/count_tokens") {
+            return IncomingApi::Anthropic;
+        }
         if normalized_path.ends_with("/v1/messages") {
             return IncomingApi::Anthropic;
         }
@@ -423,10 +426,17 @@ fn inject_openrouter_reasoning(payload: &mut Value) {
 fn anthropic_request_enables_thinking(request: &Value) -> bool {
     match request.get("thinking") {
         Some(Value::Bool(enabled)) => *enabled,
-        Some(Value::String(mode)) => mode.eq_ignore_ascii_case("enabled"),
+        Some(Value::String(mode)) => {
+            mode.eq_ignore_ascii_case("enabled") || mode.eq_ignore_ascii_case("adaptive")
+        }
         Some(Value::Object(thinking)) => match thinking.get("type").and_then(Value::as_str) {
             Some(kind) if kind.eq_ignore_ascii_case("disabled") => false,
-            Some(kind) if kind.eq_ignore_ascii_case("enabled") => true,
+            Some(kind)
+                if kind.eq_ignore_ascii_case("enabled")
+                    || kind.eq_ignore_ascii_case("adaptive") =>
+            {
+                true
+            }
             Some(_) => false,
             None => thinking
                 .get("enabled")
@@ -434,6 +444,117 @@ fn anthropic_request_enables_thinking(request: &Value) -> bool {
                 .unwrap_or(false),
         },
         _ => false,
+    }
+}
+
+fn is_anthropic_count_tokens_path(incoming_path: Option<&str>) -> bool {
+    incoming_path
+        .map(normalize_request_path)
+        .is_some_and(|path| path.ends_with("/v1/messages/count_tokens"))
+}
+
+fn estimate_anthropic_count_tokens(request: &Value) -> i64 {
+    let mut total = 0usize;
+
+    total += count_anthropic_token_chars(request.get("system"));
+
+    if let Some(messages) = request.get("messages").and_then(Value::as_array) {
+        for message in messages {
+            total += count_anthropic_message_token_chars(message);
+        }
+    }
+
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            total += count_anthropic_token_chars(tool.get("name"));
+            total += count_anthropic_token_chars(tool.get("description"));
+            total += count_anthropic_token_chars(tool.get("input_schema"));
+        }
+    }
+
+    let tokens = total / 4;
+    if tokens == 0 && request.get("messages").is_some() {
+        1
+    } else {
+        tokens as i64
+    }
+}
+
+fn count_anthropic_message_token_chars(message: &Value) -> usize {
+    let mut total = 0usize;
+    total += count_anthropic_token_chars(message.get("role"));
+    total += count_anthropic_visible_content_chars(message.get("content"));
+    total += count_anthropic_token_chars(message.get("name"));
+    total += count_anthropic_token_chars(message.get("tool_use_id"));
+    total += count_anthropic_token_chars(message.get("tool_call_id"));
+
+    total
+}
+
+fn count_anthropic_visible_content_chars(value: Option<&Value>) -> usize {
+    let Some(value) = value else {
+        return 0;
+    };
+
+    match value {
+        Value::Array(items) => items.iter().map(count_anthropic_content_block_chars).sum(),
+        Value::Object(_) => count_anthropic_content_block_chars(value),
+        _ => count_anthropic_token_chars(Some(value)),
+    }
+}
+
+fn count_anthropic_content_block_chars(block: &Value) -> usize {
+    let Some(obj) = block.as_object() else {
+        return count_anthropic_token_chars(Some(block));
+    };
+
+    let block_type = obj
+        .get("type")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+
+    if matches!(
+        block_type.as_str(),
+        "thinking" | "redacted_thinking" | "signature"
+    ) {
+        return 0;
+    }
+
+    let mut total = 0usize;
+    if !block_type.is_empty() {
+        total += block_type.len();
+    }
+
+    total += count_anthropic_token_chars(obj.get("text"));
+    total += count_anthropic_token_chars(obj.get("content"));
+    total += count_anthropic_token_chars(obj.get("input"));
+    total += count_anthropic_token_chars(obj.get("name"));
+    total += count_anthropic_token_chars(obj.get("id"));
+    total += count_anthropic_token_chars(obj.get("tool_use_id"));
+    total += count_anthropic_token_chars(obj.get("data"));
+
+    total
+}
+
+fn count_anthropic_token_chars(value: Option<&Value>) -> usize {
+    let Some(value) = value else {
+        return 0;
+    };
+
+    match value {
+        Value::Null => 0,
+        Value::Bool(v) => {
+            if *v {
+                4
+            } else {
+                5
+            }
+        }
+        Value::Number(n) => n.to_string().len(),
+        Value::String(s) => s.len(),
+        Value::Array(items) => items.iter().map(count_anthropic_content_block_chars).sum(),
+        Value::Object(_) => serde_json::to_string(value).map(|s| s.len()).unwrap_or(0),
     }
 }
 
@@ -907,6 +1028,22 @@ pub(crate) async fn handle_incoming(
             Ok(v) => v,
             Err(response) => return response,
         };
+
+    if incoming_api == IncomingApi::Anthropic
+        && is_anthropic_count_tokens_path(incoming_path.as_deref())
+    {
+        let input_tokens = estimate_anthropic_count_tokens(&request_value);
+        if verbose_logging {
+            debug!(
+                "anthropic count_tokens handled locally (router={}, estimated_input_tokens={})",
+                route_target.router_name, input_tokens
+            );
+        }
+        return json_success_response(serde_json::json!({
+            "input_tokens": input_tokens,
+        }));
+    }
+
     let (response_id, upstream_payload) = match build_upstream_payload_with_session(
         &state,
         &request_value,
