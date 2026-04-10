@@ -250,9 +250,6 @@ upstream_url = "http://localhost:8080/v1/chat/completions"
 upstream_wire = "chat"
 # Optional: force a provider-valid model ID instead of forwarding Claude Code's model string.
 # upstream_model = "provider/model-id"
-# Optional: preserve Anthropic thinking blocks in assistant content and enable OpenRouter reasoning.
-# anthropic_preserve_thinking = true
-# anthropic_enable_openrouter_reasoning = true
 ```
 
 Important points:
@@ -260,8 +257,7 @@ Important points:
 - `incoming_url` matches exact paths first, then the longest matching path prefix, so `/claude/v1/messages/count_tokens` is routed to the same Claude router as `/claude/v1/messages`.
 - For Claude Code streaming, use `upstream_wire = "chat"`.
 - If your upstream rejects Claude-native model names, set `upstream_model` or the Claude-family-specific overrides on the router to provider-valid model IDs.
-- Enable `anthropic_preserve_thinking` when the upstream model benefits from seeing prior Claude thinking blocks inside assistant content.
-- Enable `anthropic_enable_openrouter_reasoning` when routing Anthropic requests with `thinking` enabled to OpenRouter chat models that expect `reasoning.enabled`.
+- Claude parity mode does not preserve Anthropic thinking blocks in upstream chat content and does not inject OpenRouter `reasoning.enabled`; that behavior is reserved for non-Claude bridge routes.
 - `POST /v1/messages/count_tokens` is answered locally with a best-effort `input_tokens` estimate instead of being forwarded upstream.
 - Anthropic `/v1/messages` to upstream `responses` streaming is not supported yet.
 

@@ -423,6 +423,20 @@ fn inject_openrouter_reasoning(payload: &mut Value) {
     }
 }
 
+fn strip_anthropic_reasoning_fields(payload: &mut Value) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for message in messages {
+        let Some(obj) = message.as_object_mut() else {
+            continue;
+        };
+        obj.remove("reasoning_content");
+        obj.remove("thinking");
+    }
+}
+
 fn anthropic_request_enables_thinking(request: &Value) -> bool {
     match request.get("thinking") {
         Some(Value::Bool(enabled)) => *enabled,
@@ -693,6 +707,11 @@ async fn build_upstream_payload_with_session(
     wants_stream: bool,
 ) -> std::result::Result<(String, Value), Response> {
     let response_id = format!("resp_bridge_{}", Uuid::now_v7());
+    let anthropic_preserve_thinking = if incoming_api == IncomingApi::Anthropic {
+        false
+    } else {
+        route_target.anthropic_preserve_thinking
+    };
     let mut upstream_payload = match build_upstream_payload(
         request_value,
         incoming_api,
@@ -700,7 +719,7 @@ async fn build_upstream_payload_with_session(
         wants_stream,
         route_target.feature_flags.enable_extended_input_types,
         route_target.feature_flags.tool_transform_mode,
-        route_target.anthropic_preserve_thinking,
+        anthropic_preserve_thinking,
     ) {
         Ok(v) => v,
         Err(err) => {
@@ -717,7 +736,10 @@ async fn build_upstream_payload_with_session(
         }
     };
     apply_upstream_model_override(&mut upstream_payload, route_target);
-    if incoming_api == IncomingApi::Anthropic
+    if incoming_api == IncomingApi::Anthropic {
+        strip_anthropic_reasoning_fields(&mut upstream_payload);
+    }
+    if incoming_api != IncomingApi::Anthropic
         && route_target.anthropic_enable_openrouter_reasoning
         && anthropic_request_enables_thinking(request_value)
     {

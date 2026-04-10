@@ -44,7 +44,7 @@ forward_incoming_headers = ["x-codex-turn-state", "x-request-id"]
 drop_tool_types = []
 drop_request_fields = []
 anthropic_preserve_thinking = true # optional, copies assistant thinking into chat message content
-anthropic_enable_openrouter_reasoning = true # optional, injects reasoning.enabled=true when Anthropic thinking is enabled
+anthropic_enable_openrouter_reasoning = true # optional, injects reasoning.enabled=true when Anthropic thinking is enabled; ignored on Claude parity routes
 
 [routers.default.features]
 enable_previous_response_id = true

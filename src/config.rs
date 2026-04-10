@@ -174,7 +174,7 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # drop_request_fields = []
 # incoming_url = "http://<host>:<port>/v1/messages"
 # anthropic_preserve_thinking = true # optional, also copies assistant thinking blocks into chat message content
-# anthropic_enable_openrouter_reasoning = true # optional, injects reasoning.enabled=true for Anthropic requests
+# anthropic_enable_openrouter_reasoning = true # optional, injects reasoning.enabled=true for Anthropic requests; ignored on Claude parity routes
 # [routers.default.features]
 # enable_reasoning_stream_events = false
 # tool_transform_mode = "legacy_convert"

@@ -1857,6 +1857,23 @@ fn estimate_anthropic_count_tokens_ignores_assistant_thinking_blocks() {
     );
 }
 
+#[tokio::test]
+async fn anthropic_json_error_response_includes_request_id() {
+    let response = anthropic_json_error_response("invalid_request_error", "boom");
+    let body = response.into_body();
+    let bytes = to_bytes(body, usize::MAX).await.expect("body");
+    let json: Value = serde_json::from_slice(&bytes).expect("json");
+
+    assert_eq!(json["type"], "error");
+    assert_eq!(json["error"]["type"], "invalid_request_error");
+    assert_eq!(json["error"]["message"], "boom");
+    assert!(
+        json["request_id"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("req_"))
+    );
+}
+
 #[test]
 fn router_manager_collects_multiple_listen_ports_from_incoming_urls() {
     let mut routers = BTreeMap::new();
@@ -2076,6 +2093,45 @@ fn prefixed_anthropic_messages_path_maps_request_to_chat_payload() {
     assert_eq!(tools.len(), 1);
     assert_eq!(tools[0]["type"], "function");
     assert_eq!(tools[0]["function"]["name"], "shell");
+}
+
+#[test]
+fn prefixed_anthropic_messages_path_strips_bridge_thinking_fields() {
+    let request = json!({
+        "model": "claude-sonnet-4-6",
+        "messages": [
+            {
+                "role":"assistant",
+                "content":[
+                    {"type":"thinking","thinking":"internal chain"},
+                    {"type":"text","text":"hello"}
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let incoming_api =
+        infer_incoming_api_from_hint_or_path(None, Some("/claude/v1/messages"), &request);
+    let out = build_upstream_payload(
+        &request,
+        incoming_api,
+        WireApi::Chat,
+        false,
+        true,
+        ToolTransformMode::LegacyConvert,
+        true,
+    )
+    .expect("should map anthropic request");
+
+    let messages = out
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages array");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "assistant");
+    assert_eq!(messages[0]["content"], "hello");
+    assert_eq!(messages[0].get("reasoning_content"), None);
 }
 
 #[test]

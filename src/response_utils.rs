@@ -107,6 +107,7 @@ pub(crate) fn sse_error_response(code: &str, message: &str) -> Response {
 }
 
 pub(crate) fn anthropic_sse_error_response(code: &str, message: &str) -> Response {
+    let request_id = anthropic_request_id();
     let body = anthropic_sse_event(
         "error",
         &json!({
@@ -114,7 +115,8 @@ pub(crate) fn anthropic_sse_error_response(code: &str, message: &str) -> Respons
             "error": {
                 "type": code,
                 "message": message,
-            }
+            },
+            "request_id": request_id,
         }),
     );
 
@@ -173,11 +175,17 @@ pub(crate) fn json_error_response(code: &str, message: &str) -> Response {
 }
 
 pub(crate) fn anthropic_json_error_response(code: &str, message: &str) -> Response {
+    let request_id = anthropic_request_id();
     json_success_response(json!({
         "type": "error",
         "error": {
             "type": code,
             "message": message,
-        }
+        },
+        "request_id": request_id,
     }))
+}
+
+fn anthropic_request_id() -> String {
+    format!("req_{}", Uuid::now_v7())
 }

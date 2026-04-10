@@ -127,6 +127,11 @@ pub(crate) fn build_upstream_payload(
     tool_transform_mode: ToolTransformMode,
     anthropic_preserve_thinking: bool,
 ) -> Result<Value> {
+    let anthropic_preserve_thinking = if incoming_api == IncomingApi::Anthropic {
+        false
+    } else {
+        anthropic_preserve_thinking
+    };
     let mut payload = match (incoming_api, upstream_wire) {
         (IncomingApi::Responses, WireApi::Responses) => request.clone(),
         (IncomingApi::Responses, WireApi::Chat) => {
@@ -150,6 +155,9 @@ pub(crate) fn build_upstream_payload(
             map_chat_to_responses_request(&chat_request?, stream)?
         }
     };
+    if incoming_api == IncomingApi::Anthropic {
+        strip_anthropic_reasoning_fields(&mut payload);
+    }
     set_stream_flag(&mut payload, stream);
     Ok(payload)
 }
@@ -157,5 +165,19 @@ pub(crate) fn build_upstream_payload(
 fn set_stream_flag(payload: &mut Value, stream: bool) {
     if let Some(obj) = payload.as_object_mut() {
         obj.insert("stream".to_string(), Value::Bool(stream));
+    }
+}
+
+fn strip_anthropic_reasoning_fields(payload: &mut Value) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for message in messages {
+        let Some(obj) = message.as_object_mut() else {
+            continue;
+        };
+        obj.remove("reasoning_content");
+        obj.remove("thinking");
     }
 }
