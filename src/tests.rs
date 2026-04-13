@@ -2151,6 +2151,155 @@ fn map_chat_to_responses_request_converts_messages() {
     assert_eq!(out["input"][0]["content"][0]["text"], "hello");
 }
 
+fn responses_input_items(out: &Value) -> &[Value] {
+    out.get("input")
+        .and_then(Value::as_array)
+        .expect("input array")
+}
+
+fn responses_input_item<'a>(items: &'a [Value], item_type: &str) -> Option<&'a Value> {
+    items
+        .iter()
+        .find(|item| item.get("type").and_then(Value::as_str) == Some(item_type))
+}
+
+#[test]
+fn map_chat_to_responses_request_preserves_assistant_tool_calls() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"seoul\"}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let item = responses_input_item(items, "function_call").expect("function_call item");
+    assert_eq!(item["call_id"], "call_1");
+    assert_eq!(item["name"], "get_weather");
+    assert_eq!(item["arguments"], "{\"city\":\"seoul\"}");
+}
+
+#[test]
+fn map_chat_to_responses_request_preserves_assistant_reasoning() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "final answer",
+                "reasoning_content": "internal chain"
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let item = responses_input_item(items, "reasoning").expect("reasoning item");
+    assert_eq!(item["summary"][0]["type"], "summary_text");
+    assert_eq!(item["summary"][0]["text"], "internal chain");
+}
+
+#[test]
+fn map_chat_to_responses_request_preserves_multimodal_content() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type":"text","text":"hello"},
+                    {"type":"image_url","image_url":{"url":"https://example.com/cat.png"}},
+                    {"type":"input_audio","input_audio":{"data":"aGVsbG8="}}
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let message = responses_input_item(items, "message").expect("message item");
+    let content = message["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[0]["text"], "hello");
+    assert_eq!(content[1]["type"], "input_image");
+    assert_eq!(content[1]["image_url"], "https://example.com/cat.png");
+    assert_eq!(content[2]["type"], "input_audio");
+    assert_eq!(content[2]["input_audio"]["data"], "aGVsbG8=");
+}
+
+#[test]
+fn map_chat_to_responses_request_maps_tool_messages_to_function_call_output() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "tool",
+                "tool_call_id": "call_2",
+                "content": "{\"ok\":true}"
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let item = responses_input_item(items, "function_call_output")
+        .expect("function_call_output item");
+    assert_eq!(item["call_id"], "call_2");
+    assert_eq!(item["output"], "{\"ok\":true}");
+}
+
+#[test]
+fn map_chat_to_responses_request_preserves_mixed_assistant_content_and_tool_calls() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "I will check that now.",
+                "tool_calls": [
+                    {
+                        "id": "call_3",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": "{\"city\":\"seoul\"}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let message = responses_input_item(items, "message").expect("assistant message");
+    assert_eq!(message["role"], "assistant");
+    assert_eq!(message["content"][0]["text"], "I will check that now.");
+
+    let tool_call = responses_input_item(items, "function_call").expect("function_call item");
+    assert_eq!(tool_call["call_id"], "call_3");
+    assert_eq!(tool_call["name"], "get_weather");
+}
+
 #[test]
 fn previous_response_id_for_request_ignores_blank_values() {
     let request = json!({

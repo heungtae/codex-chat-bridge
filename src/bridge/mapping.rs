@@ -41,6 +41,37 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
             continue;
         }
 
+        if role == "assistant" {
+            if let Some(reasoning) = chat_message_reasoning_text(message) {
+                input.push(json!({
+                    "type": "reasoning",
+                    "summary": [{
+                        "type": "summary_text",
+                        "text": reasoning,
+                    }],
+                }));
+            }
+
+            let content = chat_message_content_to_input_items(message.get("content"));
+            if !content.is_empty() {
+                input.push(json!({
+                    "type": "message",
+                    "role": role,
+                    "content": content,
+                }));
+            }
+
+            if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+                for tool_call in tool_calls {
+                    if let Some(function_call) = chat_tool_call_to_responses_input_item(tool_call) {
+                        input.push(function_call);
+                    }
+                }
+            }
+
+            continue;
+        }
+
         let content = chat_message_content_to_input_items(message.get("content"));
         if content.is_empty() {
             continue;
@@ -658,14 +689,7 @@ pub(crate) fn chat_message_content_to_input_items(content: Option<&Value>) -> Ve
         }
         Some(Value::Array(items)) => items
             .iter()
-            .filter_map(|item| {
-                if let Some(text) = item.get("text").and_then(Value::as_str) {
-                    return Some(json!({"type":"input_text","text":text}));
-                }
-                item.get("content")
-                    .and_then(Value::as_str)
-                    .map(|text| json!({"type":"input_text","text":text}))
-            })
+            .filter_map(chat_content_item_to_input_item)
             .collect(),
         Some(other) => {
             let as_text = other.to_string();
@@ -1420,6 +1444,118 @@ fn resolve_tool_output_call_id(
             Ok(recovered)
         }
     }
+}
+
+fn chat_message_reasoning_text(message: &Value) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some(thinking) = message.get("thinking").and_then(Value::as_str)
+        && !thinking.trim().is_empty()
+    {
+        parts.push(thinking.trim().to_string());
+    }
+    if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
+        && !reasoning.trim().is_empty()
+    {
+        parts.push(reasoning.trim().to_string());
+    }
+
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("\n\n"))
+    }
+}
+
+fn chat_tool_call_to_responses_input_item(tool_call: &Value) -> Option<Value> {
+    let function = tool_call.get("function")?;
+    let name = function.get("name").and_then(Value::as_str)?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let call_id = tool_call
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "call_unknown");
+    let arguments = function
+        .get("arguments")
+        .map(function_arguments_to_text)
+        .unwrap_or_else(|| "{}".to_string());
+
+    Some(json!({
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+    }))
+}
+
+fn chat_content_item_to_input_item(item: &Value) -> Option<Value> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+
+    if matches!(item_type, "text" | "input_text" | "output_text")
+        && let Some(text) = item.get("text").and_then(Value::as_str)
+        && !text.trim().is_empty()
+    {
+        return Some(json!({
+            "type": "input_text",
+            "text": text,
+        }));
+    }
+
+    if item_type == "image_url" {
+        let image_url = item
+            .get("image_url")
+            .and_then(|value| {
+                value
+                    .as_str()
+                    .map(ToString::to_string)
+                    .or_else(|| value.get("url").and_then(Value::as_str).map(ToString::to_string))
+            })
+            .or_else(|| item.get("url").and_then(Value::as_str).map(ToString::to_string))
+            .unwrap_or_default();
+        if image_url.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "type": "input_image",
+            "image_url": image_url,
+        }));
+    }
+
+    if item_type == "input_audio" {
+        let input_audio = item.get("input_audio").unwrap_or(item);
+        let data = input_audio
+            .get("data")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if data.is_empty() {
+            return None;
+        }
+        return Some(json!({
+            "type": "input_audio",
+            "input_audio": {
+                "data": data,
+            }
+        }));
+    }
+
+    item.get("content")
+        .and_then(Value::as_str)
+        .and_then(|text| {
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(json!({
+                    "type": "input_text",
+                    "text": text,
+                }))
+            }
+        })
 }
 
 fn apply_responses_request_extensions(request: &Value, chat_request: &mut Value) -> Result<()> {
