@@ -18,7 +18,7 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
         .ok_or_else(|| anyhow!("missing `messages` array"))?;
 
     let mut input = Vec::new();
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -62,8 +62,12 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
             }
 
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
-                for tool_call in tool_calls {
-                    if let Some(function_call) = chat_tool_call_to_responses_input_item(tool_call) {
+                for (tool_index, tool_call) in tool_calls.iter().enumerate() {
+                    if let Some(function_call) = chat_tool_call_to_responses_input_item(
+                        tool_call,
+                        message_index,
+                        tool_index,
+                    ) {
                         input.push(function_call);
                     }
                 }
@@ -1466,7 +1470,11 @@ fn chat_message_reasoning_text(message: &Value) -> Option<String> {
     }
 }
 
-fn chat_tool_call_to_responses_input_item(tool_call: &Value) -> Option<Value> {
+fn chat_tool_call_to_responses_input_item(
+    tool_call: &Value,
+    message_index: usize,
+    tool_index: usize,
+) -> Option<Value> {
     let function = tool_call.get("function")?;
     let name = function.get("name").and_then(Value::as_str)?.trim();
     if name.is_empty() {
@@ -1478,7 +1486,8 @@ fn chat_tool_call_to_responses_input_item(tool_call: &Value) -> Option<Value> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|v| !v.is_empty())
-        .unwrap_or_else(|| "call_unknown");
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| format!("call_m{message_index}_t{tool_index}"));
     let arguments = function
         .get("arguments")
         .map(function_arguments_to_text)

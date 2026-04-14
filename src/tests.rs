@@ -2195,6 +2195,51 @@ fn map_chat_to_responses_request_preserves_assistant_tool_calls() {
 }
 
 #[test]
+fn map_chat_to_responses_request_generates_unique_tool_call_ids_when_missing() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "tool_a",
+                            "arguments": "{}"
+                        }
+                    },
+                    {
+                        "type": "function",
+                        "function": {
+                            "name": "tool_b",
+                            "arguments": "{\"x\":1}"
+                        }
+                    }
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let first = responses_input_item(items, "function_call").expect("first function_call item");
+    assert_eq!(first["name"], "tool_a");
+    assert_eq!(first["call_id"], "call_m0_t0");
+
+    let second = items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some("function_call"))
+        .nth(1)
+        .expect("second function_call item");
+    assert_eq!(second["name"], "tool_b");
+    assert_eq!(second["call_id"], "call_m0_t1");
+    assert_ne!(first["call_id"], second["call_id"]);
+}
+
+#[test]
 fn map_chat_to_responses_request_preserves_assistant_reasoning() {
     let chat = json!({
         "model": "gpt-4.1",
