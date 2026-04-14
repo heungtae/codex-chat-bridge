@@ -1495,6 +1495,7 @@ impl HeuristicToolParser {
 
     fn find_candidate_start(&self) -> Option<usize> {
         let mut candidate = None;
+        candidate = min_option(candidate, self.find_request_user_input_wrapper_start());
         candidate = min_option(candidate, self.find_wrapped_python_call_start());
 
         for name in &self.allowed_tool_names {
@@ -1523,8 +1524,16 @@ impl HeuristicToolParser {
         None
     }
 
+    fn find_request_user_input_wrapper_start(&self) -> Option<usize> {
+        self.buffer.find("<request_user_input>")
+    }
+
     fn looks_like_bare_tool_prefix(&self) -> bool {
         let trimmed = self.buffer.trim_start_matches(char::is_whitespace);
+
+        if trimmed.starts_with("<request_user_input>") {
+            return true;
+        }
 
         if trimmed.starts_with('[') {
             let inner = trimmed[1..].trim_start_matches(char::is_whitespace);
@@ -1567,6 +1576,10 @@ fn try_parse_python_tool_call_prefix(
     text: &str,
     allowed_tool_names: &HashSet<String>,
 ) -> Option<(Vec<HeuristicToolCall>, usize)> {
+    if let Some(result) = try_parse_request_user_input_wrapper(text) {
+        return Some(result);
+    }
+
     let trimmed = text.trim_start_matches(char::is_whitespace);
     let consumed_prefix = text.len() - trimmed.len();
     let (calls, consumed) = parse_python_tool_calls_prefix(trimmed, allowed_tool_names)?;
@@ -1579,6 +1592,28 @@ fn try_parse_python_tool_call_prefix(
         })
         .collect();
     Some((heuristic_calls, consumed_prefix + consumed))
+}
+
+fn try_parse_request_user_input_wrapper(text: &str) -> Option<(Vec<HeuristicToolCall>, usize)> {
+    const OPEN_TAG: &str = "<request_user_input>";
+    const CLOSE_TAG: &str = "</request_user_input>";
+
+    let trimmed = text.trim_start_matches(char::is_whitespace);
+    let consumed_prefix = text.len() - trimmed.len();
+    if !trimmed.starts_with(OPEN_TAG) {
+        return None;
+    }
+
+    let body_start = OPEN_TAG.len();
+    let body_end = trimmed.find(CLOSE_TAG)?;
+    let body = trimmed[body_start..body_end].trim();
+    let input = serde_json::from_str::<Value>(body).ok()?;
+    let call = HeuristicToolCall {
+        id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
+        name: "request_user_input".to_string(),
+        input,
+    };
+    Some((vec![call], consumed_prefix + body_end + CLOSE_TAG.len()))
 }
 
 fn parse_python_tool_calls_prefix(

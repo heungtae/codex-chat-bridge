@@ -3145,6 +3145,30 @@ async fn anthropic_stream_parses_bare_python_style_ask_user_question() {
 }
 
 #[tokio::test]
+async fn anthropic_stream_parses_request_user_input_xml_wrapper() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"<request_user_input>{\\\"questions\\\":[{\\\"header\\\":\\\"저장위치\\\",\\\"id\\\":\\\"exec_plan_path\\\",\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\",\\\"options\\\":[{\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\",\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\"}]}]}</request_user_input>\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::new(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"name\":\"request_user_input\""));
+    assert!(payload.contains("\"partial_json\":\"{\\\"questions\\\":[{\\\"header\\\":\\\"저장위치\\\",\\\"id\\\":\\\"exec_plan_path\\\",\\\"options\\\":[{\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\",\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\"}],\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\"}]}\""));
+}
+
+#[tokio::test]
 async fn anthropic_stream_keeps_unknown_bare_python_style_call_as_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"AskUserQuestion(question=\\\"What's up?\\\")\"},\"finish_reason\":\"stop\"}]}\n\n\
