@@ -3145,9 +3145,9 @@ async fn anthropic_stream_parses_bare_python_style_ask_user_question() {
 }
 
 #[tokio::test]
-async fn anthropic_stream_parses_request_user_input_xml_wrapper() {
+async fn anthropic_stream_parses_ask_user_question_xml_wrapper() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
-        "data: {\"choices\":[{\"delta\":{\"content\":\"<request_user_input>{\\\"questions\\\":[{\\\"header\\\":\\\"저장위치\\\",\\\"id\\\":\\\"exec_plan_path\\\",\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\",\\\"options\\\":[{\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\",\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\"}]}]}</request_user_input>\"},\"finish_reason\":\"stop\"}]}\n\n\
+        "data: {\"choices\":[{\"delta\":{\"content\":\"<AskUserQuestion>{\\\"questions\\\":[{\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\",\\\"multiSelect\\\":false,\\\"options\\\":[{\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\",\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\"},{\\\"label\\\":\\\"README.md에 추가\\\",\\\"description\\\":\\\"프로젝트 루트 README에 삽입\\\"},{\\\"label\\\":\\\"src/main/resources/unit-test-execution-plan.md\\\",\\\"description\\\":\\\"리소스 경로에 저장해 빌드에 포함\\\"}]}]}\"},\"finish_reason\":\"stop\"}]}\n\n\
              data: [DONE]\n\n",
     ))]);
     let mut output = Box::pin(translate_chat_stream_to_anthropic(
@@ -3165,7 +3165,12 @@ async fn anthropic_stream_parses_request_user_input_xml_wrapper() {
 
     assert!(payload.contains("\"type\":\"tool_use\""));
     assert!(payload.contains("\"name\":\"request_user_input\""));
-    assert!(payload.contains("\"partial_json\":\"{\\\"questions\\\":[{\\\"header\\\":\\\"저장위치\\\",\\\"id\\\":\\\"exec_plan_path\\\",\\\"options\\\":[{\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\",\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\"}],\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\"}]}\""));
+    assert!(payload.contains("\"partial_json\":\"{\\\"questions\\\":["));
+    assert!(payload.contains("\\\"id\\\":\\\"question_1\\\""));
+    assert!(payload.contains("\\\"header\\\":\\\"Question 1\\\""));
+    assert!(payload.contains("\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\""));
+    assert!(!payload.contains("\\\"multiSelect\\\""));
+    assert!(payload.contains("\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\""));
 }
 
 #[tokio::test]

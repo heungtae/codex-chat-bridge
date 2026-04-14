@@ -1373,6 +1373,7 @@ enum HeuristicFragment {
 impl HeuristicToolParser {
     const CONTROL_TOKEN_START: &'static str = "<|";
     const CONTROL_TOKEN_END: &'static str = "|>";
+    const SPECIAL_WRAPPER_NAMES: [&'static str; 2] = ["request_user_input", "AskUserQuestion"];
 
     fn new(allowed_tool_names: HashSet<String>) -> Self {
         Self {
@@ -1495,7 +1496,7 @@ impl HeuristicToolParser {
 
     fn find_candidate_start(&self) -> Option<usize> {
         let mut candidate = None;
-        candidate = min_option(candidate, self.find_request_user_input_wrapper_start());
+        candidate = min_option(candidate, self.find_special_wrapper_start());
         candidate = min_option(candidate, self.find_wrapped_python_call_start());
 
         for name in &self.allowed_tool_names {
@@ -1524,14 +1525,20 @@ impl HeuristicToolParser {
         None
     }
 
-    fn find_request_user_input_wrapper_start(&self) -> Option<usize> {
-        self.buffer.find("<request_user_input>")
+    fn find_special_wrapper_start(&self) -> Option<usize> {
+        Self::SPECIAL_WRAPPER_NAMES
+            .iter()
+            .filter_map(|name| self.buffer.find(&format!("<{name}>")))
+            .min()
     }
 
     fn looks_like_bare_tool_prefix(&self) -> bool {
         let trimmed = self.buffer.trim_start_matches(char::is_whitespace);
 
-        if trimmed.starts_with("<request_user_input>") {
+        if Self::SPECIAL_WRAPPER_NAMES
+            .iter()
+            .any(|name| trimmed.starts_with(&format!("<{name}>")))
+        {
             return true;
         }
 
@@ -1576,7 +1583,7 @@ fn try_parse_python_tool_call_prefix(
     text: &str,
     allowed_tool_names: &HashSet<String>,
 ) -> Option<(Vec<HeuristicToolCall>, usize)> {
-    if let Some(result) = try_parse_request_user_input_wrapper(text) {
+    if let Some(result) = try_parse_special_wrapper(text) {
         return Some(result);
     }
 
@@ -1594,26 +1601,189 @@ fn try_parse_python_tool_call_prefix(
     Some((heuristic_calls, consumed_prefix + consumed))
 }
 
-fn try_parse_request_user_input_wrapper(text: &str) -> Option<(Vec<HeuristicToolCall>, usize)> {
-    const OPEN_TAG: &str = "<request_user_input>";
-    const CLOSE_TAG: &str = "</request_user_input>";
-
+fn try_parse_special_wrapper(text: &str) -> Option<(Vec<HeuristicToolCall>, usize)> {
     let trimmed = text.trim_start_matches(char::is_whitespace);
     let consumed_prefix = text.len() - trimmed.len();
-    if !trimmed.starts_with(OPEN_TAG) {
+
+    for wrapper_name in HeuristicToolParser::SPECIAL_WRAPPER_NAMES {
+        let open_tag = format!("<{wrapper_name}>");
+        if !trimmed.starts_with(&open_tag) {
+            continue;
+        }
+
+        let mut rest = trimmed[open_tag.len()..].trim_start_matches(char::is_whitespace);
+        let (raw_input, consumed_json) = parse_json_prefix(rest)?;
+        rest = &rest[consumed_json..];
+        let rest_trimmed = rest.trim_start_matches(char::is_whitespace);
+        let consumed_ws = rest.len() - rest_trimmed.len();
+        let close_tag = format!("</{wrapper_name}>");
+        let consumed_close = if rest_trimmed.starts_with(&close_tag) {
+            close_tag.len()
+        } else {
+            0
+        };
+        let input = normalize_request_user_input_payload(raw_input)?;
+
+        let call = HeuristicToolCall {
+            id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
+            name: "request_user_input".to_string(),
+            input,
+        };
+
+        return Some((
+            vec![call],
+            consumed_prefix + open_tag.len() + consumed_json + consumed_ws + consumed_close,
+        ));
+    }
+
+    None
+}
+
+fn parse_json_prefix(text: &str) -> Option<(Value, usize)> {
+    let trimmed = text.trim_start_matches(char::is_whitespace);
+    let consumed_prefix = text.len() - trimmed.len();
+    let start_ch = trimmed.chars().next()?;
+    if !matches!(start_ch, '{' | '[') {
         return None;
     }
 
-    let body_start = OPEN_TAG.len();
-    let body_end = trimmed.find(CLOSE_TAG)?;
-    let body = trimmed[body_start..body_end].trim();
-    let input = serde_json::from_str::<Value>(body).ok()?;
-    let call = HeuristicToolCall {
-        id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
-        name: "request_user_input".to_string(),
-        input,
-    };
-    Some((vec![call], consumed_prefix + body_end + CLOSE_TAG.len()))
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (idx, ch) in trimmed.char_indices() {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_string = false;
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+                if depth == 0 {
+                    let end = idx + ch.len_utf8();
+                    let value = serde_json::from_str::<Value>(&trimmed[..end]).ok()?;
+                    return Some((value, consumed_prefix + end));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    None
+}
+
+fn normalize_request_user_input_payload(input: Value) -> Option<Value> {
+    let questions = input.get("questions")?.as_array()?;
+    let mut normalized_questions = Vec::with_capacity(questions.len());
+    let mut used_ids = HashSet::new();
+
+    for (index, question) in questions.iter().enumerate() {
+        let question = question.as_object()?;
+        let question_text = question
+            .get("question")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())?;
+        let mut normalized = serde_json::Map::new();
+
+        let generated_id = format!("question_{}", index + 1);
+        let id = question
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| slugify_identifier(question_text).unwrap_or(generated_id));
+        let id = dedupe_identifier(id, &mut used_ids, index + 1);
+        normalized.insert("id".to_string(), Value::String(id));
+
+        let header = question
+            .get("header")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|header| !header.is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| format!("Question {}", index + 1));
+        normalized.insert("header".to_string(), Value::String(truncate_to_chars(&header, 12)));
+        normalized.insert(
+            "question".to_string(),
+            Value::String(question_text.to_string()),
+        );
+
+        let options = question
+            .get("options")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        normalized.insert("options".to_string(), Value::Array(options));
+
+        normalized_questions.push(Value::Object(normalized));
+    }
+
+    if normalized_questions.is_empty() {
+        return None;
+    }
+
+    Some(Value::Object(serde_json::Map::from_iter([(
+        "questions".to_string(),
+        Value::Array(normalized_questions),
+    )])))
+}
+
+fn slugify_identifier(text: &str) -> Option<String> {
+    let mut out = String::new();
+    let mut prev_underscore = false;
+
+    for ch in text.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch);
+            prev_underscore = false;
+        } else if !prev_underscore {
+            out.push('_');
+            prev_underscore = true;
+        }
+    }
+
+    let slug = out.trim_matches('_').to_string();
+    if slug.is_empty() {
+        None
+    } else {
+        Some(slug)
+    }
+}
+
+fn dedupe_identifier(mut id: String, used_ids: &mut HashSet<String>, fallback_index: usize) -> String {
+    if id.is_empty() {
+        id = format!("question_{fallback_index}");
+    }
+
+    if used_ids.insert(id.clone()) {
+        return id;
+    }
+
+    let mut suffix = 2usize;
+    loop {
+        let candidate = format!("{id}_{suffix}");
+        if used_ids.insert(candidate.clone()) {
+            return candidate;
+        }
+        suffix += 1;
+    }
+}
+
+fn truncate_to_chars(text: &str, max_chars: usize) -> String {
+    text.chars().take(max_chars).collect()
 }
 
 fn parse_python_tool_calls_prefix(
