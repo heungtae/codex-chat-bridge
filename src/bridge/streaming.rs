@@ -1622,12 +1622,11 @@ fn try_parse_special_wrapper(text: &str) -> Option<(Vec<HeuristicToolCall>, usiz
         } else {
             0
         };
-        let input = normalize_request_user_input_payload(raw_input)?;
 
         let call = HeuristicToolCall {
             id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
-            name: "request_user_input".to_string(),
-            input,
+            name: wrapper_name.to_string(),
+            input: raw_input,
         };
 
         return Some((
@@ -1681,109 +1680,6 @@ fn parse_json_prefix(text: &str) -> Option<(Value, usize)> {
     }
 
     None
-}
-
-fn normalize_request_user_input_payload(input: Value) -> Option<Value> {
-    let questions = input.get("questions")?.as_array()?;
-    let mut normalized_questions = Vec::with_capacity(questions.len());
-    let mut used_ids = HashSet::new();
-
-    for (index, question) in questions.iter().enumerate() {
-        let question = question.as_object()?;
-        let question_text = question
-            .get("question")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())?;
-        let mut normalized = serde_json::Map::new();
-
-        let generated_id = format!("question_{}", index + 1);
-        let id = question
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| slugify_identifier(question_text).unwrap_or(generated_id));
-        let id = dedupe_identifier(id, &mut used_ids, index + 1);
-        normalized.insert("id".to_string(), Value::String(id));
-
-        let header = question
-            .get("header")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|header| !header.is_empty())
-            .map(ToOwned::to_owned)
-            .unwrap_or_else(|| format!("Question {}", index + 1));
-        normalized.insert("header".to_string(), Value::String(truncate_to_chars(&header, 12)));
-        normalized.insert(
-            "question".to_string(),
-            Value::String(question_text.to_string()),
-        );
-
-        let options = question
-            .get("options")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        normalized.insert("options".to_string(), Value::Array(options));
-
-        normalized_questions.push(Value::Object(normalized));
-    }
-
-    if normalized_questions.is_empty() {
-        return None;
-    }
-
-    Some(Value::Object(serde_json::Map::from_iter([(
-        "questions".to_string(),
-        Value::Array(normalized_questions),
-    )])))
-}
-
-fn slugify_identifier(text: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut prev_underscore = false;
-
-    for ch in text.chars().flat_map(char::to_lowercase) {
-        if ch.is_ascii_alphanumeric() {
-            out.push(ch);
-            prev_underscore = false;
-        } else if !prev_underscore {
-            out.push('_');
-            prev_underscore = true;
-        }
-    }
-
-    let slug = out.trim_matches('_').to_string();
-    if slug.is_empty() {
-        None
-    } else {
-        Some(slug)
-    }
-}
-
-fn dedupe_identifier(mut id: String, used_ids: &mut HashSet<String>, fallback_index: usize) -> String {
-    if id.is_empty() {
-        id = format!("question_{fallback_index}");
-    }
-
-    if used_ids.insert(id.clone()) {
-        return id;
-    }
-
-    let mut suffix = 2usize;
-    loop {
-        let candidate = format!("{id}_{suffix}");
-        if used_ids.insert(candidate.clone()) {
-            return candidate;
-        }
-        suffix += 1;
-    }
-}
-
-fn truncate_to_chars(text: &str, max_chars: usize) -> String {
-    text.chars().take(max_chars).collect()
 }
 
 fn parse_python_tool_calls_prefix(

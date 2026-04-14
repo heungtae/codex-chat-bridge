@@ -3164,13 +3164,13 @@ async fn anthropic_stream_parses_ask_user_question_xml_wrapper() {
     }
 
     assert!(payload.contains("\"type\":\"tool_use\""));
-    assert!(payload.contains("\"name\":\"request_user_input\""));
+    assert!(payload.contains("\"name\":\"AskUserQuestion\""));
     assert!(payload.contains("\"partial_json\":\"{\\\"questions\\\":["));
-    assert!(payload.contains("\\\"id\\\":\\\"question_1\\\""));
-    assert!(payload.contains("\\\"header\\\":\\\"Question 1\\\""));
     assert!(payload.contains("\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\""));
-    assert!(!payload.contains("\\\"multiSelect\\\""));
+    assert!(payload.contains("\\\"multiSelect\\\":false"));
+    assert!(payload.contains("\\\"options\\\":["));
     assert!(payload.contains("\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\""));
+    assert!(payload.contains("\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\""));
 }
 
 #[tokio::test]
