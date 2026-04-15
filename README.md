@@ -1,6 +1,6 @@
 # codex-chat-bridge
 
-`codex-chat-bridge` accepts Responses/Chat requests, applies request filtering, and forwards them to an OpenAI-compatible upstream (`/v1/chat/completions` or `/v1/responses`).
+`codex-chat-bridge` accepts Responses/Chat requests, including Claude Code's Anthropic `/v1/messages` traffic, applies request filtering, and forwards them to an OpenAI-compatible upstream (`/v1/chat/completions` or `/v1/responses`).
 
 This is intended for "no core source change" integration: run this bridge locally, then override `model_provider` to point Codex at the bridge.
 
