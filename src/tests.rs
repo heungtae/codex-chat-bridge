@@ -1,5 +1,6 @@
 use super::*;
 use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
+use crate::bridge_types::ChatDelta;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::http::Request;
 use futures::StreamExt;
@@ -69,6 +70,13 @@ fn sse_parser_collects_data_events() {
     let events = parser.feed(chunk);
     assert_eq!(events.len(), 1);
     assert_eq!(events[0], "{\"a\":1}");
+}
+
+#[test]
+fn chat_delta_treats_empty_tool_calls_as_absent() {
+    let delta: ChatDelta =
+        serde_json::from_value(json!({"tool_calls": []})).expect("delta should deserialize");
+    assert!(delta.tool_calls.is_none());
 }
 
 #[test]
@@ -3295,6 +3303,35 @@ async fn anthropic_stream_opens_text_block_only_once_across_multiple_deltas() {
     assert_eq!(payload.matches("event: content_block_stop").count(), 1);
     assert!(payload.contains("\"text\":\"He\""));
     assert!(payload.contains("\"text\":\"llo\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_ignores_empty_tool_calls_when_streaming_text() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"He\"}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"llo\",\"tool_calls\":[]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"content\":\"!\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::new(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
+    assert_eq!(payload.matches("\"type\":\"text_delta\"").count(), 3);
+    assert!(payload.contains("\"text\":\"He\""));
+    assert!(payload.contains("\"text\":\"llo\""));
+    assert!(payload.contains("\"text\":\"!\""));
 }
 
 #[tokio::test]

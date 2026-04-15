@@ -44,8 +44,18 @@ pub(crate) struct ChatDelta {
     pub(crate) thinking_blocks: Option<Value>,
     #[serde(default)]
     pub(crate) signature: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_non_empty_tool_calls")]
     pub(crate) tool_calls: Option<Vec<ChatToolCallDelta>>,
+}
+
+fn deserialize_non_empty_tool_calls<'de, D>(
+    deserializer: D,
+) -> Result<Option<Vec<ChatToolCallDelta>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let tool_calls = Option::<Vec<ChatToolCallDelta>>::deserialize(deserializer)?;
+    Ok(tool_calls.filter(|calls| !calls.is_empty()))
 }
 
 #[derive(Debug, Deserialize)]
