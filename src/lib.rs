@@ -843,10 +843,26 @@ async fn finalize_upstream_response(
 ) -> Response {
     if !upstream_response.status().is_success() {
         let status = upstream_response.status();
+        let headers = headers_for_logging(upstream_response.headers());
         let body = upstream_response
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
+        warn!(
+            "upstream error response headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
+            route_target.router_name,
+            incoming_api,
+            route_target.upstream_wire,
+            headers
+        );
+        warn!(
+            "upstream error response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, body={}",
+            route_target.router_name,
+            incoming_api,
+            route_target.upstream_wire,
+            status,
+            body
+        );
         if verbose_logging {
             debug!(
                 "upstream response payload error (router={}, {:?}<-{:?}): {body}",
