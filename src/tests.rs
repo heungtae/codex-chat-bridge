@@ -2629,6 +2629,7 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
         verbose_logging: false,
         routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
     });
     let route_target = RouteTarget {
         router_name: "default".to_string(),
@@ -2704,6 +2705,7 @@ fn test_state_with_router(
         verbose_logging: true,
         routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
     })
 }
 
