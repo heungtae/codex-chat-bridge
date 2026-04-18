@@ -127,11 +127,6 @@ pub(crate) fn build_upstream_payload(
     tool_transform_mode: ToolTransformMode,
     anthropic_preserve_thinking: bool,
 ) -> Result<Value> {
-    let anthropic_preserve_thinking = if incoming_api == IncomingApi::Anthropic {
-        false
-    } else {
-        anthropic_preserve_thinking
-    };
     let mut payload = match (incoming_api, upstream_wire) {
         (IncomingApi::Responses, WireApi::Responses) => request.clone(),
         (IncomingApi::Responses, WireApi::Chat) => {

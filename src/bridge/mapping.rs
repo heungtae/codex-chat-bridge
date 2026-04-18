@@ -112,6 +112,18 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
         "parallel_tool_calls": parallel_tool_calls,
     });
 
+    if let Some(response_format) = request.get("response_format").cloned()
+        && !response_format.is_null()
+        && let Some(obj) = out.as_object_mut()
+    {
+        obj.insert(
+            "text".to_string(),
+            json!({
+                "format": response_format,
+            }),
+        );
+    }
+
     if out
         .get("tools")
         .and_then(Value::as_array)
@@ -535,17 +547,42 @@ fn append_preserved_thinking_to_chat_content(content: &str, thinking: &str) -> S
 
 fn anthropic_user_message_to_chat_messages(content: Option<&Value>) -> Vec<Value> {
     let mut messages = Vec::new();
-    let mut text_parts = Vec::new();
+    let mut content_parts = Vec::new();
+    let mut has_image = false;
 
-    let flush_text = |messages: &mut Vec<Value>, text_parts: &mut Vec<String>| {
-        if !text_parts.is_empty() {
-            messages.push(json!({
-                "role": "user",
-                "content": text_parts.join("\n"),
-            }));
-            text_parts.clear();
-        }
-    };
+    let flush_content =
+        |messages: &mut Vec<Value>, content_parts: &mut Vec<Value>, has_image: &mut bool| {
+            if content_parts.is_empty() {
+                return;
+            }
+
+            if *has_image {
+                messages.push(json!({
+                    "role": "user",
+                    "content": content_parts.clone(),
+                }));
+            } else {
+                let text_parts = content_parts
+                    .iter()
+                    .filter_map(|item| item.get("text").and_then(Value::as_str))
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>();
+                if text_parts.len() == 1 {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": text_parts[0].clone(),
+                    }));
+                } else {
+                    messages.push(json!({
+                        "role": "user",
+                        "content": text_parts.join("\n"),
+                    }));
+                }
+            }
+
+            content_parts.clear();
+            *has_image = false;
+        };
 
     match content {
         Some(Value::String(text)) => {
@@ -563,11 +600,14 @@ fn anthropic_user_message_to_chat_messages(content: Option<&Value>) -> Vec<Value
                         if let Some(text) = item.get("text").and_then(Value::as_str)
                             && !text.trim().is_empty()
                         {
-                            text_parts.push(text.to_string());
+                            content_parts.push(json!({
+                                "type": "text",
+                                "text": text,
+                            }));
                         }
                     }
                     "tool_result" => {
-                        flush_text(&mut messages, &mut text_parts);
+                        flush_content(&mut messages, &mut content_parts, &mut has_image);
                         let content = anthropic_tool_result_content_to_text(item.get("content"));
                         messages.push(json!({
                             "role": "tool",
@@ -575,10 +615,16 @@ fn anthropic_user_message_to_chat_messages(content: Option<&Value>) -> Vec<Value
                             "content": content,
                         }));
                     }
+                    "image" => {
+                        if let Some(image_item) = anthropic_image_to_chat_content_item(item) {
+                            has_image = true;
+                            content_parts.push(image_item);
+                        }
+                    }
                     _ => {}
                 }
             }
-            flush_text(&mut messages, &mut text_parts);
+            flush_content(&mut messages, &mut content_parts, &mut has_image);
         }
         Some(other) => {
             let text = other.to_string();
@@ -593,6 +639,49 @@ fn anthropic_user_message_to_chat_messages(content: Option<&Value>) -> Vec<Value
     }
 
     messages
+}
+
+fn anthropic_image_to_chat_content_item(item: &Value) -> Option<Value> {
+    let source = item.get("source")?;
+    let source_type = source.get("type").and_then(Value::as_str)?;
+
+    let image_url = match source_type {
+        "url" => source.get("url").and_then(Value::as_str)?.trim().to_string(),
+        "base64" => {
+            let data = source.get("data").and_then(Value::as_str)?.trim();
+            if data.is_empty() {
+                return None;
+            }
+            let media_type = source
+                .get("media_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png")
+                .trim();
+            if media_type.is_empty() {
+                return None;
+            }
+            format!("data:{};base64,{}", media_type, data)
+        }
+        "file" => {
+            warn!("ignoring anthropic image block with unsupported file source");
+            return None;
+        }
+        _ => {
+            warn!("ignoring anthropic image block with unsupported source type: {source_type}");
+            return None;
+        }
+    };
+
+    if image_url.is_empty() {
+        return None;
+    }
+
+    Some(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": image_url,
+        }
+    }))
 }
 
 fn anthropic_tool_result_content_to_text(content: Option<&Value>) -> String {
@@ -1591,9 +1680,7 @@ fn apply_responses_request_extensions(request: &Value, chat_request: &mut Value)
         if let Some(format) = text.get("format") {
             chat_obj.insert("response_format".to_string(), format.clone());
         }
-        chat_obj.insert("text".to_string(), text.clone());
     }
-
     Ok(())
 }
 
@@ -1867,4 +1954,89 @@ pub(crate) fn normalize_tool_choice(
     }
 
     Value::String("auto".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anthropic_user_image_blocks_are_preserved() {
+        let input = json!({
+            "model": "claude-opus-4-7",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type":"text","text":"before"},
+                        {
+                            "type":"image",
+                            "source":{
+                                "type":"url",
+                                "url":"https://example.com/cat.png"
+                            }
+                        },
+                        {"type":"text","text":"after"}
+                    ]
+                }
+            ]
+        });
+
+        let out = map_anthropic_messages_to_chat_request(&input, false).expect("ok");
+        let messages = out["messages"].as_array().expect("messages");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        assert_eq!(messages[0]["content"][0]["type"], "text");
+        assert_eq!(messages[0]["content"][0]["text"], "before");
+        assert_eq!(messages[0]["content"][1]["type"], "image_url");
+        assert_eq!(messages[0]["content"][1]["image_url"]["url"], "https://example.com/cat.png");
+        assert_eq!(messages[0]["content"][2]["type"], "text");
+        assert_eq!(messages[0]["content"][2]["text"], "after");
+    }
+
+    #[test]
+    fn chat_response_format_maps_to_responses_text_format() {
+        let chat = json!({
+            "model": "gpt-4.1",
+            "messages": [],
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "answer",
+                    "schema": {"type":"object"}
+                }
+            },
+            "stream": false
+        });
+
+        let out = map_chat_to_responses_request(&chat, false).expect("ok");
+        assert_eq!(out["text"]["format"]["type"], "json_schema");
+        assert_eq!(out["text"]["format"]["json_schema"]["name"], "answer");
+        assert!(out.get("response_format").is_none());
+    }
+
+    #[test]
+    fn responses_text_format_maps_to_chat_response_format_without_text_field() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [],
+            "text": {
+                "format": {
+                    "type": "json_object"
+                }
+            }
+        });
+
+        let out = map_responses_to_chat_request_with_stream(
+            &request,
+            &HashSet::new(),
+            false,
+            false,
+            ToolTransformMode::LegacyConvert,
+        )
+        .expect("ok");
+
+        assert_eq!(out.chat_request["response_format"]["type"], "json_object");
+        assert!(out.chat_request.get("text").is_none());
+    }
 }

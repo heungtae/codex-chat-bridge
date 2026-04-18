@@ -4,6 +4,10 @@
 
 This is intended for "no core source change" integration: run this bridge locally, then override `model_provider` to point Codex at the bridge.
 
+## Documentation
+
+- [OpenAI / Anthropic API 문서 정리](docs/openai-anthropic-api-summary.md)
+
 ## Prerequisites (before `npm install`)
 
 `npm install` runs a `postinstall` step that compiles the Rust binary locally (`cargo build --release`).

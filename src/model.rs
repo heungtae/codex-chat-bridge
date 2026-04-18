@@ -29,9 +29,10 @@ pub(crate) struct UpstreamHeader {
     pub(crate) value: String,
 }
 
-pub(crate) const DEFAULT_FORWARDED_UPSTREAM_HEADERS: [&str; 5] = [
+pub(crate) const DEFAULT_FORWARDED_UPSTREAM_HEADERS: [&str; 6] = [
     "openai-organization",
     "openai-project",
+    "x-client-request-id",
     "x-openai-subagent",
     "x-codex-turn-state",
     "x-codex-turn-metadata",

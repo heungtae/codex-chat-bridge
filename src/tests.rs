@@ -335,7 +335,7 @@ fn map_applies_responses_extensions_to_chat_payload() {
         "reasoning.encrypted_content"
     );
     assert_eq!(req.chat_request["response_format"]["type"], "json_object");
-    assert_eq!(req.chat_request["text"]["format"]["type"], "json_object");
+    assert!(req.chat_request.get("text").is_none());
 }
 
 #[test]
@@ -2104,7 +2104,7 @@ fn prefixed_anthropic_messages_path_maps_request_to_chat_payload() {
 }
 
 #[test]
-fn prefixed_anthropic_messages_path_strips_bridge_thinking_fields() {
+fn prefixed_anthropic_messages_path_preserves_thinking_content_when_enabled() {
     let request = json!({
         "model": "claude-sonnet-4-6",
         "messages": [
@@ -2138,7 +2138,10 @@ fn prefixed_anthropic_messages_path_strips_bridge_thinking_fields() {
         .expect("messages array");
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0]["role"], "assistant");
-    assert_eq!(messages[0]["content"], "hello");
+    assert_eq!(
+        messages[0]["content"],
+        "<thinking>\ninternal chain\n</thinking>\n\nhello"
+    );
     assert_eq!(messages[0].get("reasoning_content"), None);
 }
 
@@ -2149,6 +2152,13 @@ fn map_chat_to_responses_request_converts_messages() {
         "messages": [
             {"role":"user","content":"hello"}
         ],
+        "response_format": {
+            "type": "json_schema",
+            "json_schema": {
+                "name": "answer",
+                "schema": {"type":"object"}
+            }
+        },
         "stream": false
     });
 
@@ -2157,6 +2167,8 @@ fn map_chat_to_responses_request_converts_messages() {
     assert_eq!(out["stream"], false);
     assert_eq!(out["input"][0]["type"], "message");
     assert_eq!(out["input"][0]["content"][0]["text"], "hello");
+    assert_eq!(out["text"]["format"]["type"], "json_schema");
+    assert_eq!(out["text"]["format"]["json_schema"]["name"], "answer");
 }
 
 fn responses_input_items(out: &Value) -> &[Value] {
@@ -2473,6 +2485,7 @@ fn request_fields_for_logging_sorts_top_level_keys() {
 fn upstream_headers_for_logging_includes_forwarded_headers() {
     let mut headers = HeaderMap::new();
     headers.insert("openai-organization", HeaderValue::from_static("org_123"));
+    headers.insert("x-client-request-id", HeaderValue::from_static("trace_123"));
     headers.insert("x-openai-subagent", HeaderValue::from_static("subagent_1"));
     let configured_headers = vec![
         UpstreamHeader {
@@ -2486,6 +2499,7 @@ fn upstream_headers_for_logging_includes_forwarded_headers() {
     ];
     let forwarded_headers = vec![
         "openai-organization".to_string(),
+        "x-client-request-id".to_string(),
         "x-openai-subagent".to_string(),
     ];
 
@@ -2494,6 +2508,7 @@ fn upstream_headers_for_logging_includes_forwarded_headers() {
     assert_eq!(out["authorization"], "<redacted>");
     assert_eq!(out["content-type"], "application/json");
     assert_eq!(out["openai-organization"], "org_123");
+    assert_eq!(out["x-client-request-id"], "trace_123");
     assert_eq!(out["x-openai-subagent"], "subagent_1");
     assert_eq!(out["x-custom-header"], "hello");
 }
@@ -2643,7 +2658,10 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
             name: "x-request-id".to_string(),
             value: "from-upstream-http-headers".to_string(),
         }],
-        forward_incoming_headers: vec!["x-request-id".to_string()],
+        forward_incoming_headers: vec![
+            "x-request-id".to_string(),
+            "x-client-request-id".to_string(),
+        ],
         drop_tool_types: HashSet::new(),
         drop_request_fields: HashSet::new(),
         feature_flags: FeatureFlags::default(),
@@ -2654,6 +2672,10 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
     incoming_headers.insert(
         "x-request-id",
         HeaderValue::from_static("from-forward-incoming-headers"),
+    );
+    incoming_headers.insert(
+        "x-client-request-id",
+        HeaderValue::from_static("client-trace-123"),
     );
 
     let request = build_upstream_request(
@@ -2669,6 +2691,13 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
 
     assert_eq!(collected.len(), 1);
     assert_eq!(collected[0], "from-upstream-http-headers");
+    assert_eq!(
+        request
+            .headers()
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("client-trace-123")
+    );
 }
 
 fn test_state_with_router(
