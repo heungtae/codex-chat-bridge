@@ -3113,6 +3113,84 @@ async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
     assert!(payload.contains("\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\""));
     assert!(payload.contains("\"text\":\"before \""));
     assert!(payload.contains("\"text\":\" after\""));
+    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_parses_exit_plan_mode_python_call() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"ExitPlanMode()\"}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::from(["ExitPlanMode".to_string()]),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"name\":\"ExitPlanMode\""));
+    assert!(payload.contains("\"partial_json\":\"{}\""));
+    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
+    assert!(!payload.contains("\"type\":\"text_delta\""));
+}
+
+#[tokio::test]
+async fn anthropic_stream_parses_exit_plan_mode_harmony_call() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"to=functions.ExitPlanMode<|constrain|>json<|message|>{}\"}}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::from(["ExitPlanMode".to_string()]),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"name\":\"ExitPlanMode\""));
+    assert!(payload.contains("\"partial_json\":\"{}\""));
+    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
+    assert!(!payload.contains("<|constrain|>"));
+    assert!(!payload.contains("<|message|>"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_keeps_unallowed_harmony_call_as_text() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"to=functions.ExitPlanMode<|constrain|>json<|message|>{}\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "claude-bridge".to_string(),
+        HashSet::from(["OtherTool".to_string()]),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"text\":\"to=functions.ExitPlanModejson{}\""));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]

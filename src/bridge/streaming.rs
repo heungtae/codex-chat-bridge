@@ -239,7 +239,7 @@ where
                     for parsed in think_parser.feed(&content) {
                         match parsed.kind {
                             ThinkContentKind::Text => {
-                                emit_text_segment(
+                                if emit_text_segment(
                                     &mut emitted,
                                     &mut next_index,
                                     &mut thinking_index,
@@ -248,7 +248,9 @@ where
                                     &mut text_started,
                                     &mut heuristic_tool_parser,
                                     &parsed.content,
-                                );
+                                ) {
+                                    finish_reason = "tool_use".to_string();
+                                }
                             }
                             ThinkContentKind::Thinking => {
                                 emit_thinking_segment(
@@ -266,6 +268,7 @@ where
                 }
 
                 if let Some(tool_calls) = delta.tool_calls {
+                    finish_reason = "tool_use".to_string();
                     if let Some(index) = thinking_index.take() {
                         emitted.push(anthropic_content_block_stop(index));
                         thinking_started = false;
@@ -366,7 +369,7 @@ where
             let mut emitted = Vec::new();
             match remaining.kind {
                 ThinkContentKind::Text => {
-                    emit_text_segment(
+                    if emit_text_segment(
                         &mut emitted,
                         &mut next_index,
                         &mut thinking_index,
@@ -375,7 +378,9 @@ where
                         &mut text_started,
                         &mut heuristic_tool_parser,
                         &remaining.content,
-                    );
+                    ) {
+                        finish_reason = "tool_use".to_string();
+                    }
                 }
                 ThinkContentKind::Thinking => {
                     emit_thinking_segment(
@@ -395,7 +400,7 @@ where
         }
 
         let mut emitted = Vec::new();
-        emit_heuristic_fragments(
+        if emit_heuristic_fragments(
             &mut emitted,
             &mut next_index,
             &mut thinking_index,
@@ -403,7 +408,9 @@ where
             &mut text_index,
             &mut text_started,
             heuristic_tool_parser.flush(),
-        );
+        ) {
+            finish_reason = "tool_use".to_string();
+        }
         for event in emitted {
             yield Ok(event);
         }
@@ -1213,9 +1220,9 @@ fn emit_text_segment(
     text_started: &mut bool,
     heuristic_tool_parser: &mut HeuristicToolParser,
     segment: &str,
-) {
+) -> bool {
     if segment.is_empty() {
-        return;
+        return false;
     }
     if let Some(index) = thinking_index.take() {
         emitted.push(anthropic_content_block_stop(index));
@@ -1223,7 +1230,7 @@ fn emit_text_segment(
     }
     let fragments = heuristic_tool_parser.feed(segment);
     if fragments.is_empty() {
-        return;
+        return false;
     }
     emit_heuristic_fragments(
         emitted,
@@ -1233,7 +1240,7 @@ fn emit_text_segment(
         text_index,
         text_started,
         fragments,
-    );
+    )
 }
 
 fn emit_heuristic_fragments(
@@ -1244,7 +1251,8 @@ fn emit_heuristic_fragments(
     text_index: &mut Option<usize>,
     text_started: &mut bool,
     fragments: Vec<HeuristicFragment>,
-) {
+) -> bool {
+    let mut emitted_tool_call = false;
     for fragment in fragments {
         match fragment {
             HeuristicFragment::Text(text) => {
@@ -1267,6 +1275,7 @@ fn emit_heuristic_fragments(
                 emitted.push(anthropic_content_block_delta(index, "text_delta", &text));
             }
             HeuristicFragment::ToolCall(call) => {
+                emitted_tool_call = true;
                 emit_heuristic_tool_call(
                     emitted,
                     next_index,
@@ -1279,6 +1288,7 @@ fn emit_heuristic_fragments(
             }
         }
     }
+    emitted_tool_call
 }
 
 fn emit_thinking_segment(
@@ -1497,6 +1507,8 @@ impl HeuristicToolParser {
     fn find_candidate_start(&self) -> Option<usize> {
         let mut candidate = None;
         candidate = min_option(candidate, self.find_special_wrapper_start());
+        candidate = min_option(candidate, self.find_allowed_xml_wrapper_start());
+        candidate = min_option(candidate, self.find_harmony_tool_call_start());
         candidate = min_option(candidate, self.find_wrapped_python_call_start());
 
         for name in &self.allowed_tool_names {
@@ -1532,12 +1544,50 @@ impl HeuristicToolParser {
             .min()
     }
 
+    fn find_allowed_xml_wrapper_start(&self) -> Option<usize> {
+        self.allowed_tool_names
+            .iter()
+            .filter_map(|name| self.buffer.find(&format!("<{name}>")))
+            .min()
+    }
+
+    fn find_harmony_tool_call_start(&self) -> Option<usize> {
+        let mut start = 0;
+        while let Some(idx) = self.buffer[start..].find("to=functions.") {
+            let pos = start + idx;
+            let rest = &self.buffer[pos + "to=functions.".len()..];
+            if self.allowed_tool_names.iter().any(|name| {
+                rest.starts_with(name) && looks_like_harmony_tool_tail(&rest[name.len()..])
+            }) {
+                return Some(pos);
+            }
+            start = pos + 1;
+        }
+        None
+    }
+
     fn looks_like_bare_tool_prefix(&self) -> bool {
         let trimmed = self.buffer.trim_start_matches(char::is_whitespace);
 
         if Self::SPECIAL_WRAPPER_NAMES
             .iter()
             .any(|name| trimmed.starts_with(&format!("<{name}>")))
+        {
+            return true;
+        }
+
+        if self
+            .allowed_tool_names
+            .iter()
+            .any(|name| trimmed.starts_with(&format!("<{name}>")))
+        {
+            return true;
+        }
+
+        if let Some(rest) = trimmed.strip_prefix("to=functions.")
+            && self.allowed_tool_names.iter().any(|name| {
+                rest.starts_with(name) && looks_like_harmony_tool_tail(&rest[name.len()..])
+            })
         {
             return true;
         }
@@ -1554,6 +1604,15 @@ impl HeuristicToolParser {
             .iter()
             .any(|name| trimmed.starts_with(&format!("{name}(")))
     }
+}
+
+fn looks_like_harmony_tool_tail(tail: &str) -> bool {
+    tail.is_empty()
+        || tail.starts_with("json")
+        || tail.starts_with('{')
+        || tail.starts_with('[')
+        || tail.starts_with(char::is_whitespace)
+        || tail.starts_with(HeuristicToolParser::CONTROL_TOKEN_START)
 }
 
 fn min_option(current: Option<usize>, candidate: Option<usize>) -> Option<usize> {
@@ -1584,6 +1643,12 @@ fn try_parse_python_tool_call_prefix(
     allowed_tool_names: &HashSet<String>,
 ) -> Option<(Vec<HeuristicToolCall>, usize)> {
     if let Some(result) = try_parse_special_wrapper(text) {
+        return Some(result);
+    }
+    if let Some(result) = try_parse_allowed_xml_wrapper(text, allowed_tool_names) {
+        return Some(result);
+    }
+    if let Some(result) = try_parse_harmony_tool_call(text, allowed_tool_names) {
         return Some(result);
     }
 
@@ -1636,6 +1701,73 @@ fn try_parse_special_wrapper(text: &str) -> Option<(Vec<HeuristicToolCall>, usiz
     }
 
     None
+}
+
+fn try_parse_allowed_xml_wrapper(
+    text: &str,
+    allowed_tool_names: &HashSet<String>,
+) -> Option<(Vec<HeuristicToolCall>, usize)> {
+    let trimmed = text.trim_start_matches(char::is_whitespace);
+    let consumed_prefix = text.len() - trimmed.len();
+
+    for name in allowed_tool_names {
+        let open_tag = format!("<{name}>");
+        if !trimmed.starts_with(&open_tag) {
+            continue;
+        }
+
+        let mut rest = trimmed[open_tag.len()..].trim_start_matches(char::is_whitespace);
+        let (raw_input, consumed_json) = parse_json_prefix(rest)?;
+        rest = &rest[consumed_json..];
+        let rest_trimmed = rest.trim_start_matches(char::is_whitespace);
+        let consumed_ws = rest.len() - rest_trimmed.len();
+        let close_tag = format!("</{name}>");
+        let consumed_close = if rest_trimmed.starts_with(&close_tag) {
+            close_tag.len()
+        } else {
+            0
+        };
+
+        return Some((
+            vec![HeuristicToolCall {
+                id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
+                name: name.to_string(),
+                input: raw_input,
+            }],
+            consumed_prefix + open_tag.len() + consumed_json + consumed_ws + consumed_close,
+        ));
+    }
+
+    None
+}
+
+fn try_parse_harmony_tool_call(
+    text: &str,
+    allowed_tool_names: &HashSet<String>,
+) -> Option<(Vec<HeuristicToolCall>, usize)> {
+    let trimmed = text.trim_start_matches(char::is_whitespace);
+    let consumed_prefix = text.len() - trimmed.len();
+    let rest = trimmed.strip_prefix("to=functions.")?;
+
+    let name = allowed_tool_names
+        .iter()
+        .filter(|name| rest.starts_with(name.as_str()))
+        .max_by_key(|name| name.len())?;
+    let mut tail = rest[name.len()..].trim_start_matches(char::is_whitespace);
+    if let Some(json_tail) = tail.strip_prefix("json") {
+        tail = json_tail.trim_start_matches(char::is_whitespace);
+    }
+
+    let (raw_input, consumed_json) = parse_json_prefix(tail)?;
+    let consumed_before_json = trimmed.len() - tail.len();
+    Some((
+        vec![HeuristicToolCall {
+            id: format!("toolu_heuristic_{}", uuid::Uuid::now_v7()),
+            name: name.to_string(),
+            input: raw_input,
+        }],
+        consumed_prefix + consumed_before_json + consumed_json,
+    ))
 }
 
 fn parse_json_prefix(text: &str) -> Option<(Value, usize)> {
