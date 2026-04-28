@@ -1676,12 +1676,43 @@ fn apply_responses_request_extensions(request: &Value, chat_request: &mut Value)
     if let Some(include) = request.get("include") {
         chat_obj.insert("include".to_string(), include.clone());
     }
-    if let Some(text) = request.get("text") {
-        if let Some(format) = text.get("format") {
-            chat_obj.insert("response_format".to_string(), format.clone());
-        }
+    if let Some(text) = request.get("text")
+        && let Some(response_format) = text
+            .get("format")
+            .and_then(responses_text_format_to_chat_response_format)
+    {
+        chat_obj.insert("response_format".to_string(), response_format);
     }
     Ok(())
+}
+
+fn responses_text_format_to_chat_response_format(format: &Value) -> Option<Value> {
+    let format_obj = format.as_object()?;
+    let format_type = format_obj.get("type").and_then(Value::as_str)?;
+
+    match format_type {
+        "json_schema" if format_obj.contains_key("json_schema") => Some(format.clone()),
+        "json_schema" => {
+            let schema = format_obj.get("schema")?.clone();
+            let name = format_obj.get("name")?.clone();
+            let mut json_schema = serde_json::Map::new();
+            json_schema.insert("name".to_string(), name);
+            json_schema.insert("schema".to_string(), schema);
+
+            for field in ["description", "strict"] {
+                if let Some(value) = format_obj.get(field) {
+                    json_schema.insert(field.to_string(), value.clone());
+                }
+            }
+
+            Some(json!({
+                "type": "json_schema",
+                "json_schema": Value::Object(json_schema),
+            }))
+        }
+        "json_object" => Some(format.clone()),
+        _ => None,
+    }
 }
 
 pub(crate) fn flatten_content_items(items: &[Value], enable_extended_input_types: bool) -> String {
@@ -2038,5 +2069,52 @@ mod tests {
 
         assert_eq!(out.chat_request["response_format"]["type"], "json_object");
         assert!(out.chat_request.get("text").is_none());
+    }
+
+    #[test]
+    fn responses_json_schema_text_format_maps_to_chat_response_format() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "name": "codex_output_schema",
+                    "schema": {
+                        "type": "object",
+                        "properties": {
+                            "answer": {"type": "string"}
+                        },
+                        "required": ["answer"],
+                        "additionalProperties": false
+                    },
+                    "strict": true
+                }
+            }
+        });
+
+        let out = map_responses_to_chat_request_with_stream(
+            &request,
+            &HashSet::new(),
+            false,
+            false,
+            ToolTransformMode::LegacyConvert,
+        )
+        .expect("ok");
+
+        assert_eq!(out.chat_request["response_format"]["type"], "json_schema");
+        assert_eq!(
+            out.chat_request["response_format"]["json_schema"]["name"],
+            "codex_output_schema"
+        );
+        assert_eq!(
+            out.chat_request["response_format"]["json_schema"]["schema"]["type"],
+            "object"
+        );
+        assert_eq!(
+            out.chat_request["response_format"]["json_schema"]["strict"],
+            true
+        );
+        assert!(out.chat_request["response_format"].get("schema").is_none());
     }
 }
