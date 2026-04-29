@@ -19,7 +19,6 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::fs::File;
 use std::fs::{self};
 use std::io::Write;
@@ -833,9 +832,10 @@ async fn finalize_upstream_response(
     route_target: &RouteTarget,
     incoming_api: IncomingApi,
     wants_stream: bool,
+    upstream_model: String,
+    anthropic_input_tokens: i64,
     response_id: String,
     tool_call_kinds_by_name: HashMap<String, ResponsesToolCallKind>,
-    allowed_tool_names: HashSet<String>,
     verbose_logging: bool,
 ) -> Response {
     if !upstream_response.status().is_success() {
@@ -863,18 +863,11 @@ async fn finalize_upstream_response(
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
         warn!(
             "upstream error response headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
-            route_target.router_name,
-            incoming_api,
-            route_target.upstream_wire,
-            headers
+            route_target.router_name, incoming_api, route_target.upstream_wire, headers
         );
         warn!(
             "upstream error response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, body={}",
-            route_target.router_name,
-            incoming_api,
-            route_target.upstream_wire,
-            status,
-            body
+            route_target.router_name, incoming_api, route_target.upstream_wire, status, body
         );
         if verbose_logging {
             debug!(
@@ -914,13 +907,12 @@ async fn finalize_upstream_response(
         let body = match route_target.upstream_wire {
             WireApi::Chat => {
                 if incoming_api == IncomingApi::Anthropic {
-                    let model = "claude-bridge".to_string();
                     Body::from_stream(translate_chat_stream_to_anthropic(
                         upstream_response.bytes_stream(),
                         route_target.router_name.clone(),
                         verbose_logging,
-                        model,
-                        allowed_tool_names,
+                        upstream_model.clone(),
+                        anthropic_input_tokens,
                     ))
                 } else {
                     Body::from_stream(translate_chat_stream(
@@ -976,7 +968,7 @@ async fn finalize_upstream_response(
     let response_json = match route_target.upstream_wire {
         WireApi::Chat => {
             if incoming_api == IncomingApi::Anthropic {
-                chat_json_to_anthropic_json(upstream_json, "claude-bridge")
+                chat_json_to_anthropic_json(upstream_json, &upstream_model)
             } else {
                 chat_json_to_responses_json(
                     upstream_json,
@@ -988,7 +980,7 @@ async fn finalize_upstream_response(
         }
         WireApi::Responses => {
             if incoming_api == IncomingApi::Anthropic {
-                responses_json_to_anthropic_json(upstream_json, "claude-bridge")
+                responses_json_to_anthropic_json(upstream_json, &upstream_model)
             } else {
                 upstream_json
             }
@@ -998,25 +990,12 @@ async fn finalize_upstream_response(
     json_success_response(response_json)
 }
 
-fn extract_allowed_tool_names(payload: &Value) -> HashSet<String> {
+fn upstream_payload_model(payload: &Value) -> String {
     payload
-        .get("tools")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|tool| {
-            tool.get("function")
-                .and_then(Value::as_object)
-                .and_then(|function| function.get("name"))
-                .and_then(Value::as_str)
-                .map(ToString::to_string)
-                .or_else(|| {
-                    tool.get("name")
-                        .and_then(Value::as_str)
-                        .map(ToString::to_string)
-                })
-        })
-        .collect()
+        .get("model")
+        .and_then(Value::as_str)
+        .unwrap_or("claude-bridge")
+        .to_string()
 }
 
 pub(crate) async fn handle_incoming(
@@ -1160,6 +1139,12 @@ pub(crate) async fn handle_incoming(
 
     let upstream_request =
         build_upstream_request(&state, &route_target, &headers, &upstream_payload);
+    let upstream_model = upstream_payload_model(&upstream_payload);
+    let anthropic_input_tokens = if incoming_api == IncomingApi::Anthropic {
+        estimate_anthropic_count_tokens(&request_value)
+    } else {
+        0
+    };
     let upstream_response = match upstream_request.send().await {
         Ok(response) => response,
         Err(err) => {
@@ -1209,9 +1194,10 @@ pub(crate) async fn handle_incoming(
         &route_target,
         incoming_api,
         wants_stream,
+        upstream_model,
+        anthropic_input_tokens,
         response_id,
         tool_call_kinds_by_name,
-        extract_allowed_tool_names(&upstream_payload),
         verbose_logging,
     )
     .await

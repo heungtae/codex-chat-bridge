@@ -63,11 +63,9 @@ pub(crate) fn map_chat_to_responses_request(request: &Value, stream: bool) -> Re
 
             if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
                 for (tool_index, tool_call) in tool_calls.iter().enumerate() {
-                    if let Some(function_call) = chat_tool_call_to_responses_input_item(
-                        tool_call,
-                        message_index,
-                        tool_index,
-                    ) {
+                    if let Some(function_call) =
+                        chat_tool_call_to_responses_input_item(tool_call, message_index, tool_index)
+                    {
                         input.push(function_call);
                     }
                 }
@@ -454,53 +452,6 @@ fn split_think_tagged_text(text: &str) -> Option<Vec<Value>> {
     Some(blocks)
 }
 
-fn push_anthropic_thinking_block(content: &mut Vec<Value>, block: &Value) {
-    match block
-        .get("type")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-    {
-        "thinking" => {
-            let thinking = block
-                .get("thinking")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let signature = block
-                .get("signature")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            if thinking.trim().is_empty() && signature.trim().is_empty() {
-                return;
-            }
-            let mut item = json!({
-                "type": "thinking",
-                "thinking": thinking,
-            });
-            if !signature.trim().is_empty()
-                && let Some(obj) = item.as_object_mut()
-            {
-                obj.insert(
-                    "signature".to_string(),
-                    Value::String(signature.to_string()),
-                );
-            }
-            content.push(item);
-        }
-        "redacted_thinking" => {
-            let mut item = json!({
-                "type": "redacted_thinking",
-            });
-            if let Some(data) = block.get("data") {
-                if let Some(obj) = item.as_object_mut() {
-                    obj.insert("data".to_string(), data.clone());
-                }
-            }
-            content.push(item);
-        }
-        _ => {}
-    }
-}
-
 fn next_think_open(text: &str) -> Option<usize> {
     match (text.find("<think>"), text.find("<thinking>")) {
         (Some(a), Some(b)) => Some(a.min(b)),
@@ -647,7 +598,11 @@ fn anthropic_image_to_chat_content_item(item: &Value) -> Option<Value> {
     let source_type = source.get("type").and_then(Value::as_str)?;
 
     let image_url = match source_type {
-        "url" => source.get("url").and_then(Value::as_str)?.trim().to_string(),
+        "url" => source
+            .get("url")
+            .and_then(Value::as_str)?
+            .trim()
+            .to_string(),
         "base64" => {
             let data = source.get("data").and_then(Value::as_str)?.trim();
             if data.is_empty() {
@@ -1059,25 +1014,31 @@ pub(crate) fn chat_json_to_responses_json(
 
 pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> Value {
     let mut content = Vec::new();
-    let mut stop_reason = "end_turn";
+    let mut stop_reason = None::<String>;
 
     if let Some(choice) = chat
         .get("choices")
         .and_then(Value::as_array)
         .and_then(|items| items.first())
     {
-        stop_reason = match choice.get("finish_reason").and_then(Value::as_str) {
-            Some("length") => "max_tokens",
-            Some("tool_calls") => "tool_use",
-            _ => "end_turn",
-        };
-
         if let Some(message) = choice.get("message") {
-            if let Some(blocks) = message.get("thinking_blocks").and_then(Value::as_array) {
-                for block in blocks {
-                    push_anthropic_thinking_block(&mut content, block);
+            let has_tool_calls = message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|tool_calls| !tool_calls.is_empty());
+            stop_reason = if has_tool_calls {
+                Some("tool_use".to_string())
+            } else {
+                match choice.get("finish_reason").and_then(Value::as_str) {
+                    Some("stop") => Some("end_turn".to_string()),
+                    Some("length") => Some("max_tokens".to_string()),
+                    Some("tool_calls") => Some("tool_use".to_string()),
+                    Some(reason) if !reason.trim().is_empty() => Some("stop_sequence".to_string()),
+                    _ => None,
                 }
-            } else if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
+            };
+
+            if let Some(reasoning) = message.get("reasoning_content").and_then(Value::as_str)
                 && !reasoning.trim().is_empty()
             {
                 content.push(json!({
@@ -1105,9 +1066,7 @@ pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> 
             }
 
             if let Some(text) = message.get("content").and_then(Value::as_str) {
-                if let Some(segments) = split_think_tagged_text(text) {
-                    content.extend(segments);
-                } else if !text.trim().is_empty() {
+                if !text.trim().is_empty() {
                     content.push(json!({
                         "type": "text",
                         "text": text,
@@ -1118,29 +1077,10 @@ pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> 
                     .get("content")
                     .map(function_output_to_text)
                     .unwrap_or_default();
-                if let Some(segments) = split_think_tagged_text(&text) {
-                    content.extend(segments);
-                } else if !text.trim().is_empty() {
+                if !text.trim().is_empty() {
                     content.push(json!({
                         "type": "text",
                         "text": text,
-                    }));
-                }
-            }
-
-            if let Some(details) = message.get("reasoning_details").and_then(Value::as_array) {
-                for text in details
-                    .iter()
-                    .filter_map(|item| {
-                        item.get("text")
-                            .and_then(Value::as_str)
-                            .or_else(|| item.get("content").and_then(Value::as_str))
-                    })
-                    .filter(|text| !text.trim().is_empty())
-                {
-                    content.push(json!({
-                        "type": "thinking",
-                        "thinking": text,
                     }));
                 }
             }
@@ -1163,19 +1103,23 @@ pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> 
         }
     }
 
-    json!({
+    let mut response = json!({
         "id": chat.get("id").and_then(Value::as_str).map(ToString::to_string).unwrap_or_else(|| format!("msg_{}", Uuid::now_v7())),
         "type": "message",
         "role": "assistant",
         "model": chat.get("model").and_then(Value::as_str).unwrap_or(fallback_model),
         "content": content,
-        "stop_reason": stop_reason,
-        "stop_sequence": null,
         "usage": {
             "input_tokens": chat.get("usage").and_then(|u| u.get("prompt_tokens")).and_then(Value::as_i64).unwrap_or(0),
             "output_tokens": chat.get("usage").and_then(|u| u.get("completion_tokens")).and_then(Value::as_i64).unwrap_or(0),
         }
-    })
+    });
+    if let Some(stop_reason) = stop_reason
+        && let Some(obj) = response.as_object_mut()
+    {
+        obj.insert("stop_reason".to_string(), Value::String(stop_reason));
+    }
+    response
 }
 
 pub(crate) fn responses_json_to_anthropic_json(response: Value, fallback_model: &str) -> Value {
@@ -1648,12 +1592,18 @@ fn chat_content_item_to_input_item(item: &Value) -> Option<Value> {
         let image_url = item
             .get("image_url")
             .and_then(|value| {
-                value
-                    .as_str()
-                    .map(ToString::to_string)
-                    .or_else(|| value.get("url").and_then(Value::as_str).map(ToString::to_string))
+                value.as_str().map(ToString::to_string).or_else(|| {
+                    value
+                        .get("url")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
             })
-            .or_else(|| item.get("url").and_then(Value::as_str).map(ToString::to_string))
+            .or_else(|| {
+                item.get("url")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
             .unwrap_or_default();
         if image_url.is_empty() {
             return None;
@@ -2064,7 +2014,10 @@ mod tests {
         assert_eq!(messages[0]["content"][0]["type"], "text");
         assert_eq!(messages[0]["content"][0]["text"], "before");
         assert_eq!(messages[0]["content"][1]["type"], "image_url");
-        assert_eq!(messages[0]["content"][1]["image_url"]["url"], "https://example.com/cat.png");
+        assert_eq!(
+            messages[0]["content"][1]["image_url"]["url"],
+            "https://example.com/cat.png"
+        );
         assert_eq!(messages[0]["content"][2]["type"], "text");
         assert_eq!(messages[0]["content"][2]["text"], "after");
     }

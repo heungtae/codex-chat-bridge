@@ -38,12 +38,6 @@ pub(crate) struct ChatDelta {
     pub(crate) content: Option<String>,
     #[serde(default)]
     pub(crate) reasoning_content: Option<String>,
-    #[serde(default)]
-    pub(crate) reasoning_details: Option<Value>,
-    #[serde(default)]
-    pub(crate) thinking_blocks: Option<Value>,
-    #[serde(default)]
-    pub(crate) signature: Option<String>,
     #[serde(default, deserialize_with = "deserialize_non_empty_tool_calls")]
     pub(crate) tool_calls: Option<Vec<ChatToolCallDelta>>,
 }

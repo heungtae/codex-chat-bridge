@@ -790,7 +790,7 @@ fn chat_json_to_anthropic_json_maps_tool_calls() {
 }
 
 #[test]
-fn chat_json_to_anthropic_json_splits_think_tags_in_content() {
+fn chat_json_to_anthropic_json_keeps_think_tags_as_text() {
     let input = json!({
         "choices": [{
             "message": {
@@ -801,15 +801,15 @@ fn chat_json_to_anthropic_json_splits_think_tags_in_content() {
 
     let out = chat_json_to_anthropic_json(input, "claude-bridge");
     assert_eq!(out["content"][0]["type"], "text");
-    assert_eq!(out["content"][0]["text"], "before ");
-    assert_eq!(out["content"][1]["type"], "thinking");
-    assert_eq!(out["content"][1]["thinking"], "internal");
-    assert_eq!(out["content"][2]["type"], "text");
-    assert_eq!(out["content"][2]["text"], " after");
+    assert_eq!(
+        out["content"][0]["text"],
+        "before <think>internal</think> after"
+    );
+    assert!(out.get("stop_sequence").is_none());
 }
 
 #[test]
-fn chat_json_to_anthropic_json_preserves_thinking_blocks_and_signature() {
+fn chat_json_to_anthropic_json_ignores_provider_specific_thinking_blocks() {
     let input = json!({
         "choices": [{
             "message": {
@@ -829,11 +829,37 @@ fn chat_json_to_anthropic_json_preserves_thinking_blocks_and_signature() {
     });
 
     let out = chat_json_to_anthropic_json(input, "claude-bridge");
-    assert_eq!(out["content"][0]["type"], "thinking");
-    assert_eq!(out["content"][0]["thinking"], "step one");
-    assert_eq!(out["content"][0]["signature"], "sig_1");
-    assert_eq!(out["content"][1]["type"], "redacted_thinking");
-    assert_eq!(out["content"][1]["data"], "redacted_payload");
+    assert_eq!(out["content"].as_array().unwrap().len(), 0);
+    assert!(out.get("stop_reason").is_none());
+    assert!(out.get("stop_sequence").is_none());
+}
+
+#[test]
+fn chat_json_to_anthropic_json_maps_unknown_finish_reason_to_stop_sequence() {
+    let input = json!({
+        "choices": [{
+            "finish_reason": "content_filter",
+            "message": {"content": "filtered"}
+        }]
+    });
+
+    let out = chat_json_to_anthropic_json(input, "claude-bridge");
+    assert_eq!(out["stop_reason"], "stop_sequence");
+    assert!(out.get("stop_sequence").is_none());
+}
+
+#[test]
+fn chat_json_to_anthropic_json_omits_empty_finish_reason() {
+    let input = json!({
+        "choices": [{
+            "finish_reason": "",
+            "message": {"content": "hello"}
+        }]
+    });
+
+    let out = chat_json_to_anthropic_json(input, "claude-bridge");
+    assert!(out.get("stop_reason").is_none());
+    assert!(out.get("stop_sequence").is_none());
 }
 
 #[test]
@@ -2369,8 +2395,8 @@ fn map_chat_to_responses_request_maps_tool_messages_to_function_call_output() {
 
     let out = map_chat_to_responses_request(&chat, false).expect("ok");
     let items = responses_input_items(&out);
-    let item = responses_input_item(items, "function_call_output")
-        .expect("function_call_output item");
+    let item =
+        responses_input_item(items, "function_call_output").expect("function_call_output item");
     assert_eq!(item["call_id"], "call_2");
     assert_eq!(item["output"], "{\"ok\":true}");
 }
@@ -2966,6 +2992,61 @@ async fn stream_emits_reasoning_summary_events() {
 }
 
 #[tokio::test]
+async fn anthropic_stream_message_start_uses_model_and_input_tokens_without_null_stop_fields() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"content\":\"Hi\"},\"finish_reason\":\"stop\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "gpt-4.1".to_string(),
+        17,
+    ));
+    let first = output
+        .next()
+        .await
+        .expect("message_start event")
+        .expect("stream event");
+    let payload = String::from_utf8_lossy(&first);
+
+    assert!(payload.contains("event: message_start"));
+    assert!(payload.contains("\"model\":\"gpt-4.1\""));
+    assert!(payload.contains("\"input_tokens\":17"));
+    assert!(!payload.contains("\"stop_reason\":null"));
+    assert!(!payload.contains("\"stop_sequence\":null"));
+}
+
+#[tokio::test]
+async fn anthropic_stream_maps_native_tool_call_delta() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"shell\",\"arguments\":\"{\\\"cmd\\\":\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream_to_anthropic(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "gpt-4.1".to_string(),
+        0,
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"id\":\"call_1\""));
+    assert!(payload.contains("\"name\":\"shell\""));
+    assert!(payload.contains("\"partial_json\":\"{\\\"cmd\\\":\""));
+    assert!(payload.contains("\"partial_json\":\"\\\"pwd\\\"}\""));
+    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
+}
+
+#[tokio::test]
 async fn anthropic_stream_handles_split_think_tags_across_chunks() {
     let upstream = stream::iter(vec![
         Ok::<Bytes, reqwest::Error>(Bytes::from(
@@ -2984,7 +3065,7 @@ async fn anthropic_stream_handles_split_think_tags_across_chunks() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -2992,15 +3073,14 @@ async fn anthropic_stream_handles_split_think_tags_across_chunks() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"text\":\"before \""));
-    assert!(payload.contains("\"type\":\"thinking_delta\""));
-    assert!(payload.contains("\"thinking\":\"internal\""));
-    assert!(payload.contains("\"text\":\" after\""));
-    assert!(!payload.contains("<thi"));
+    assert!(payload.contains("\"text\":\"before <thi\""));
+    assert!(payload.contains("\"text\":\"nk>internal</thi\""));
+    assert!(payload.contains("\"text\":\"nk> after\""));
+    assert!(!payload.contains("\"type\":\"thinking_delta\""));
 }
 
 #[tokio::test]
-async fn anthropic_stream_preserves_signature_delta_from_thinking_blocks() {
+async fn anthropic_stream_ignores_signature_delta_from_thinking_blocks() {
     let upstream = stream::iter(vec![
         Ok::<Bytes, reqwest::Error>(Bytes::from(
             "data: {\"choices\":[{\"delta\":{\"thinking_blocks\":[{\"type\":\"thinking\",\"thinking\":\"step one\",\"signature\":\"sig_1\"}]}}]}\n\n",
@@ -3012,7 +3092,7 @@ async fn anthropic_stream_preserves_signature_delta_from_thinking_blocks() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3020,14 +3100,14 @@ async fn anthropic_stream_preserves_signature_delta_from_thinking_blocks() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"thinking_delta\""));
-    assert!(payload.contains("\"thinking\":\"step one\""));
-    assert!(payload.contains("\"type\":\"signature_delta\""));
-    assert!(payload.contains("\"signature\":\"sig_1\""));
+    assert!(!payload.contains("\"type\":\"thinking_delta\""));
+    assert!(!payload.contains("\"type\":\"signature_delta\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 0);
+    assert!(payload.contains("event: message_stop"));
 }
 
 #[tokio::test]
-async fn anthropic_stream_preserves_redacted_thinking_blocks() {
+async fn anthropic_stream_ignores_redacted_thinking_blocks() {
     let upstream = stream::iter(vec![
         Ok::<Bytes, reqwest::Error>(Bytes::from(
             "data: {\"choices\":[{\"delta\":{\"thinking_blocks\":[{\"type\":\"redacted_thinking\",\"data\":\"secret\"}]}}]}\n\n",
@@ -3039,7 +3119,7 @@ async fn anthropic_stream_preserves_redacted_thinking_blocks() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3047,7 +3127,8 @@ async fn anthropic_stream_preserves_redacted_thinking_blocks() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"redacted_thinking\""));
+    assert!(!payload.contains("\"type\":\"redacted_thinking\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 0);
     assert!(!payload.contains("response.failed"));
 }
 
@@ -3062,7 +3143,7 @@ async fn anthropic_stream_accepts_terminal_finish_reason_without_done_marker() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3091,7 +3172,7 @@ async fn anthropic_stream_splits_think_tags_in_content() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3099,17 +3180,15 @@ async fn anthropic_stream_splits_think_tags_in_content() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"thinking_delta\""));
-    assert!(payload.contains("\"thinking\":\"internal\""));
     assert!(payload.contains("\"type\":\"text_delta\""));
-    assert!(payload.contains("\"text\":\"before \""));
-    assert!(payload.contains("\"text\":\" after\""));
-    assert_eq!(payload.matches("event: content_block_start").count(), 3);
-    assert_eq!(payload.matches("event: content_block_stop").count(), 3);
+    assert!(payload.contains("\"text\":\"before <think>internal</think> after\""));
+    assert!(!payload.contains("\"type\":\"thinking_delta\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 1);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
 }
 
 #[tokio::test]
-async fn stream_emits_thinking_from_reasoning_details() {
+async fn anthropic_stream_ignores_reasoning_details() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"reasoning_details\":[{\"text\":\"step one\"}]}}]}\n\n\
              data: [DONE]\n\n",
@@ -3119,7 +3198,7 @@ async fn stream_emits_thinking_from_reasoning_details() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3127,14 +3206,14 @@ async fn stream_emits_thinking_from_reasoning_details() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"thinking\":\"step one\""));
-    assert_eq!(payload.matches("event: content_block_start").count(), 1);
-    assert_eq!(payload.matches("event: content_block_stop").count(), 1);
+    assert!(!payload.contains("\"thinking\":\"step one\""));
+    assert_eq!(payload.matches("event: content_block_start").count(), 0);
+    assert_eq!(payload.matches("event: content_block_stop").count(), 0);
     assert!(payload.contains("event: message_stop"));
 }
 
 #[tokio::test]
-async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
+async fn anthropic_stream_keeps_heuristic_tool_call_text_as_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"before shell(command='pwd') after\"}}]}\n\n\
              data: [DONE]\n\n",
@@ -3144,7 +3223,7 @@ async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::from(["shell".to_string()]),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3152,16 +3231,13 @@ async fn anthropic_stream_detects_heuristic_tool_call_in_text() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"tool_use\""));
-    assert!(payload.contains("\"name\":\"shell\""));
-    assert!(payload.contains("\"partial_json\":\"{\\\"command\\\":\\\"pwd\\\"}\""));
-    assert!(payload.contains("\"text\":\"before \""));
-    assert!(payload.contains("\"text\":\" after\""));
-    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
+    assert!(payload.contains("\"text\":\"before shell(command='pwd') after\""));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]
-async fn anthropic_stream_parses_exit_plan_mode_python_call() {
+async fn anthropic_stream_keeps_exit_plan_mode_python_call_as_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"ExitPlanMode()\"}}]}\n\n\
              data: [DONE]\n\n",
@@ -3171,7 +3247,7 @@ async fn anthropic_stream_parses_exit_plan_mode_python_call() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::from(["ExitPlanMode".to_string()]),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3179,15 +3255,13 @@ async fn anthropic_stream_parses_exit_plan_mode_python_call() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"tool_use\""));
-    assert!(payload.contains("\"name\":\"ExitPlanMode\""));
-    assert!(payload.contains("\"partial_json\":\"{}\""));
-    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
-    assert!(!payload.contains("\"type\":\"text_delta\""));
+    assert!(payload.contains("\"text\":\"ExitPlanMode()\""));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]
-async fn anthropic_stream_parses_exit_plan_mode_harmony_call() {
+async fn anthropic_stream_keeps_exit_plan_mode_harmony_call_as_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"to=functions.ExitPlanMode<|constrain|>json<|message|>{}\"}}]}\n\n\
              data: [DONE]\n\n",
@@ -3197,7 +3271,7 @@ async fn anthropic_stream_parses_exit_plan_mode_harmony_call() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::from(["ExitPlanMode".to_string()]),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3205,12 +3279,11 @@ async fn anthropic_stream_parses_exit_plan_mode_harmony_call() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"tool_use\""));
-    assert!(payload.contains("\"name\":\"ExitPlanMode\""));
-    assert!(payload.contains("\"partial_json\":\"{}\""));
-    assert!(payload.contains("\"stop_reason\":\"tool_use\""));
-    assert!(!payload.contains("<|constrain|>"));
-    assert!(!payload.contains("<|message|>"));
+    assert!(payload.contains("to=functions.ExitPlanMode"));
+    assert!(payload.contains("<|constrain|>"));
+    assert!(payload.contains("<|message|>"));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]
@@ -3224,7 +3297,7 @@ async fn anthropic_stream_keeps_unallowed_harmony_call_as_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::from(["OtherTool".to_string()]),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3232,13 +3305,15 @@ async fn anthropic_stream_keeps_unallowed_harmony_call_as_text() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"text\":\"to=functions.ExitPlanModejson{}\""));
+    assert!(payload.contains("to=functions.ExitPlanMode"));
+    assert!(payload.contains("<|constrain|>"));
+    assert!(payload.contains("<|message|>"));
     assert!(!payload.contains("\"type\":\"tool_use\""));
     assert!(payload.contains("\"stop_reason\":\"end_turn\""));
 }
 
 #[tokio::test]
-async fn anthropic_stream_strips_control_tokens_from_text_content() {
+async fn anthropic_stream_preserves_control_tokens_in_text_content() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"alpha<|message|>beta<|constrain|>gamma\"}}]}\n\n\
              data: [DONE]\n\n",
@@ -3248,7 +3323,7 @@ async fn anthropic_stream_strips_control_tokens_from_text_content() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3256,9 +3331,7 @@ async fn anthropic_stream_strips_control_tokens_from_text_content() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"text\":\"alphabetagamma\""));
-    assert!(!payload.contains("<|message|>"));
-    assert!(!payload.contains("<|constrain|>"));
+    assert!(payload.contains("alpha<|message|>beta<|constrain|>gamma"));
     assert!(!payload.contains("\"type\":\"tool_use\""));
 }
 
@@ -3273,7 +3346,7 @@ async fn anthropic_stream_keeps_non_tool_thinking_trace_as_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3284,9 +3357,11 @@ async fn anthropic_stream_keeps_non_tool_thinking_trace_as_text() {
     assert!(payload.contains("● <thinking"));
     assert!(payload.contains("Create next tasks."));
     assert!(payload.contains("Create remaining tasks similarly."));
-    assert!(payload.contains("to=functions.TaskCreatejson"));
-    assert!(!payload.contains("<|message|>"));
-    assert!(!payload.contains("<|constrain|>"));
+    assert!(payload.contains("to=functions.TaskCreate"));
+    assert!(payload.contains("<|mes"));
+    assert!(payload.contains("sage|>"));
+    assert!(payload.contains("<|con"));
+    assert!(payload.contains("strain|>"));
     assert!(!payload.contains("\"type\":\"tool_use\""));
 }
 
@@ -3309,7 +3384,7 @@ async fn anthropic_stream_keeps_split_non_tool_thinking_trace_as_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3320,13 +3395,15 @@ async fn anthropic_stream_keeps_split_non_tool_thinking_trace_as_text() {
     assert!(payload.contains("\"text\":\"● <thinking"));
     assert!(payload.contains("Create next tasks."));
     assert!(payload.contains("to=functions.TaskCreate"));
-    assert!(!payload.contains("<|message|>"));
-    assert!(!payload.contains("<|constrain|>"));
+    assert!(payload.contains("<|mes"));
+    assert!(payload.contains("sage|>"));
+    assert!(payload.contains("<|con"));
+    assert!(payload.contains("strain|>"));
     assert!(!payload.contains("\"type\":\"tool_use\""));
 }
 
 #[tokio::test]
-async fn anthropic_stream_parses_bare_python_style_ask_user_question() {
+async fn anthropic_stream_keeps_bare_python_style_ask_user_question_as_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"[AskUserQuestion(question=\\\"What's up?\\\", headers=['Hello!'], options=['A','B'], multiSelect=False, metadata={'priority': 1, 'active': True})]\"},\"finish_reason\":\"stop\"}]}\n\n\
              data: [DONE]\n\n",
@@ -3336,7 +3413,7 @@ async fn anthropic_stream_parses_bare_python_style_ask_user_question() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::from(["AskUserQuestion".to_string()]),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3344,14 +3421,13 @@ async fn anthropic_stream_parses_bare_python_style_ask_user_question() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"tool_use\""));
-    assert!(payload.contains("\"name\":\"AskUserQuestion\""));
-    assert!(payload.contains("\"partial_json\":\"{\\\"headers\\\":[\\\"Hello!\\\"],\\\"metadata\\\":{\\\"active\\\":true,\\\"priority\\\":1},\\\"multiSelect\\\":false,\\\"options\\\":[\\\"A\\\",\\\"B\\\"],\\\"question\\\":\\\"What's up?\\\"}\""));
-    assert!(!payload.contains("\"type\":\"text_delta\""));
+    assert!(payload.contains("AskUserQuestion(question="));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
+    assert!(payload.contains("\"type\":\"text_delta\""));
 }
 
 #[tokio::test]
-async fn anthropic_stream_parses_ask_user_question_xml_wrapper() {
+async fn anthropic_stream_keeps_ask_user_question_xml_wrapper_as_text() {
     let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
         "data: {\"choices\":[{\"delta\":{\"content\":\"<AskUserQuestion>{\\\"questions\\\":[{\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\",\\\"multiSelect\\\":false,\\\"options\\\":[{\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\",\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\"},{\\\"label\\\":\\\"README.md에 추가\\\",\\\"description\\\":\\\"프로젝트 루트 README에 삽입\\\"},{\\\"label\\\":\\\"src/main/resources/unit-test-execution-plan.md\\\",\\\"description\\\":\\\"리소스 경로에 저장해 빌드에 포함\\\"}]}]}\"},\"finish_reason\":\"stop\"}]}\n\n\
              data: [DONE]\n\n",
@@ -3361,7 +3437,7 @@ async fn anthropic_stream_parses_ask_user_question_xml_wrapper() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3369,14 +3445,9 @@ async fn anthropic_stream_parses_ask_user_question_xml_wrapper() {
         payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
     }
 
-    assert!(payload.contains("\"type\":\"tool_use\""));
-    assert!(payload.contains("\"name\":\"AskUserQuestion\""));
-    assert!(payload.contains("\"partial_json\":\"{\\\"questions\\\":["));
-    assert!(payload.contains("\\\"question\\\":\\\"작업 분할 계획을 저장할 파일 경로를 선택해 주세요.\\\""));
-    assert!(payload.contains("\\\"multiSelect\\\":false"));
-    assert!(payload.contains("\\\"options\\\":["));
-    assert!(payload.contains("\\\"label\\\":\\\"docs/plans/unit-test-execution-plan.md (추천)\\\""));
-    assert!(payload.contains("\\\"description\\\":\\\"문서 전용 폴더에 마크다운 파일로 보관\\\""));
+    assert!(payload.contains("<AskUserQuestion>"));
+    assert!(payload.contains("작업 분할 계획을 저장할 파일 경로를 선택해 주세요."));
+    assert!(!payload.contains("\"type\":\"tool_use\""));
 }
 
 #[tokio::test]
@@ -3390,7 +3461,7 @@ async fn anthropic_stream_keeps_unknown_bare_python_style_call_as_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::from(["OtherTool".to_string()]),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3415,7 +3486,7 @@ async fn anthropic_stream_handles_trailing_done_without_newline() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3443,7 +3514,7 @@ async fn anthropic_stream_opens_text_block_only_once_across_multiple_deltas() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3471,7 +3542,7 @@ async fn anthropic_stream_ignores_empty_tool_calls_when_streaming_text() {
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
@@ -3500,7 +3571,7 @@ async fn anthropic_stream_opens_thinking_block_only_once_across_multiple_deltas(
         "test_router".to_string(),
         false,
         "claude-bridge".to_string(),
-        HashSet::new(),
+        0,
     ));
     let mut payload = String::new();
 
