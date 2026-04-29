@@ -1143,6 +1143,13 @@ pub(crate) async fn handle_incoming(
             tool_types_for_logging(&upstream_payload)
         );
         debug!(
+            "upstream tool definitions (router={}, {:?}->{:?}): {}",
+            route_target.router_name,
+            incoming_api,
+            route_target.upstream_wire,
+            tool_definitions_for_logging(&upstream_payload)
+        );
+        debug!(
             "upstream request fields (router={}, {:?}->{:?}): {}",
             route_target.router_name,
             incoming_api,

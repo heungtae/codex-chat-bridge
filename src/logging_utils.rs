@@ -37,6 +37,20 @@ pub(crate) fn tool_types_for_logging(payload: &Value) -> Value {
     Value::Array(tool_labels)
 }
 
+pub(crate) fn tool_definitions_for_logging(payload: &Value) -> Value {
+    let definitions = payload
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .map(tool_definition_for_logging)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Value::Array(definitions)
+}
+
 pub(crate) fn request_fields_for_logging(payload: &Value) -> Value {
     let Some(obj) = payload.as_object() else {
         return Value::Array(Vec::new());
@@ -80,6 +94,24 @@ pub(crate) fn tool_type_label_for_logging(tool: &Value) -> String {
         (None, Some(n)) => format!("<missing_type>({n})"),
         (None, None) => "<missing_type>".to_string(),
     }
+}
+
+fn tool_definition_for_logging(tool: &Value) -> Value {
+    let function = tool.get("function").unwrap_or(tool);
+    let name = function
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let parameters = function.get("parameters").unwrap_or(&Value::Null);
+
+    serde_json::json!({
+        "name": name,
+        "required": parameters.get("required").cloned().unwrap_or(Value::Null),
+        "additionalProperties": parameters
+            .get("additionalProperties")
+            .cloned()
+            .unwrap_or(Value::Null),
+    })
 }
 
 pub(crate) fn upstream_headers_for_logging(

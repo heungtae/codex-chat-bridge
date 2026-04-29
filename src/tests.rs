@@ -117,6 +117,26 @@ fn normalize_chat_tools_converts_mcp_to_function() {
 }
 
 #[test]
+fn normalize_chat_tools_converts_empty_additional_properties_to_false() {
+    let tools = vec![json!({
+        "type": "function",
+        "name": "ExitPlanMode",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": {}
+        }
+    })];
+    let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
+    assert_eq!(out[0]["function"]["parameters"]["required"], json!([]));
+    assert_eq!(
+        out[0]["function"]["parameters"]["additionalProperties"],
+        false
+    );
+}
+
+#[test]
 fn flatten_content_items_filters_non_text() {
     let items = vec![
         json!({"type":"input_text","text":"a"}),
@@ -660,6 +680,30 @@ fn map_anthropic_messages_to_chat_request_supports_tools_and_thinking() {
     assert_eq!(messages[3]["role"], "tool");
     assert_eq!(out["tools"][0]["function"]["name"], "shell");
     assert_eq!(out["tool_choice"]["function"]["name"], "shell");
+}
+
+#[test]
+fn map_anthropic_messages_to_chat_request_normalizes_empty_additional_properties() {
+    let input = json!({
+        "model": "claude-sonnet",
+        "messages": [{"role":"user","content":[{"type":"text","text":"hi"}]}],
+        "tools": [
+            {
+                "name": "ExitPlanMode",
+                "description": "exit plan mode",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": {}
+                }
+            }
+        ]
+    });
+
+    let out = map_anthropic_messages_to_chat_request(&input, false).expect("ok");
+    let parameters = &out["tools"][0]["function"]["parameters"];
+    assert_eq!(parameters["required"], json!([]));
+    assert_eq!(parameters["additionalProperties"], false);
 }
 
 #[test]

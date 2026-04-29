@@ -222,6 +222,7 @@ pub(crate) fn map_anthropic_messages_to_chat_request(
                     .get("input_schema")
                     .cloned()
                     .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                let parameters = normalize_anthropic_tool_parameters(name, parameters);
                 Some(json!({
                     "type": "function",
                     "function": {
@@ -743,6 +744,7 @@ pub(crate) fn normalize_responses_tools(tools: Vec<Value>) -> Vec<Value> {
                 .get("parameters")
                 .cloned()
                 .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+            let parameters = normalize_tool_parameters(parameters);
 
             Some(json!({
                 "type": "function",
@@ -906,11 +908,52 @@ fn normalize_custom_tool_parameters(parameters: Option<Value>) -> Value {
             if obj.get("type").and_then(Value::as_str) == Some("string") {
                 return default_custom_tool_function_parameters();
             }
-            Value::Object(obj)
+            normalize_tool_parameters(Value::Object(obj))
         }
-        Some(other) => other,
+        Some(other) => normalize_tool_parameters(other),
         None => default_custom_tool_function_parameters(),
     }
+}
+
+fn normalize_tool_parameters(mut parameters: Value) -> Value {
+    let Some(obj) = parameters.as_object_mut() else {
+        return parameters;
+    };
+
+    if obj
+        .get("additionalProperties")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        obj.insert("additionalProperties".to_string(), Value::Bool(false));
+    }
+
+    parameters
+}
+
+fn normalize_anthropic_tool_parameters(tool_name: &str, mut parameters: Value) -> Value {
+    let Some(obj) = parameters.as_object_mut() else {
+        return parameters;
+    };
+
+    obj.entry("type".to_string())
+        .or_insert_with(|| json!("object"));
+    obj.entry("properties".to_string())
+        .or_insert_with(|| json!({}));
+    obj.entry("required".to_string())
+        .or_insert_with(|| json!([]));
+
+    if tool_name == "ExitPlanMode" {
+        obj.insert("additionalProperties".to_string(), Value::Bool(false));
+    } else if obj
+        .get("additionalProperties")
+        .and_then(Value::as_object)
+        .is_some_and(serde_json::Map::is_empty)
+    {
+        obj.insert("additionalProperties".to_string(), Value::Bool(false));
+    }
+
+    parameters
 }
 
 pub(crate) fn chat_json_to_responses_json(
@@ -1793,6 +1836,7 @@ pub(crate) fn normalize_chat_tools(
                     .get("parameters")
                     .cloned()
                     .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                let parameters = normalize_tool_parameters(parameters);
 
                 return Some(json!({
                     "type": "function",
@@ -1870,6 +1914,7 @@ pub(crate) fn normalize_chat_tools(
                             "additionalProperties": true
                         })
                     });
+                let parameters = normalize_tool_parameters(parameters);
                 return Some(json!({
                     "type": "function",
                     "function": {
@@ -1908,6 +1953,7 @@ pub(crate) fn normalize_chat_tools(
                             "additionalProperties": true
                         })
                     });
+                let parameters = normalize_tool_parameters(parameters);
                 return Some(json!({
                     "type": "function",
                     "function": {
