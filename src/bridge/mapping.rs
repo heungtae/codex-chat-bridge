@@ -940,8 +940,6 @@ fn normalize_anthropic_tool_parameters(tool_name: &str, mut parameters: Value) -
         .or_insert_with(|| json!("object"));
     obj.entry("properties".to_string())
         .or_insert_with(|| json!({}));
-    obj.entry("required".to_string())
-        .or_insert_with(|| json!([]));
 
     if tool_name == "ExitPlanMode" {
         obj.insert("additionalProperties".to_string(), Value::Bool(false));

@@ -702,7 +702,7 @@ fn map_anthropic_messages_to_chat_request_normalizes_empty_additional_properties
 
     let out = map_anthropic_messages_to_chat_request(&input, false).expect("ok");
     let parameters = &out["tools"][0]["function"]["parameters"];
-    assert_eq!(parameters["required"], json!([]));
+    assert!(parameters.get("required").is_none());
     assert_eq!(parameters["additionalProperties"], false);
 }
 
