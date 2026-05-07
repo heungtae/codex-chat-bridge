@@ -144,6 +144,52 @@ fn maps_responses_request_defaults_missing_parameters() {
 }
 
 #[test]
+fn maps_responses_request_wraps_missing_type_named_tool() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }
+        ],
+        "tools": [
+            {
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent"
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+
+    assert_eq!(
+        req.chat_request["tools"][0],
+        json!({
+            "type": "function",
+            "function": {
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                    "additionalProperties": false
+                }
+            }
+        })
+    );
+}
+
+#[test]
 fn sse_parser_collects_data_events() {
     let mut parser = SseParser::default();
     let chunk = "event: message\ndata: {\"a\":1}\n\n";
@@ -2394,6 +2440,61 @@ fn map_chat_to_responses_request_converts_messages() {
     assert_eq!(out["input"][0]["content"][0]["text"], "hello");
     assert_eq!(out["text"]["format"]["type"], "json_schema");
     assert_eq!(out["text"]["format"]["json_schema"]["name"], "answer");
+}
+
+#[test]
+fn map_chat_to_responses_request_normalizes_missing_type_named_tool() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {"role":"user","content":"hello"}
+        ],
+        "tools": [
+            {
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent"
+            }
+        ]
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    assert_eq!(
+        out["tools"][0],
+        json!({
+            "type": "function",
+            "name": "spawn_agent",
+            "description": "Spawn a sub-agent",
+            "parameters": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": false
+            }
+        })
+    );
+}
+
+#[test]
+fn map_chat_to_responses_request_normalizes_top_level_function_tool() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {"role":"user","content":"hello"}
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent"
+            }
+        ]
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    assert_eq!(out["tools"][0]["type"], "function");
+    assert_eq!(out["tools"][0]["name"], "spawn_agent");
+    assert!(out["tools"][0].get("function").is_none());
+    assert_eq!(out["tools"][0]["parameters"]["required"], json!([]));
 }
 
 fn responses_input_items(out: &Value) -> &[Value] {

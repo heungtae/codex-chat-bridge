@@ -679,35 +679,7 @@ fn anthropic_tool_choice_to_chat_tool_choice(tool_choice: Option<&Value>) -> Opt
 pub(crate) fn normalize_responses_tools(tools: Vec<Value>) -> Vec<Value> {
     tools
         .into_iter()
-        .filter_map(|tool| {
-            if tool.get("type").and_then(Value::as_str) != Some("function") {
-                return Some(tool);
-            }
-
-            if tool.get("function").is_none() {
-                return Some(tool);
-            }
-
-            let function = tool.get("function")?;
-            let name = function.get("name").and_then(Value::as_str)?.to_string();
-            let description = function
-                .get("description")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            let parameters = function
-                .get("parameters")
-                .cloned()
-                .unwrap_or_else(default_function_tool_parameters);
-            let parameters = normalize_tool_parameters(parameters);
-
-            Some(json!({
-                "type": "function",
-                "name": name,
-                "description": description,
-                "parameters": parameters,
-            }))
-        })
+        .filter_map(normalize_responses_tool_shape)
         .collect()
 }
 
@@ -934,6 +906,81 @@ fn normalize_wrapped_function_tool_parameters(mut tool: Value) -> Value {
     }
 
     tool
+}
+
+fn normalize_responses_tool_shape(tool: Value) -> Option<Value> {
+    let tool_type = tool.get("type").and_then(Value::as_str);
+    if tool_type.is_some_and(|value| value != "function") {
+        return Some(tool);
+    }
+
+    let function = tool.get("function").and_then(Value::as_object);
+    let name = function
+        .and_then(|obj| obj.get("name"))
+        .or_else(|| tool.get("name"))?
+        .as_str()?
+        .trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let description = function
+        .and_then(|obj| obj.get("description"))
+        .or_else(|| tool.get("description"))
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let parameters = function
+        .and_then(|obj| obj.get("parameters"))
+        .or_else(|| tool.get("parameters"))
+        .or_else(|| tool.get("input_schema"))
+        .cloned()
+        .unwrap_or_else(default_function_tool_parameters);
+    let parameters = normalize_tool_parameters(parameters);
+
+    Some(json!({
+        "type": "function",
+        "name": name,
+        "description": description,
+        "parameters": parameters,
+    }))
+}
+
+fn normalize_chat_function_tool_shape(tool: Value) -> Option<Value> {
+    let tool_type = tool.get("type").and_then(Value::as_str);
+    if tool_type.is_some_and(|value| value != "function") {
+        return Some(tool);
+    }
+
+    if tool.get("function").is_some() {
+        return Some(normalize_wrapped_function_tool_parameters(tool));
+    }
+
+    let name = tool.get("name")?.as_str()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+
+    let description = tool
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let parameters = tool
+        .get("parameters")
+        .or_else(|| tool.get("input_schema"))
+        .cloned()
+        .unwrap_or_else(default_function_tool_parameters);
+    let parameters = normalize_tool_parameters(parameters);
+
+    Some(json!({
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        }
+    }))
 }
 
 pub(crate) fn chat_json_to_responses_json(
@@ -1797,30 +1844,11 @@ pub(crate) fn normalize_chat_tools(
             }
 
             if tool_type == Some("function") {
-                if tool.get("function").is_some() {
-                    return Some(normalize_wrapped_function_tool_parameters(tool));
-                }
+                return normalize_chat_function_tool_shape(tool);
+            }
 
-                let name = tool.get("name")?.as_str()?.to_string();
-                let description = tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let parameters = tool
-                    .get("parameters")
-                    .cloned()
-                    .unwrap_or_else(default_function_tool_parameters);
-                let parameters = normalize_tool_parameters(parameters);
-
-                return Some(json!({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": parameters,
-                    }
-                }));
+            if tool_type.is_none() && tool.get("name").is_some() {
+                return normalize_chat_function_tool_shape(tool);
             }
 
             if tool_type == Some("custom") {
