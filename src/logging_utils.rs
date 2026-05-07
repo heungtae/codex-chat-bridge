@@ -107,23 +107,18 @@ fn tool_definition_for_logging(tool: &Value) -> Value {
     let mut out = serde_json::Map::new();
     out.insert("name".to_string(), Value::String(name.to_string()));
 
-    if let Some(required) = parameters.get("required") {
-        out.insert(
-            "required".to_string(),
-            if required.is_array() {
-                required.clone()
-            } else {
-                Value::Array(Vec::new())
-            },
-        );
-    }
+    let required = parameters
+        .get("required")
+        .filter(|required| required.is_array())
+        .cloned()
+        .unwrap_or_else(|| Value::Array(Vec::new()));
+    out.insert("required".to_string(), required);
 
-    if let Some(additional_properties) = parameters.get("additionalProperties") {
-        out.insert(
-            "additionalProperties".to_string(),
-            additional_properties.clone(),
-        );
-    }
+    let additional_properties = parameters
+        .get("additionalProperties")
+        .cloned()
+        .unwrap_or(Value::Bool(false));
+    out.insert("additionalProperties".to_string(), additional_properties);
 
     Value::Object(out)
 }

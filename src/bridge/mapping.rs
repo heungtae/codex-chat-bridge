@@ -219,7 +219,7 @@ pub(crate) fn map_anthropic_messages_to_chat_request(
                 let parameters = tool
                     .get("input_schema")
                     .cloned()
-                    .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                    .unwrap_or_else(default_function_tool_parameters);
                 let parameters = normalize_anthropic_tool_parameters(name, parameters);
                 Some(json!({
                     "type": "function",
@@ -698,7 +698,7 @@ pub(crate) fn normalize_responses_tools(tools: Vec<Value>) -> Vec<Value> {
             let parameters = function
                 .get("parameters")
                 .cloned()
-                .unwrap_or_else(|| json!({"type":"object","properties":{}}));
+                .unwrap_or_else(default_function_tool_parameters);
             let parameters = normalize_tool_parameters(parameters);
 
             Some(json!({
@@ -857,6 +857,15 @@ fn default_custom_tool_function_parameters() -> Value {
     })
 }
 
+fn default_function_tool_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+    })
+}
+
 fn normalize_custom_tool_parameters(parameters: Option<Value>) -> Value {
     match parameters {
         Some(Value::Object(obj)) => {
@@ -875,10 +884,7 @@ fn normalize_tool_parameters(mut parameters: Value) -> Value {
         return parameters;
     };
 
-    if obj
-        .get("required")
-        .is_some_and(|required| !required.is_array())
-    {
+    if !obj.get("required").is_some_and(Value::is_array) {
         obj.insert("required".to_string(), Value::Array(Vec::new()));
     }
 
@@ -917,13 +923,14 @@ fn normalize_anthropic_tool_parameters(tool_name: &str, mut parameters: Value) -
 }
 
 fn normalize_wrapped_function_tool_parameters(mut tool: Value) -> Value {
-    if let Some(parameters) = tool
-        .get_mut("function")
-        .and_then(Value::as_object_mut)
-        .and_then(|function| function.get_mut("parameters"))
-    {
-        let normalized = normalize_tool_parameters(parameters.take());
-        *parameters = normalized;
+    if let Some(function) = tool.get_mut("function").and_then(Value::as_object_mut) {
+        let parameters = function
+            .remove("parameters")
+            .unwrap_or_else(default_function_tool_parameters);
+        function.insert(
+            "parameters".to_string(),
+            normalize_tool_parameters(parameters),
+        );
     }
 
     tool
@@ -1803,7 +1810,7 @@ pub(crate) fn normalize_chat_tools(
                 let parameters = tool
                     .get("parameters")
                     .cloned()
-                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+                    .unwrap_or_else(default_function_tool_parameters);
                 let parameters = normalize_tool_parameters(parameters);
 
                 return Some(json!({

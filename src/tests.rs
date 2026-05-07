@@ -104,6 +104,46 @@ fn maps_responses_request_normalizes_null_required() {
 }
 
 #[test]
+fn maps_responses_request_defaults_missing_parameters() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "description": "Spawn a sub-agent"
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+
+    assert_eq!(
+        req.chat_request["tools"][0]["function"]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    );
+}
+
+#[test]
 fn sse_parser_collects_data_events() {
     let mut parser = SseParser::default();
     let chunk = "event: message\ndata: {\"a\":1}\n\n";
@@ -693,7 +733,8 @@ fn normalize_chat_tools_keeps_function_already_wrapped() {
         &HashSet::new(),
         ToolTransformMode::LegacyConvert,
     );
-    assert_eq!(out, tools);
+    assert_eq!(out[0]["function"]["name"], "f");
+    assert_eq!(out[0]["function"]["parameters"]["required"], json!([]));
 }
 
 #[test]
@@ -707,6 +748,27 @@ fn normalize_chat_tools_normalizes_wrapped_function_null_required() {
     })];
     let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
     assert_eq!(out[0]["function"]["parameters"]["required"], json!([]));
+}
+
+#[test]
+fn normalize_chat_tools_adds_default_parameters_for_wrapped_function() {
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "spawn_agent",
+            "description": "Spawn a sub-agent"
+        }
+    })];
+    let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
+    assert_eq!(
+        out[0]["function"]["parameters"],
+        json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        })
+    );
 }
 
 #[test]
@@ -770,7 +832,7 @@ fn map_anthropic_messages_to_chat_request_normalizes_empty_additional_properties
 
     let out = map_anthropic_messages_to_chat_request(&input, false).expect("ok");
     let parameters = &out["tools"][0]["function"]["parameters"];
-    assert!(parameters.get("required").is_none());
+    assert_eq!(parameters["required"], json!([]));
     assert_eq!(parameters["additionalProperties"], false);
 }
 
@@ -971,7 +1033,7 @@ fn normalize_chat_tools_converts_custom_tool_to_function() {
             "function": {
                 "name": "shell",
                 "description": "run shell",
-                "parameters": {"type":"object","properties":{"cmd":{"type":"string"}}}
+                "parameters": {"type":"object","properties":{"cmd":{"type":"string"}},"required":[]}
             }
         })
     );
@@ -2633,17 +2695,26 @@ fn tool_types_for_logging_includes_type_and_name_labels() {
 }
 
 #[test]
-fn tool_definitions_for_logging_omits_missing_required_and_normalizes_null() {
+fn tool_definitions_for_logging_defaults_required_and_normalizes_null() {
     let payload = json!({
         "tools": [
             {"type":"function","function":{"name":"missing","parameters":{"type":"object"}}},
-            {"type":"function","function":{"name":"null","parameters":{"type":"object","required":null}}}
+            {"type":"function","function":{"name":"null","parameters":{"type":"object","required":null}}},
+            {"type":"function","function":{"name":"spawn_agent"}}
         ]
     });
 
     let out = tool_definitions_for_logging(&payload);
-    assert!(out[0].get("required").is_none());
+    assert_eq!(out[0]["required"], json!([]));
     assert_eq!(out[1]["required"], json!([]));
+    assert_eq!(
+        out[2],
+        json!({
+            "name": "spawn_agent",
+            "required": [],
+            "additionalProperties": false
+        })
+    );
 }
 
 #[test]
