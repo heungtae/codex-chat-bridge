@@ -876,6 +876,13 @@ fn normalize_tool_parameters(mut parameters: Value) -> Value {
     };
 
     if obj
+        .get("required")
+        .is_some_and(|required| !required.is_array())
+    {
+        obj.insert("required".to_string(), Value::Array(Vec::new()));
+    }
+
+    if obj
         .get("additionalProperties")
         .and_then(Value::as_object)
         .is_some_and(serde_json::Map::is_empty)
@@ -906,7 +913,20 @@ fn normalize_anthropic_tool_parameters(tool_name: &str, mut parameters: Value) -
         obj.insert("additionalProperties".to_string(), Value::Bool(false));
     }
 
-    parameters
+    normalize_tool_parameters(parameters)
+}
+
+fn normalize_wrapped_function_tool_parameters(mut tool: Value) -> Value {
+    if let Some(parameters) = tool
+        .get_mut("function")
+        .and_then(Value::as_object_mut)
+        .and_then(|function| function.get_mut("parameters"))
+    {
+        let normalized = normalize_tool_parameters(parameters.take());
+        *parameters = normalized;
+    }
+
+    tool
 }
 
 pub(crate) fn chat_json_to_responses_json(
@@ -1771,7 +1791,7 @@ pub(crate) fn normalize_chat_tools(
 
             if tool_type == Some("function") {
                 if tool.get("function").is_some() {
-                    return Some(tool);
+                    return Some(normalize_wrapped_function_tool_parameters(tool));
                 }
 
                 let name = tool.get("name")?.as_str()?.to_string();
@@ -1806,7 +1826,7 @@ pub(crate) fn normalize_chat_tools(
                         obj.insert("type".to_string(), Value::String("function".to_string()));
                         obj.insert("function".to_string(), function);
                     }
-                    return Some(converted);
+                    return Some(normalize_wrapped_function_tool_parameters(converted));
                 }
 
                 let name = tool.get("name")?.as_str()?.to_string();

@@ -104,14 +104,28 @@ fn tool_definition_for_logging(tool: &Value) -> Value {
         .unwrap_or("<unknown>");
     let parameters = function.get("parameters").unwrap_or(&Value::Null);
 
-    serde_json::json!({
-        "name": name,
-        "required": parameters.get("required").cloned().unwrap_or(Value::Null),
-        "additionalProperties": parameters
-            .get("additionalProperties")
-            .cloned()
-            .unwrap_or(Value::Null),
-    })
+    let mut out = serde_json::Map::new();
+    out.insert("name".to_string(), Value::String(name.to_string()));
+
+    if let Some(required) = parameters.get("required") {
+        out.insert(
+            "required".to_string(),
+            if required.is_array() {
+                required.clone()
+            } else {
+                Value::Array(Vec::new())
+            },
+        );
+    }
+
+    if let Some(additional_properties) = parameters.get("additionalProperties") {
+        out.insert(
+            "additionalProperties".to_string(),
+            additional_properties.clone(),
+        );
+    }
+
+    Value::Object(out)
 }
 
 pub(crate) fn upstream_headers_for_logging(

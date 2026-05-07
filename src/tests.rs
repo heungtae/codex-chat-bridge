@@ -64,6 +64,46 @@ fn maps_responses_request_to_chat_request_with_function_tool() {
 }
 
 #[test]
+fn maps_responses_request_normalizes_null_required() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "hello"}]
+            }
+        ],
+        "tools": [
+            {
+                "type": "function",
+                "name": "shell",
+                "description": "Run shell",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": null
+                }
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+
+    assert_eq!(
+        req.chat_request["tools"][0]["function"]["parameters"]["required"],
+        json!([])
+    );
+}
+
+#[test]
 fn sse_parser_collects_data_events() {
     let mut parser = SseParser::default();
     let chunk = "event: message\ndata: {\"a\":1}\n\n";
@@ -134,6 +174,21 @@ fn normalize_chat_tools_converts_empty_additional_properties_to_false() {
         out[0]["function"]["parameters"]["additionalProperties"],
         false
     );
+}
+
+#[test]
+fn normalize_chat_tools_converts_null_required_to_empty_array() {
+    let tools = vec![json!({
+        "type": "function",
+        "name": "shell",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": null
+        }
+    })];
+    let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
+    assert_eq!(out[0]["function"]["parameters"]["required"], json!([]));
 }
 
 #[test]
@@ -642,6 +697,19 @@ fn normalize_chat_tools_keeps_function_already_wrapped() {
 }
 
 #[test]
+fn normalize_chat_tools_normalizes_wrapped_function_null_required() {
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "f",
+            "parameters": {"type":"object","required":null}
+        }
+    })];
+    let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
+    assert_eq!(out[0]["function"]["parameters"]["required"], json!([]));
+}
+
+#[test]
 fn map_anthropic_messages_to_chat_request_supports_tools_and_thinking() {
     let input = json!({
         "model": "claude-sonnet",
@@ -704,6 +772,31 @@ fn map_anthropic_messages_to_chat_request_normalizes_empty_additional_properties
     let parameters = &out["tools"][0]["function"]["parameters"];
     assert!(parameters.get("required").is_none());
     assert_eq!(parameters["additionalProperties"], false);
+}
+
+#[test]
+fn map_anthropic_messages_to_chat_request_normalizes_null_required() {
+    let input = json!({
+        "model": "claude-sonnet",
+        "messages": [{"role":"user","content":[{"type":"text","text":"hi"}]}],
+        "tools": [
+            {
+                "name": "shell",
+                "description": "run shell",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {},
+                    "required": null
+                }
+            }
+        ]
+    });
+
+    let out = map_anthropic_messages_to_chat_request(&input, false).expect("ok");
+    assert_eq!(
+        out["tools"][0]["function"]["parameters"]["required"],
+        json!([])
+    );
 }
 
 #[test]
@@ -2537,6 +2630,20 @@ fn tool_types_for_logging_includes_type_and_name_labels() {
             "<missing_type>"
         ])
     );
+}
+
+#[test]
+fn tool_definitions_for_logging_omits_missing_required_and_normalizes_null() {
+    let payload = json!({
+        "tools": [
+            {"type":"function","function":{"name":"missing","parameters":{"type":"object"}}},
+            {"type":"function","function":{"name":"null","parameters":{"type":"object","required":null}}}
+        ]
+    });
+
+    let out = tool_definitions_for_logging(&payload);
+    assert!(out[0].get("required").is_none());
+    assert_eq!(out[1]["required"], json!([]));
 }
 
 #[test]
