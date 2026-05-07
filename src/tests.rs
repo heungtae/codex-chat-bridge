@@ -2831,6 +2831,22 @@ fn request_fields_for_logging_sorts_top_level_keys() {
 }
 
 #[test]
+fn split_log_chunks_splits_large_ascii_payloads() {
+    let chunks = split_log_chunks_by_bytes("abcdef", 2);
+
+    assert_eq!(chunks, vec!["ab", "cd", "ef"]);
+}
+
+#[test]
+fn split_log_chunks_keeps_utf8_boundaries() {
+    let input = "가나다";
+    let chunks = split_log_chunks_by_bytes(input, 4);
+
+    assert_eq!(chunks, vec!["가", "나", "다"]);
+    assert_eq!(chunks.join(""), input);
+}
+
+#[test]
 fn upstream_headers_for_logging_includes_forwarded_headers() {
     let mut headers = HeaderMap::new();
     headers.insert("openai-organization", HeaderValue::from_static("org_123"));

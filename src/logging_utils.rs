@@ -1,9 +1,85 @@
 use axum::http::HeaderMap;
 use axum::http::header::CONTENT_TYPE;
 use serde_json::Value;
+use tracing::{debug, warn};
 
 use crate::model::UpstreamHeader;
 use crate::model::WireApi;
+
+pub(crate) const LOG_CHUNK_BYTES: usize = 2 * 1024;
+
+pub(crate) fn debug_large_log(label: &str, value: &str) {
+    for (index, chunk, chunk_count) in indexed_log_chunks(value) {
+        if chunk_count == 1 {
+            debug!("{label}: {chunk}");
+        } else {
+            debug!(
+                "{label}: chunk_index={} chunk_count={} chunk_bytes={} total_bytes={} chunk={}",
+                index + 1,
+                chunk_count,
+                chunk.len(),
+                value.len(),
+                chunk
+            );
+        }
+    }
+}
+
+pub(crate) fn warn_large_log(label: &str, value: &str) {
+    for (index, chunk, chunk_count) in indexed_log_chunks(value) {
+        if chunk_count == 1 {
+            warn!("{label}: {chunk}");
+        } else {
+            warn!(
+                "{label}: chunk_index={} chunk_count={} chunk_bytes={} total_bytes={} chunk={}",
+                index + 1,
+                chunk_count,
+                chunk.len(),
+                value.len(),
+                chunk
+            );
+        }
+    }
+}
+
+fn indexed_log_chunks(value: &str) -> impl Iterator<Item = (usize, &str, usize)> {
+    let chunks = split_log_chunks(value);
+    let chunk_count = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(move |(index, chunk)| (index, chunk, chunk_count))
+}
+
+pub(crate) fn split_log_chunks(value: &str) -> Vec<&str> {
+    split_log_chunks_by_bytes(value, LOG_CHUNK_BYTES)
+}
+
+pub(crate) fn split_log_chunks_by_bytes(value: &str, max_bytes: usize) -> Vec<&str> {
+    if value.len() <= max_bytes || max_bytes == 0 {
+        return vec![value];
+    }
+
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < value.len() {
+        let mut end = (start + max_bytes).min(value.len());
+        while end > start && !value.is_char_boundary(end) {
+            end -= 1;
+        }
+        if end == start {
+            end = value[start..]
+                .char_indices()
+                .nth(1)
+                .map(|(offset, _)| start + offset)
+                .unwrap_or(value.len());
+        }
+        chunks.push(&value[start..end]);
+        start = end;
+    }
+
+    chunks
+}
 
 pub(crate) fn upstream_messages_for_logging(
     upstream_wire: WireApi,

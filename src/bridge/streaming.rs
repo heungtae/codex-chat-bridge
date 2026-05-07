@@ -4,8 +4,9 @@ use axum::body::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
-use tracing::{debug, warn};
+use tracing::warn;
 
+use crate::logging_utils::debug_large_log;
 use crate::{
     ChatChunk, ResponsesToolCallKind, SseParser, StreamAccumulator, responses_tool_call_item,
 };
@@ -24,10 +25,12 @@ where
             match chunk_result {
                 Ok(chunk) => {
                     if verbose_logging {
-                        debug!(
-                            "upstream response payload stream chunk (router={}, responses): {}",
-                            router_name,
-                            String::from_utf8_lossy(&chunk)
+                        debug_large_log(
+                            &format!(
+                                "upstream response payload stream chunk (router={}, responses)",
+                                router_name
+                            ),
+                            String::from_utf8_lossy(&chunk).as_ref(),
                         );
                     }
                     yield Ok(chunk)
@@ -231,10 +234,12 @@ where
             };
 
             if verbose_logging {
-                debug!(
-                    "upstream response payload stream chunk (router={}, chat->anthropic): {}",
-                    router_name,
-                    String::from_utf8_lossy(&chunk)
+                debug_large_log(
+                    &format!(
+                        "upstream response payload stream chunk (router={}, chat->anthropic)",
+                        router_name
+                    ),
+                    String::from_utf8_lossy(&chunk).as_ref(),
                 );
             }
 
@@ -363,10 +368,12 @@ where
             };
 
             if verbose_logging {
-                debug!(
-                    "upstream response payload stream chunk (router={}, chat): {}",
-                    router_name,
-                    String::from_utf8_lossy(&chunk)
+                debug_large_log(
+                    &format!(
+                        "upstream response payload stream chunk (router={}, chat)",
+                        router_name
+                    ),
+                    String::from_utf8_lossy(&chunk).as_ref(),
                 );
             }
 

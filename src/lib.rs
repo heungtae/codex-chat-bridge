@@ -865,14 +865,20 @@ async fn finalize_upstream_response(
             "upstream error response headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
             route_target.router_name, incoming_api, route_target.upstream_wire, headers
         );
-        warn!(
-            "upstream error response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, body={}",
-            route_target.router_name, incoming_api, route_target.upstream_wire, status, body
+        warn_large_log(
+            &format!(
+                "upstream error response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}",
+                route_target.router_name, incoming_api, route_target.upstream_wire, status
+            ),
+            &body,
         );
         if verbose_logging {
-            debug!(
-                "upstream response payload error (router={}, {:?}<-{:?}): {body}",
-                route_target.router_name, incoming_api, route_target.upstream_wire
+            debug_large_log(
+                &format!(
+                    "upstream response payload error (router={}, {:?}<-{:?})",
+                    route_target.router_name, incoming_api, route_target.upstream_wire
+                ),
+                &body,
             );
         }
         let normalized = normalize_upstream_error_payload(status, &body);
@@ -959,9 +965,12 @@ async fn finalize_upstream_response(
         }
     };
     if verbose_logging {
-        debug!(
-            "upstream response payload (router={}, {:?}<-{:?}): {}",
-            route_target.router_name, incoming_api, route_target.upstream_wire, upstream_json
+        debug_large_log(
+            &format!(
+                "upstream response payload (router={}, {:?}<-{:?})",
+                route_target.router_name, incoming_api, route_target.upstream_wire
+            ),
+            &upstream_json.to_string(),
         );
     }
 
@@ -1041,9 +1050,12 @@ pub(crate) async fn handle_incoming(
             route_target.router_name,
             headers_for_logging(&headers)
         );
-        debug!(
-            "incoming request body (router={}): {body}",
-            route_target.router_name
+        debug_large_log(
+            &format!(
+                "incoming request body (router={})",
+                route_target.router_name
+            ),
+            &body,
         );
     }
 
@@ -1091,9 +1103,12 @@ pub(crate) async fn handle_incoming(
         if let Some(messages) =
             upstream_messages_for_logging(route_target.upstream_wire, &upstream_payload)
         {
-            debug!(
-                "upstream messages (router={}, {:?}->{:?}): {}",
-                route_target.router_name, incoming_api, route_target.upstream_wire, messages
+            debug_large_log(
+                &format!(
+                    "upstream messages (router={}, {:?}->{:?})",
+                    route_target.router_name, incoming_api, route_target.upstream_wire
+                ),
+                &messages.to_string(),
             );
         }
 
@@ -1110,9 +1125,12 @@ pub(crate) async fn handle_incoming(
             )
         );
 
-        debug!(
-            "upstream payload (router={}, {:?}->{:?}): {}",
-            route_target.router_name, incoming_api, route_target.upstream_wire, upstream_payload
+        debug_large_log(
+            &format!(
+                "upstream payload (router={}, {:?}->{:?})",
+                route_target.router_name, incoming_api, route_target.upstream_wire
+            ),
+            &upstream_payload.to_string(),
         );
         debug!(
             "upstream tool types (router={}, {:?}->{:?}): {}",

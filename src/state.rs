@@ -1,8 +1,8 @@
+use axum::http::StatusCode;
 use reqwest::Client;
 use serde_json::Value;
 use std::sync::Arc;
 use tokio::sync::RwLock;
-use axum::http::StatusCode;
 
 use crate::model::{IncomingApi, WireApi};
 use crate::routing::RouterManager;
