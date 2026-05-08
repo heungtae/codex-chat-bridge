@@ -1767,7 +1767,10 @@ fn responses_text_format_to_chat_response_format(format: &Value) -> Option<Value
     let format_type = format_obj.get("type").and_then(Value::as_str)?;
 
     match format_type {
-        "json_schema" if format_obj.contains_key("json_schema") => Some(format.clone()),
+        "json_schema" if format_obj.contains_key("json_schema") => Some(json!({
+            "type": "json_schema",
+            "json_schema": format_obj.get("json_schema")?.clone(),
+        })),
         "json_schema" => {
             let schema = format_obj.get("schema")?.clone();
             let name = format_obj.get("name")?.clone();
@@ -1786,7 +1789,7 @@ fn responses_text_format_to_chat_response_format(format: &Value) -> Option<Value
                 "json_schema": Value::Object(json_schema),
             }))
         }
-        "json_object" => Some(format.clone()),
+        "json_object" => Some(json!({"type": "json_object"})),
         _ => None,
     }
 }
@@ -2116,7 +2119,12 @@ mod tests {
             "input": [],
             "text": {
                 "format": {
-                    "type": "json_object"
+                    "type": "json_object",
+                    "json": {"type": "object"},
+                    "regex": null,
+                    "choice": null,
+                    "grammar": null,
+                    "disable_any_whitespace": false
                 }
             }
         });
@@ -2131,6 +2139,10 @@ mod tests {
         .expect("ok");
 
         assert_eq!(out.chat_request["response_format"]["type"], "json_object");
+        assert_eq!(
+            out.chat_request["response_format"],
+            json!({"type": "json_object"})
+        );
         assert!(out.chat_request.get("text").is_none());
     }
 
@@ -2179,5 +2191,51 @@ mod tests {
             true
         );
         assert!(out.chat_request["response_format"].get("schema").is_none());
+    }
+
+    #[test]
+    fn responses_nested_json_schema_text_format_drops_other_constraints() {
+        let request = json!({
+            "model": "gpt-4.1",
+            "input": [],
+            "text": {
+                "format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "codex_output_schema",
+                        "schema": {"type": "object"},
+                        "strict": true
+                    },
+                    "json": {"type": "object"},
+                    "regex": null,
+                    "choice": null,
+                    "grammar": null,
+                    "json_object": null,
+                    "disable_any_whitespace": false,
+                    "disable_additional_properties": false
+                }
+            }
+        });
+
+        let out = map_responses_to_chat_request_with_stream(
+            &request,
+            &HashSet::new(),
+            false,
+            false,
+            ToolTransformMode::LegacyConvert,
+        )
+        .expect("ok");
+
+        assert_eq!(
+            out.chat_request["response_format"],
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "codex_output_schema",
+                    "schema": {"type": "object"},
+                    "strict": true
+                }
+            })
+        );
     }
 }
