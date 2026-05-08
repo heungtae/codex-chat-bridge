@@ -802,25 +802,57 @@ fn normalize_unsupported_chat_message_roles(payload: &mut Value) {
         return;
     };
 
-    for message in messages {
-        let Some(obj) = message.as_object_mut() else {
-            continue;
-        };
-        let Some(role) = obj.get("role").and_then(Value::as_str) else {
-            continue;
-        };
+    let original_messages = std::mem::take(messages);
+    let mut system_contents = Vec::new();
+    let mut normalized_messages = Vec::new();
 
-        match role {
-            "developer" => {
-                obj.insert("role".to_string(), Value::String("system".to_string()));
+    for mut message in original_messages {
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+
+        match role.as_str() {
+            "developer" | "system" => {
+                if let Some(content) = chat_message_content_to_system_text(&message) {
+                    system_contents.push(content);
+                }
             }
             "tool" | "function" => {
+                let Some(obj) = message.as_object_mut() else {
+                    normalized_messages.push(message);
+                    continue;
+                };
                 obj.insert("role".to_string(), Value::String("user".to_string()));
                 obj.remove("tool_call_id");
                 obj.remove("name");
+                normalized_messages.push(message);
             }
-            _ => {}
+            _ => normalized_messages.push(message),
         }
+    }
+
+    if !system_contents.is_empty() {
+        messages.push(serde_json::json!({
+            "role": "system",
+            "content": system_contents.join("\n\n"),
+        }));
+    }
+    messages.extend(normalized_messages);
+}
+
+fn chat_message_content_to_system_text(message: &Value) -> Option<String> {
+    let content = message.get("content")?;
+    let text = match content {
+        Value::String(text) => text.clone(),
+        Value::Null => return None,
+        other => other.to_string(),
+    };
+    if text.trim().is_empty() {
+        None
+    } else {
+        Some(text)
     }
 }
 

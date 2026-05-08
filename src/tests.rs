@@ -2101,9 +2101,11 @@ fn normalize_unsupported_chat_message_roles_rewrites_provider_rejected_roles() {
     let mut payload = json!({
         "model": "gpt-4.1",
         "messages": [
+            {"role":"user","content":"first user"},
             {"role":"developer","content":"developer instructions"},
             {"role":"tool","tool_call_id":"call_1","content":"tool output"},
             {"role":"function","name":"legacy_function","content":"function output"},
+            {"role":"system","content":"later system"},
             {"role":"user","content":"hi"}
         ]
     });
@@ -2112,11 +2114,17 @@ fn normalize_unsupported_chat_message_roles_rewrites_provider_rejected_roles() {
 
     let messages = payload["messages"].as_array().expect("messages");
     assert_eq!(messages[0]["role"], "system");
+    assert_eq!(
+        messages[0]["content"],
+        "developer instructions\n\nlater system"
+    );
     assert_eq!(messages[1]["role"], "user");
-    assert!(messages[1].get("tool_call_id").is_none());
+    assert_eq!(messages[1]["content"], "first user");
     assert_eq!(messages[2]["role"], "user");
-    assert!(messages[2].get("name").is_none());
+    assert!(messages[2].get("tool_call_id").is_none());
     assert_eq!(messages[3]["role"], "user");
+    assert!(messages[3].get("name").is_none());
+    assert_eq!(messages[4]["role"], "user");
 }
 
 #[test]
