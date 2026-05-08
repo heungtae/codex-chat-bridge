@@ -263,6 +263,44 @@ fn normalize_chat_tools_converts_empty_additional_properties_to_false() {
 }
 
 #[test]
+fn normalize_chat_tools_removes_parameter_constraint_fields() {
+    let tools = vec![json!({
+        "type": "function",
+        "name": "format_output",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "structural_tag": null,
+            "disable_any_whitespace": false,
+            "disable_additional_properties": false,
+            "whitespace_pattern": null,
+            "regex": null,
+            "choice": null,
+            "grammar": null,
+            "json_object": null
+        }
+    })];
+    let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
+    let parameters = out[0]["function"]["parameters"]
+        .as_object()
+        .expect("parameters");
+
+    for field in [
+        "structural_tag",
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+        "regex",
+        "choice",
+        "grammar",
+        "json_object",
+    ] {
+        assert!(!parameters.contains_key(field), "{field} should be removed");
+    }
+}
+
+#[test]
 fn normalize_chat_tools_converts_null_required_to_empty_array() {
     let tools = vec![json!({
         "type": "function",
@@ -487,14 +525,13 @@ fn map_applies_responses_extensions_to_chat_payload() {
         ToolTransformMode::LegacyConvert,
     )
     .expect("should map");
-    assert_eq!(req.chat_request["max_tokens"], 321);
+    assert_eq!(req.chat_request["max_completion_tokens"], 321);
     assert_eq!(req.chat_request["metadata"]["trace_id"], "t-1");
-    assert_eq!(req.chat_request["reasoning"]["effort"], "medium");
+    assert_eq!(req.chat_request["reasoning_effort"], "medium");
     assert_eq!(req.chat_request["service_tier"], "default");
-    assert_eq!(
-        req.chat_request["include"][0],
-        "reasoning.encrypted_content"
-    );
+    assert!(req.chat_request.get("include").is_none());
+    assert!(req.chat_request.get("reasoning").is_none());
+    assert!(req.chat_request.get("max_tokens").is_none());
     assert_eq!(req.chat_request["response_format"]["type"], "json_object");
     assert!(req.chat_request.get("text").is_none());
 }
@@ -831,6 +868,55 @@ fn normalize_chat_tools_normalizes_wrapped_function_null_required() {
     })];
     let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
     assert_eq!(out[0]["function"]["parameters"]["required"], json!([]));
+}
+
+#[test]
+fn normalize_chat_tools_removes_wrapped_output_schema_constraint_fields() {
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "format_output",
+            "parameters": {"type":"object"},
+            "output_schema": {
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "structural_tag": null,
+                "disable_any_whitespace": false,
+                "disable_additional_properties": false,
+                "whitespace_pattern": null,
+                "regex": null,
+                "choice": null,
+                "grammar": null,
+                "json_object": null
+            }
+        }
+    })];
+    let out = normalize_chat_tools(tools, &HashSet::new(), ToolTransformMode::LegacyConvert);
+    let output_schema = out[0]["function"]["output_schema"]
+        .as_object()
+        .expect("output_schema");
+
+    assert_eq!(
+        output_schema.get("type").and_then(Value::as_str),
+        Some("object")
+    );
+    assert_eq!(output_schema.get("required"), Some(&json!([])));
+    for field in [
+        "structural_tag",
+        "disable_any_whitespace",
+        "disable_additional_properties",
+        "whitespace_pattern",
+        "regex",
+        "choice",
+        "grammar",
+        "json_object",
+    ] {
+        assert!(
+            !output_schema.contains_key(field),
+            "{field} should be removed"
+        );
+    }
 }
 
 #[test]

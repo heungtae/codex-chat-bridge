@@ -851,6 +851,23 @@ fn normalize_custom_tool_parameters(parameters: Option<Value>) -> Value {
     }
 }
 
+const TOOL_SCHEMA_CONSTRAINT_FIELDS: [&str; 8] = [
+    "structural_tag",
+    "disable_any_whitespace",
+    "disable_additional_properties",
+    "whitespace_pattern",
+    "regex",
+    "choice",
+    "grammar",
+    "json_object",
+];
+
+fn remove_tool_schema_constraint_fields(obj: &mut serde_json::Map<String, Value>) {
+    for field in TOOL_SCHEMA_CONSTRAINT_FIELDS {
+        obj.remove(field);
+    }
+}
+
 fn normalize_tool_parameters(mut parameters: Value) -> Value {
     let Some(obj) = parameters.as_object_mut() else {
         return parameters;
@@ -867,6 +884,8 @@ fn normalize_tool_parameters(mut parameters: Value) -> Value {
     {
         obj.insert("additionalProperties".to_string(), Value::Bool(false));
     }
+
+    remove_tool_schema_constraint_fields(obj);
 
     parameters
 }
@@ -903,6 +922,12 @@ fn normalize_wrapped_function_tool_parameters(mut tool: Value) -> Value {
             "parameters".to_string(),
             normalize_tool_parameters(parameters),
         );
+        if let Some(output_schema) = function.remove("output_schema") {
+            function.insert(
+                "output_schema".to_string(),
+                normalize_tool_parameters(output_schema),
+            );
+        }
     }
 
     tool
@@ -1738,19 +1763,26 @@ fn apply_responses_request_extensions(request: &Value, chat_request: &mut Value)
     };
 
     if let Some(max_output_tokens) = request.get("max_output_tokens") {
-        chat_obj.insert("max_tokens".to_string(), max_output_tokens.clone());
+        chat_obj.insert(
+            "max_completion_tokens".to_string(),
+            max_output_tokens.clone(),
+        );
     }
     if let Some(metadata) = request.get("metadata") {
         chat_obj.insert("metadata".to_string(), metadata.clone());
     }
-    if let Some(reasoning) = request.get("reasoning") {
-        chat_obj.insert("reasoning".to_string(), reasoning.clone());
+    if let Some(reasoning_effort) = request
+        .get("reasoning")
+        .and_then(|reasoning| reasoning.get("effort"))
+        .and_then(Value::as_str)
+    {
+        chat_obj.insert(
+            "reasoning_effort".to_string(),
+            Value::String(reasoning_effort.to_string()),
+        );
     }
     if let Some(service_tier) = request.get("service_tier") {
         chat_obj.insert("service_tier".to_string(), service_tier.clone());
-    }
-    if let Some(include) = request.get("include") {
-        chat_obj.insert("include".to_string(), include.clone());
     }
     if let Some(text) = request.get("text")
         && let Some(response_format) = text
