@@ -612,6 +612,43 @@ fn map_preserves_user_messages_while_dropping_reasoning_items() {
 }
 
 #[test]
+fn map_responses_developer_message_to_chat_system_message() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": [
+                    {"type":"input_text","text":"<permissions instructions>..."}
+                ]
+            },
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type":"input_text","text":"hi"}
+                ]
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        false,
+        false,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+    let messages = req.chat_request["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 2);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "<permissions instructions>...");
+    assert_eq!(messages[1]["role"], "user");
+}
+
+#[test]
 fn map_recovers_missing_call_id_from_pending_tool_call() {
     let input = json!({
         "model": "gpt-4.1",
@@ -2057,6 +2094,29 @@ fn apply_upstream_model_override_ignores_family_overrides_for_non_claude_models(
     apply_upstream_model_override(&mut payload, &route_target);
 
     assert_eq!(payload["model"], "openrouter/default-model");
+}
+
+#[test]
+fn normalize_unsupported_chat_message_roles_rewrites_provider_rejected_roles() {
+    let mut payload = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {"role":"developer","content":"developer instructions"},
+            {"role":"tool","tool_call_id":"call_1","content":"tool output"},
+            {"role":"function","name":"legacy_function","content":"function output"},
+            {"role":"user","content":"hi"}
+        ]
+    });
+
+    normalize_unsupported_chat_message_roles(&mut payload);
+
+    let messages = payload["messages"].as_array().expect("messages");
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[1]["role"], "user");
+    assert!(messages[1].get("tool_call_id").is_none());
+    assert_eq!(messages[2]["role"], "user");
+    assert!(messages[2].get("name").is_none());
+    assert_eq!(messages[3]["role"], "user");
 }
 
 #[test]

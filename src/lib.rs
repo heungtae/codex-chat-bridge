@@ -741,10 +741,11 @@ async fn build_upstream_payload_with_session(
         inject_openrouter_reasoning(&mut upstream_payload);
     }
 
-    if route_target.feature_flags.enable_previous_response_id
-        && incoming_api == IncomingApi::Responses
-        && route_target.upstream_wire == WireApi::Chat
-    {
+    let should_store_previous_response_messages =
+        route_target.feature_flags.enable_previous_response_id
+            && incoming_api == IncomingApi::Responses
+            && route_target.upstream_wire == WireApi::Chat;
+    if should_store_previous_response_messages {
         let previous_messages = {
             let sessions = state.sessions.read().await;
             match resolve_previous_messages_for_request(request_value, &sessions) {
@@ -777,7 +778,13 @@ async fn build_upstream_payload_with_session(
                 &err.to_string(),
             ));
         }
+    }
 
+    if route_target.upstream_wire == WireApi::Chat {
+        normalize_unsupported_chat_message_roles(&mut upstream_payload);
+    }
+
+    if should_store_previous_response_messages {
         let chat_messages = upstream_payload
             .get("messages")
             .and_then(Value::as_array)
@@ -788,6 +795,33 @@ async fn build_upstream_payload_with_session(
     }
 
     Ok((response_id, upstream_payload))
+}
+
+fn normalize_unsupported_chat_message_roles(payload: &mut Value) {
+    let Some(messages) = payload.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for message in messages {
+        let Some(obj) = message.as_object_mut() else {
+            continue;
+        };
+        let Some(role) = obj.get("role").and_then(Value::as_str) else {
+            continue;
+        };
+
+        match role {
+            "developer" => {
+                obj.insert("role".to_string(), Value::String("system".to_string()));
+            }
+            "tool" | "function" => {
+                obj.insert("role".to_string(), Value::String("user".to_string()));
+                obj.remove("tool_call_id");
+                obj.remove("name");
+            }
+            _ => {}
+        }
+    }
 }
 
 fn build_upstream_request(

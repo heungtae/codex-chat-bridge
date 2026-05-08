@@ -1340,7 +1340,11 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
 
         match item_type {
             "message" => {
-                let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+                let role = item
+                    .get("role")
+                    .and_then(Value::as_str)
+                    .map(responses_message_role_to_chat_role)
+                    .unwrap_or("user");
                 let content = item
                     .get("content")
                     .and_then(Value::as_array)
@@ -1548,6 +1552,13 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
     apply_responses_request_extensions(request, &mut chat_request)?;
 
     Ok(BridgeRequest { chat_request })
+}
+
+fn responses_message_role_to_chat_role(role: &str) -> &str {
+    match role {
+        "developer" => "system",
+        role => role,
+    }
 }
 
 fn resolve_tool_output_call_id(
