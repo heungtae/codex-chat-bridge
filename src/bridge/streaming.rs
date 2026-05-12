@@ -4,6 +4,7 @@ use axum::body::Bytes;
 use futures::{Stream, StreamExt};
 use serde_json::{Value, json};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::warn;
 
 use crate::logging_utils::debug_large_log;
@@ -51,6 +52,113 @@ where
                     return;
                 }
             }
+        }
+    }
+}
+
+pub(crate) fn passthrough_chat_stream<S>(
+    upstream_stream: S,
+    router_name: String,
+    verbose_logging: bool,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    stream! {
+        let mut upstream_stream = Box::pin(upstream_stream);
+        while let Some(chunk_result) = upstream_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if verbose_logging {
+                        debug_large_log(
+                            &format!(
+                                "upstream response payload stream chunk (router={}, chat passthrough)",
+                                router_name
+                            ),
+                            String::from_utf8_lossy(&chunk).as_ref(),
+                        );
+                    }
+                    yield Ok(chunk)
+                },
+                Err(err) => {
+                    yield Ok(chat_sse_data(&json!({
+                        "error": {
+                            "type": "upstream_stream_error",
+                            "message": err.to_string(),
+                        }
+                    })));
+                    yield Ok(Bytes::from("data: [DONE]\n\n"));
+                    return;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) fn translate_responses_stream_to_chat<S>(
+    upstream_stream: S,
+    router_name: String,
+    verbose_logging: bool,
+    model: String,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    stream! {
+        let mut upstream_stream = Box::pin(upstream_stream);
+        let mut parser = SseParser::default();
+        let mut state = ResponsesToChatStreamState::new(model);
+
+        while let Some(chunk_result) = upstream_stream.next().await {
+            let chunk = match chunk_result {
+                Ok(chunk) => chunk,
+                Err(err) => {
+                    yield Ok(chat_sse_data(&json!({
+                        "error": {
+                            "type": "upstream_stream_error",
+                            "message": err.to_string(),
+                        }
+                    })));
+                    yield Ok(Bytes::from("data: [DONE]\n\n"));
+                    return;
+                }
+            };
+
+            if verbose_logging {
+                debug_large_log(
+                    &format!(
+                        "upstream response payload stream chunk (router={}, responses->chat)",
+                        router_name
+                    ),
+                    String::from_utf8_lossy(&chunk).as_ref(),
+                );
+            }
+
+            let text = String::from_utf8_lossy(&chunk);
+            for (event_name, data) in parser.feed_with_event_names(&text) {
+                for event in state.process_event(event_name.as_deref(), &data) {
+                    yield Ok(event);
+                }
+                if state.done {
+                    return;
+                }
+            }
+        }
+
+        if let Some(data) = parser.finish() {
+            for event in state.process_event(None, &data) {
+                yield Ok(event);
+            }
+        }
+
+        if !state.done {
+            yield Ok(chat_sse_data(&json!({
+                "error": {
+                    "type": "upstream_stream_incomplete",
+                    "message": "upstream stream ended before terminal marker",
+                }
+            })));
+            yield Ok(Bytes::from("data: [DONE]\n\n"));
         }
     }
 }
@@ -758,7 +866,14 @@ fn tool_output_index(index: usize) -> usize {
 }
 
 pub(crate) fn sse_event(event_name: &str, payload: &Value) -> Bytes {
-    let json_payload = serde_json::to_string(payload).unwrap_or_else(|_| {
+    static NEXT_SEQUENCE_NUMBER: AtomicU64 = AtomicU64::new(0);
+
+    let mut payload_with_sequence = payload.clone();
+    if let Some(obj) = payload_with_sequence.as_object_mut() {
+        obj.entry("sequence_number".to_string())
+            .or_insert_with(|| json!(NEXT_SEQUENCE_NUMBER.fetch_add(1, Ordering::Relaxed)));
+    }
+    let json_payload = serde_json::to_string(&payload_with_sequence).unwrap_or_else(|_| {
         "{\"type\":\"response.failed\",\"response\":{\"error\":{\"message\":\"internal serialization error\"}}}".to_string()
     });
     Bytes::from(format!("event: {event_name}\ndata: {json_payload}\n\n"))
@@ -769,6 +884,345 @@ pub(crate) fn anthropic_sse_event(event_name: &str, payload: &Value) -> Bytes {
         "{\"type\":\"error\",\"error\":{\"type\":\"api_error\",\"message\":\"internal serialization error\"}}".to_string()
     });
     Bytes::from(format!("event: {event_name}\ndata: {json_payload}\n\n"))
+}
+
+fn chat_sse_data(payload: &Value) -> Bytes {
+    let json_payload = serde_json::to_string(payload).unwrap_or_else(|_| {
+        "{\"error\":{\"type\":\"internal_error\",\"message\":\"internal serialization error\"}}"
+            .to_string()
+    });
+    Bytes::from(format!("data: {json_payload}\n\n"))
+}
+
+#[derive(Default)]
+struct ResponsesToChatToolState {
+    id: String,
+    name: String,
+    emitted: bool,
+    argument_delta_seen: bool,
+}
+
+struct ResponsesToChatStreamState {
+    id: String,
+    model: String,
+    tool_calls: BTreeMap<usize, ResponsesToChatToolState>,
+    tool_index_by_item_id: HashMap<String, usize>,
+    next_tool_index: usize,
+    text_delta_seen: bool,
+    done: bool,
+}
+
+impl ResponsesToChatStreamState {
+    fn new(model: String) -> Self {
+        Self {
+            id: format!("chatcmpl_{}", uuid::Uuid::now_v7()),
+            model,
+            tool_calls: BTreeMap::new(),
+            tool_index_by_item_id: HashMap::new(),
+            next_tool_index: 0,
+            text_delta_seen: false,
+            done: false,
+        }
+    }
+
+    fn process_event(&mut self, event_name: Option<&str>, data: &str) -> Vec<Bytes> {
+        if data == "[DONE]" {
+            self.done = true;
+            return vec![Bytes::from("data: [DONE]\n\n")];
+        }
+
+        let Ok(payload) = serde_json::from_str::<Value>(data) else {
+            warn!("failed to decode upstream responses stream event");
+            return Vec::new();
+        };
+        let event_type = event_name
+            .filter(|value| !value.trim().is_empty())
+            .or_else(|| payload.get("type").and_then(Value::as_str))
+            .unwrap_or_default();
+
+        match event_type {
+            "response.output_text.delta" => {
+                let delta = payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if delta.is_empty() {
+                    Vec::new()
+                } else {
+                    self.text_delta_seen = true;
+                    vec![self.chat_chunk(json!({"content": delta}), None, None)]
+                }
+            }
+            "response.output_item.added" => self.process_output_item_added(&payload),
+            "response.function_call_arguments.delta" => {
+                let delta = payload
+                    .get("delta")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                if delta.is_empty() {
+                    return Vec::new();
+                }
+                let index = self.tool_index_for_payload(&payload);
+                if let Some(index) = index {
+                    if let Some(state) = self.tool_calls.get_mut(&index) {
+                        state.argument_delta_seen = true;
+                    }
+                    vec![self.chat_chunk(
+                        json!({
+                            "tool_calls": [{
+                                "index": index,
+                                "function": {
+                                    "arguments": delta,
+                                }
+                            }]
+                        }),
+                        None,
+                        None,
+                    )]
+                } else {
+                    Vec::new()
+                }
+            }
+            "response.output_item.done" => self.process_output_item_done(&payload),
+            "response.completed" => {
+                self.done = true;
+                let response = payload.get("response").unwrap_or(&payload);
+                let finish_reason = if !self.tool_calls.is_empty() {
+                    "tool_calls"
+                } else if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+                    "length"
+                } else {
+                    "stop"
+                };
+                let usage = chat_usage_from_responses_usage(response.get("usage"));
+                vec![
+                    self.chat_chunk(json!({}), Some(finish_reason), usage),
+                    Bytes::from("data: [DONE]\n\n"),
+                ]
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    fn process_output_item_added(&mut self, payload: &Value) -> Vec<Bytes> {
+        let Some(item) = payload.get("item") else {
+            return Vec::new();
+        };
+        if !is_responses_tool_item(item) {
+            return Vec::new();
+        }
+
+        let index = payload
+            .get("output_index")
+            .and_then(Value::as_u64)
+            .map(responses_output_index_to_tool_index)
+            .unwrap_or_else(|| {
+                let index = self.next_tool_index;
+                self.next_tool_index += 1;
+                index
+            });
+        let id = responses_tool_item_id(item);
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_function")
+            .to_string();
+        self.tool_index_by_item_id.insert(id.clone(), index);
+        let state = self.tool_calls.entry(index).or_default();
+        state.id = id.clone();
+        state.name = name.clone();
+        state.emitted = true;
+
+        vec![self.chat_chunk(
+            json!({
+                "tool_calls": [{
+                    "index": index,
+                    "id": id,
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": "",
+                    }
+                }]
+            }),
+            None,
+            None,
+        )]
+    }
+
+    fn process_output_item_done(&mut self, payload: &Value) -> Vec<Bytes> {
+        let Some(item) = payload.get("item") else {
+            return Vec::new();
+        };
+        if item.get("type").and_then(Value::as_str) == Some("message") {
+            if self.text_delta_seen {
+                return Vec::new();
+            }
+            let text = item
+                .get("content")
+                .and_then(Value::as_array)
+                .map(|parts| {
+                    parts
+                        .iter()
+                        .filter_map(|part| part.get("text").and_then(Value::as_str))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                })
+                .unwrap_or_default();
+            if text.is_empty() {
+                return Vec::new();
+            }
+            self.text_delta_seen = true;
+            return vec![self.chat_chunk(json!({"content": text}), None, None)];
+        }
+
+        if !is_responses_tool_item(item) {
+            return Vec::new();
+        }
+
+        let index = self.tool_index_for_payload(payload).unwrap_or_else(|| {
+            let index = self.next_tool_index;
+            self.next_tool_index += 1;
+            index
+        });
+        let id = responses_tool_item_id(item);
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown_function")
+            .to_string();
+        self.tool_index_by_item_id.insert(id.clone(), index);
+        let (emit_added, emit_arguments) = {
+            let state = self.tool_calls.entry(index).or_default();
+            let emit_added = !state.emitted;
+            if emit_added {
+                state.id = id.clone();
+                state.name = name.clone();
+                state.emitted = true;
+            }
+            let emit_arguments = !state.argument_delta_seen;
+            (emit_added, emit_arguments)
+        };
+
+        let mut emitted = Vec::new();
+        if emit_added {
+            emitted.push(self.chat_chunk(
+                json!({
+                    "tool_calls": [{
+                        "index": index,
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": "",
+                        }
+                    }]
+                }),
+                None,
+                None,
+            ));
+        }
+
+        if emit_arguments {
+            let arguments = item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .map(crate::bridge::mapping::function_arguments_to_text)
+                .unwrap_or_default();
+            if !arguments.is_empty() {
+                emitted.push(self.chat_chunk(
+                    json!({
+                        "tool_calls": [{
+                            "index": index,
+                            "function": {
+                                "arguments": arguments,
+                            }
+                        }]
+                    }),
+                    None,
+                    None,
+                ));
+            }
+        }
+
+        emitted
+    }
+
+    fn tool_index_for_payload(&self, payload: &Value) -> Option<usize> {
+        payload
+            .get("item_id")
+            .or_else(|| payload.get("call_id"))
+            .and_then(Value::as_str)
+            .and_then(|id| self.tool_index_by_item_id.get(id).copied())
+            .or_else(|| {
+                payload
+                    .get("output_index")
+                    .and_then(Value::as_u64)
+                    .map(responses_output_index_to_tool_index)
+            })
+    }
+
+    fn chat_chunk(&self, delta: Value, finish_reason: Option<&str>, usage: Option<Value>) -> Bytes {
+        let mut chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": self.model,
+            "choices": [{
+                "index": 0,
+                "delta": delta,
+                "finish_reason": finish_reason,
+            }],
+        });
+        if let Some(usage) = usage
+            && let Some(obj) = chunk.as_object_mut()
+        {
+            obj.insert("usage".to_string(), usage);
+        }
+        chat_sse_data(&chunk)
+    }
+}
+
+fn is_responses_tool_item(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call" | "custom_tool_call")
+    )
+}
+
+fn responses_tool_item_id(item: &Value) -> String {
+    item.get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+        .unwrap_or_else(|| format!("call_{}", uuid::Uuid::now_v7()))
+}
+
+fn responses_output_index_to_tool_index(output_index: u64) -> usize {
+    output_index.saturating_sub(1) as usize
+}
+
+fn chat_usage_from_responses_usage(usage: Option<&Value>) -> Option<Value> {
+    let usage = usage?;
+    if usage.is_null() {
+        return None;
+    }
+    let prompt_tokens = usage
+        .get("input_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or(0);
+    Some(json!({
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "total_tokens": usage
+            .get("total_tokens")
+            .and_then(Value::as_i64)
+            .unwrap_or(prompt_tokens + completion_tokens),
+    }))
 }
 
 fn anthropic_content_block_start(index: usize, _block_type: &str, content_block: Value) -> Bytes {

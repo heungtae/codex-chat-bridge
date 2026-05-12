@@ -986,6 +986,12 @@ async fn finalize_upstream_response(
                         upstream_model.clone(),
                         anthropic_input_tokens,
                     ))
+                } else if incoming_api == IncomingApi::Chat {
+                    Body::from_stream(passthrough_chat_stream(
+                        upstream_response.bytes_stream(),
+                        route_target.router_name.clone(),
+                        verbose_logging,
+                    ))
                 } else {
                     Body::from_stream(translate_chat_stream(
                         upstream_response.bytes_stream(),
@@ -997,11 +1003,22 @@ async fn finalize_upstream_response(
                     ))
                 }
             }
-            WireApi::Responses => Body::from_stream(passthrough_responses_stream(
-                upstream_response.bytes_stream(),
-                route_target.router_name.clone(),
-                verbose_logging,
-            )),
+            WireApi::Responses => {
+                if incoming_api == IncomingApi::Chat {
+                    Body::from_stream(translate_responses_stream_to_chat(
+                        upstream_response.bytes_stream(),
+                        route_target.router_name.clone(),
+                        verbose_logging,
+                        upstream_model.clone(),
+                    ))
+                } else {
+                    Body::from_stream(passthrough_responses_stream(
+                        upstream_response.bytes_stream(),
+                        route_target.router_name.clone(),
+                        verbose_logging,
+                    ))
+                }
+            }
         };
 
         return (
@@ -1044,6 +1061,8 @@ async fn finalize_upstream_response(
         WireApi::Chat => {
             if incoming_api == IncomingApi::Anthropic {
                 chat_json_to_anthropic_json(upstream_json, &upstream_model)
+            } else if incoming_api == IncomingApi::Chat {
+                upstream_json
             } else {
                 chat_json_to_responses_json(
                     upstream_json,
@@ -1056,6 +1075,8 @@ async fn finalize_upstream_response(
         WireApi::Responses => {
             if incoming_api == IncomingApi::Anthropic {
                 responses_json_to_anthropic_json(upstream_json, &upstream_model)
+            } else if incoming_api == IncomingApi::Chat {
+                responses_json_to_chat_json(upstream_json, &upstream_model)
             } else {
                 upstream_json
             }

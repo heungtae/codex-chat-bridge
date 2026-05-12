@@ -1111,6 +1111,89 @@ pub(crate) fn chat_json_to_responses_json(
     response
 }
 
+pub(crate) fn responses_json_to_chat_json(response: Value, fallback_model: &str) -> Value {
+    let mut content_parts = Vec::new();
+    let mut tool_calls = Vec::new();
+
+    if let Some(output) = response.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str).unwrap_or_default() {
+                "message" => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        content_parts.extend(
+                            parts
+                                .iter()
+                                .filter_map(|part| part.get("text").and_then(Value::as_str))
+                                .filter(|text| !text.is_empty())
+                                .map(ToString::to_string),
+                        );
+                    }
+                }
+                "function_call" | "custom_tool_call" => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                        .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown_function");
+                    let arguments = item
+                        .get("arguments")
+                        .or_else(|| item.get("input"))
+                        .map(function_arguments_to_text)
+                        .unwrap_or_else(|| "{}".to_string());
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": arguments,
+                        }
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let mut message = json!({
+        "role": "assistant",
+        "content": content_parts.join("\n"),
+    });
+    if !tool_calls.is_empty()
+        && let Some(obj) = message.as_object_mut()
+    {
+        obj.insert("tool_calls".to_string(), Value::Array(tool_calls.clone()));
+    }
+
+    let usage_json = response.get("usage").map(|usage| {
+        json!({
+            "prompt_tokens": usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0),
+            "completion_tokens": usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0),
+            "total_tokens": usage.get("total_tokens").and_then(Value::as_i64).unwrap_or_else(|| {
+                usage.get("input_tokens").and_then(Value::as_i64).unwrap_or(0)
+                    + usage.get("output_tokens").and_then(Value::as_i64).unwrap_or(0)
+            }),
+        })
+    });
+
+    json!({
+        "id": response.get("id").and_then(Value::as_str).map(ToString::to_string).unwrap_or_else(|| format!("chatcmpl_{}", Uuid::now_v7())),
+        "object": "chat.completion",
+        "created": 0,
+        "model": response.get("model").and_then(Value::as_str).unwrap_or(fallback_model),
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": responses_finish_reason_for_chat(&response, !tool_calls.is_empty()),
+        }],
+        "usage": usage_json,
+    })
+}
+
 pub(crate) fn chat_json_to_anthropic_json(chat: Value, fallback_model: &str) -> Value {
     let mut content = Vec::new();
     let mut stop_reason = None::<String>;
@@ -1307,6 +1390,16 @@ fn map_chat_finish_reason_to_responses_status(finish_reason: Option<&str>) -> &'
     match finish_reason {
         Some("length" | "content_filter") => "incomplete",
         _ => "completed",
+    }
+}
+
+fn responses_finish_reason_for_chat(response: &Value, has_tool_calls: bool) -> &'static str {
+    if has_tool_calls {
+        return "tool_calls";
+    }
+    match response.get("status").and_then(Value::as_str) {
+        Some("incomplete") => "length",
+        _ => "stop",
     }
 }
 

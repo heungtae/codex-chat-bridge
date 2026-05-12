@@ -1,8 +1,11 @@
 use super::*;
 use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
 use crate::bridge_types::ChatDelta;
+use axum::Json;
 use axum::body::{Body, Bytes, to_bytes};
+use axum::extract::State as AxumState;
 use axum::http::Request;
+use axum::routing::post;
 use futures::StreamExt;
 use futures::stream;
 use serde_json::json;
@@ -1633,6 +1636,90 @@ fn chat_json_to_responses_json_preserves_provider_specific_fields() {
 }
 
 #[test]
+fn responses_json_to_chat_json_maps_text_tool_calls_and_usage() {
+    let response = json!({
+        "id": "resp_1",
+        "model": "gpt-4.1",
+        "status": "completed",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"output_text","text":"hello"}]
+            },
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "get_weather",
+                "arguments": "{\"city\":\"seoul\"}"
+            }
+        ],
+        "usage": {
+            "input_tokens": 3,
+            "output_tokens": 5,
+            "total_tokens": 8
+        }
+    });
+
+    let out = responses_json_to_chat_json(response, "fallback-model");
+
+    assert_eq!(out["object"], "chat.completion");
+    assert_eq!(out["id"], "resp_1");
+    assert_eq!(out["model"], "gpt-4.1");
+    assert_eq!(out["choices"][0]["message"]["role"], "assistant");
+    assert_eq!(out["choices"][0]["message"]["content"], "hello");
+    assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+    assert_eq!(
+        out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+        "get_weather"
+    );
+    assert_eq!(
+        out["choices"][0]["message"]["tool_calls"][0]["function"]["arguments"],
+        "{\"city\":\"seoul\"}"
+    );
+    assert_eq!(out["usage"]["prompt_tokens"], 3);
+    assert_eq!(out["usage"]["completion_tokens"], 5);
+    assert_eq!(out["usage"]["total_tokens"], 8);
+}
+
+#[tokio::test]
+async fn responses_stream_to_chat_stream_emits_data_only_chunks_and_done() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "event: response.output_text.delta\n\
+         data: {\"type\":\"response.output_text.delta\",\"delta\":\"Hi\"}\n\n\
+         event: response.output_item.added\n\
+         data: {\"type\":\"response.output_item.added\",\"output_index\":1,\"item\":{\"type\":\"function_call\",\"call_id\":\"call_1\",\"name\":\"shell\",\"arguments\":\"\"}}\n\n\
+         event: response.function_call_arguments.delta\n\
+         data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"output_index\":1,\"delta\":\"{\\\"cmd\\\":\"}\n\n\
+         event: response.function_call_arguments.delta\n\
+         data: {\"type\":\"response.function_call_arguments.delta\",\"item_id\":\"call_1\",\"output_index\":1,\"delta\":\"\\\"ls\\\"}\"}\n\n\
+         event: response.completed\n\
+         data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":2,\"total_tokens\":3}}}\n\n",
+    ))]);
+    let mut output = Box::pin(translate_responses_stream_to_chat(
+        upstream,
+        "test_router".to_string(),
+        false,
+        "gpt-4.1".to_string(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    assert!(!payload.contains("event:"));
+    assert!(payload.contains("\"object\":\"chat.completion.chunk\""));
+    assert!(payload.contains("\"content\":\"Hi\""));
+    assert!(payload.contains("\"tool_calls\""));
+    assert!(payload.contains("\"arguments\":\"{\\\"cmd\\\":\""));
+    assert!(payload.contains("\"arguments\":\"\\\"ls\\\"}\""));
+    assert!(payload.contains("\"finish_reason\":\"tool_calls\""));
+    assert!(payload.contains("\"prompt_tokens\":1"));
+    assert!(payload.ends_with("data: [DONE]\n\n"));
+}
+
+#[test]
 fn resolve_config_prefers_cli_over_file_and_defaults() {
     let args = Args {
         config: None,
@@ -3257,6 +3344,46 @@ fn test_state_with_router(
     })
 }
 
+#[derive(Clone)]
+struct MockJsonUpstreamState {
+    response: Value,
+    captured_request: Arc<tokio::sync::Mutex<Option<Value>>>,
+}
+
+async fn mock_json_upstream_handler(
+    AxumState(state): AxumState<MockJsonUpstreamState>,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    *state.captured_request.lock().await = Some(body);
+    Json(state.response)
+}
+
+async fn spawn_mock_json_upstream(
+    path: &str,
+    response: Value,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::sync::Mutex<Option<Value>>>,
+) {
+    let captured_request = Arc::new(tokio::sync::Mutex::new(None));
+    let state = MockJsonUpstreamState {
+        response,
+        captured_request: captured_request.clone(),
+    };
+    let app = axum::Router::new()
+        .route(path, post(mock_json_upstream_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let addr = listener.local_addr().expect("mock upstream address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}{path}"), handle, captured_request)
+}
+
 #[tokio::test]
 async fn direct_anthropic_endpoint_routes_using_request_path() {
     let app = build_app(test_state_with_router(
@@ -3353,6 +3480,129 @@ async fn direct_responses_endpoint_routes_using_request_path() {
     let json: Value = serde_json::from_slice(&body).expect("json");
 
     assert_eq!(json["error"]["type"], "upstream_transport_error");
+}
+
+#[tokio::test]
+#[ignore = "requires binding a local TCP listener"]
+async fn responses_request_to_chat_upstream_returns_responses_json() {
+    let (upstream_url, upstream_handle, captured_request) = spawn_mock_json_upstream(
+        "/v1/chat/completions",
+        json!({
+            "id": "chatcmpl_1",
+            "model": "gpt-4.1",
+            "choices": [{
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "hello"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "total_tokens": 3
+            }
+        }),
+    )
+    .await;
+    let app = build_app(test_state_with_router(
+        "http://127.0.0.1:8787/v1/responses",
+        &upstream_url,
+        WireApi::Chat,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4.1","stream":false,"input":[{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    upstream_handle.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    let captured = captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("captured request");
+
+    assert_eq!(captured["messages"][0]["role"], "user");
+    assert_eq!(json["object"], "response");
+    assert_eq!(json["output"][0]["content"][0]["text"], "hello");
+    assert_eq!(json["usage"]["input_tokens"], 1);
+}
+
+#[tokio::test]
+#[ignore = "requires binding a local TCP listener"]
+async fn chat_request_to_responses_upstream_returns_chat_json() {
+    let (upstream_url, upstream_handle, captured_request) = spawn_mock_json_upstream(
+        "/v1/responses",
+        json!({
+            "id": "resp_1",
+            "model": "gpt-4.1",
+            "status": "completed",
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type":"output_text","text":"hello chat"}]
+            }],
+            "usage": {
+                "input_tokens": 4,
+                "output_tokens": 5,
+                "total_tokens": 9
+            }
+        }),
+    )
+    .await;
+    let app = build_app(test_state_with_router(
+        "http://127.0.0.1:8787/v1/chat/completions",
+        &upstream_url,
+        WireApi::Responses,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    upstream_handle.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    let captured = captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("captured request");
+
+    assert_eq!(captured["input"][0]["type"], "message");
+    assert_eq!(json["object"], "chat.completion");
+    assert_eq!(json["choices"][0]["message"]["content"], "hello chat");
+    assert_eq!(json["usage"]["prompt_tokens"], 4);
 }
 
 #[tokio::test]

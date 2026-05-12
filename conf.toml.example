@@ -76,3 +76,8 @@ enable_reasoning_stream_events = false
 enable_provider_specific_fields = true
 enable_extended_input_types = true
 tool_transform_mode = "legacy_convert"
+
+[routers.chat_to_responses]
+incoming_url = "http://127.0.0.1:8787/chat/v1/chat/completions"
+upstream_url = "https://api.openai.com/v1/responses"
+upstream_wire = "responses"

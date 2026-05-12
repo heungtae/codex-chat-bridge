@@ -57,9 +57,11 @@ npm install -g @heungtae/codex-chat-bridge
 - Uses `incoming_url` path matching for `POST /{*incoming_path}`
 - Supports feature flags globally (`[features]`) and per-router (`[routers.<name>.features]`)
 - Supports host-aware routing when routers use absolute `incoming_url` values
-- Returns Responses-style output (`stream=true` -> SSE, `stream=false` -> JSON)
+- Preserves the incoming OpenAI API shape on response:
+  - incoming `POST /v1/responses` returns Responses JSON/SSE
+  - incoming `POST /v1/chat/completions` returns Chat Completions JSON/data-only SSE
 - Supports Anthropic `POST /v1/messages` input for Claude Code compatible routing
-- For chat upstream streaming, emits Responses-style SSE events:
+- For Chat upstream -> Responses client streaming, emits Responses-style SSE events:
   - `response.created`
   - `response.in_progress` (when `enable_extended_stream_events=true`)
   - `response.output_item.added` (assistant text starts; only emitted when text delta exists)
@@ -71,13 +73,16 @@ npm install -g @heungtae/codex-chat-bridge
   - `response.output_item.done` (assistant message and function calls)
   - `response.completed`
   - `response.failed` (for upstream/network errors)
+- For Responses upstream -> Chat client streaming, emits OpenAI Chat Completions data-only SSE chunks and ends with `data: [DONE]`.
 
 ## Routers
 
 The bridge supports multiple routers for different upstream configurations. Routing key is:
 
-- absolute `incoming_url` in config: `host:port + path`
-- path-only `incoming_url` in config: `path` only
+- absolute `incoming_url` in config: normalized `host:port + path`
+- path-only `incoming_url` in config: normalized `path` only
+
+Query strings and fragments are excluded from route keys. Duplicate normalized route keys are rejected at startup. Resolution order is authority+path exact, path-only exact, authority longest-prefix, then path-only longest-prefix.
 
 Define routers in `conf.toml`:
 
@@ -93,6 +98,10 @@ upstream_url = "https://api.openai.com/v1/responses"
 [routers.local]
 incoming_url = "http://127.0.0.1:8787/local/v1/responses"
 upstream_url = "http://localhost:8080/v1/chat/completions"
+
+[routers.chat_to_responses]
+incoming_url = "http://127.0.0.1:8787/chat/v1/chat/completions"
+upstream_url = "https://api.openai.com/v1/responses"
 ```
 
 Router resolution and overrides:
@@ -216,6 +225,22 @@ So if provider `base_url` is `http://127.0.0.1:8787/research/v1`, set:
 ```toml
 [routers.research]
 incoming_url = "http://127.0.0.1:8787/research/v1/responses"
+upstream_url = "https://api.openai.com/v1/responses"
+```
+
+To use Codex Responses wire against a Chat Completions upstream, route the same incoming Responses path to a Chat upstream:
+
+```toml
+[routers.codex_to_chat]
+incoming_url = "http://127.0.0.1:8787/openrouter/v1/responses"
+upstream_url = "https://openrouter.ai/api/v1/chat/completions"
+```
+
+For Chat Completions clients that should call a Responses upstream, use the Chat endpoint as the incoming URL:
+
+```toml
+[routers.chat_to_responses]
+incoming_url = "http://127.0.0.1:8787/chat/v1/chat/completions"
 upstream_url = "https://api.openai.com/v1/responses"
 ```
 
