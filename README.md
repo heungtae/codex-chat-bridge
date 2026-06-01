@@ -166,7 +166,7 @@ Available flags:
 - `enable_extended_stream_events`: Emits extended SSE lifecycle events (`response.in_progress`, content part add/done, `response.output_text.done`).
 - `enable_reasoning_stream_events`: Emits reasoning SSE events (`response.reasoning_summary_text.*`) and reasoning output items.
 - `enable_provider_specific_fields`: Preserves/passes `provider_specific_fields` in mapped responses.
-- `enable_extended_input_types`: Allows extended input/tool types (`input_image`, `input_file`, `mcp`, `web_search`, `web_search_preview`) in `responses -> chat` bridge path.
+- `enable_extended_input_types`: Allows extended input/tool types (`input_image`, `input_file`, `namespace`, `mcp`, `web_search`, `web_search_preview`) in `responses -> chat` bridge path.
 - `tool_transform_mode`: Controls `responses -> chat` tool conversion.
   - `legacy_convert` (default): Convert `custom`/`mcp`/`web_search*` tools into chat `function` tools.
   - `passthrough`: Keep non-`function` tool types as-is (LiteLLM-like behavior).

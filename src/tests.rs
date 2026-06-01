@@ -3212,6 +3212,7 @@ fn capability_gate_allows_mcp_and_web_search_tool_types() {
         "model": "gpt-4.1",
         "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
         "tools": [
+            {"type":"namespace","namespace":"functions","tools":[]},
             {"type":"mcp","server_label":"s","server_url":"http://localhost/mcp"},
             {"type":"web_search"},
             {"type":"web_search_preview"}
@@ -3220,6 +3221,33 @@ fn capability_gate_allows_mcp_and_web_search_tool_types() {
 
     let out = validate_capability_gate(IncomingApi::Responses, WireApi::Chat, true, &request);
     assert!(out.is_ok());
+}
+
+#[test]
+fn maps_responses_request_with_namespace_tool() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}],
+        "tools": [{
+            "type": "namespace",
+            "namespace": "functions",
+            "tools": [{
+                "name": "exec_command",
+                "description": "Run a command",
+                "parameters": {"type":"object","properties":{"cmd":{"type":"string"}}}
+            }]
+        }]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("namespace tool should map");
+    assert_eq!(req.chat_request["tools"][0]["type"], "namespace");
 }
 
 #[test]

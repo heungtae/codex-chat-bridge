@@ -102,7 +102,12 @@ pub(crate) fn validate_capability_gate(
             let is_supported = if enable_extended_input_types {
                 matches!(
                     tool_type,
-                    "function" | "custom" | "mcp" | "web_search" | "web_search_preview"
+                    "function"
+                        | "custom"
+                        | "namespace"
+                        | "mcp"
+                        | "web_search"
+                        | "web_search_preview"
                 )
             } else {
                 matches!(tool_type, "function" | "custom")
