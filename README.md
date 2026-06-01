@@ -168,7 +168,7 @@ Available flags:
 - `enable_provider_specific_fields`: Preserves/passes `provider_specific_fields` in mapped responses.
 - `enable_extended_input_types`: Allows extended input/tool types (`input_image`, `input_file`, `namespace`, `mcp`, `web_search`, `web_search_preview`) in `responses -> chat` bridge path.
 - `tool_transform_mode`: Controls `responses -> chat` tool conversion.
-  - `legacy_convert` (default): Convert `custom`/`mcp`/`web_search*` tools into chat `function` tools.
+  - `legacy_convert` (default): Convert `custom`/`namespace`/`mcp`/`web_search*` tools into chat `function` tools. `namespace` tools are flattened from `tools[]` into individual chat functions.
   - `passthrough`: Keep non-`function` tool types as-is (LiteLLM-like behavior).
 
 `responses -> chat` mapping accepts top-level `input` items with `type: "reasoning"` for compatibility, but does not serialize them into assistant message text. Live reasoning visibility is provided through Responses-style reasoning stream events/items.

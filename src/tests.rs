@@ -3247,7 +3247,32 @@ fn maps_responses_request_with_namespace_tool() {
         ToolTransformMode::LegacyConvert,
     )
     .expect("namespace tool should map");
-    assert_eq!(req.chat_request["tools"][0]["type"], "namespace");
+    assert_eq!(req.chat_request["tools"][0]["type"], "function");
+    assert_eq!(
+        req.chat_request["tools"][0]["function"]["name"],
+        "exec_command"
+    );
+    assert_eq!(
+        req.chat_request["tools"][0]["function"]["parameters"]["required"],
+        json!([])
+    );
+}
+
+#[test]
+fn namespace_tools_are_tracked_as_function_calls_by_name() {
+    let request = json!({
+        "tools": [{
+            "type": "namespace",
+            "namespace": "functions",
+            "tools": [{"name": "exec_command", "parameters": {"type": "object"}}]
+        }]
+    });
+
+    let kinds = responses_tool_call_kind_by_name(&request);
+    assert_eq!(
+        kinds.get("exec_command"),
+        Some(&ResponsesToolCallKind::Function)
+    );
 }
 
 #[test]

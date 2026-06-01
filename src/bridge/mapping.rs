@@ -728,35 +728,49 @@ pub(crate) fn chat_message_content_to_input_items(content: Option<&Value>) -> Ve
 pub(crate) fn responses_tool_call_kind_by_name(
     request: &Value,
 ) -> HashMap<String, ResponsesToolCallKind> {
-    request
-        .get("tools")
-        .and_then(Value::as_array)
-        .map(|tools| {
-            tools
-                .iter()
-                .filter_map(|tool| {
-                    let tool_type = tool.get("type").and_then(Value::as_str)?;
-                    let kind = match tool_type {
-                        "function" => ResponsesToolCallKind::Function,
-                        "custom" => ResponsesToolCallKind::Custom,
-                        _ => return None,
-                    };
-                    let name = tool
-                        .get("function")
-                        .and_then(Value::as_object)
-                        .and_then(|f| f.get("name"))
-                        .and_then(Value::as_str)
-                        .or_else(|| tool.get("name").and_then(Value::as_str))?
-                        .trim()
-                        .to_string();
-                    if name.is_empty() {
-                        return None;
+    let mut kinds = HashMap::new();
+
+    if let Some(tools) = request.get("tools").and_then(Value::as_array) {
+        for tool in tools {
+            let Some(tool_type) = tool.get("type").and_then(Value::as_str) else {
+                continue;
+            };
+
+            if tool_type == "namespace" {
+                if let Some(namespace_tools) = tool.get("tools").and_then(Value::as_array) {
+                    for namespace_tool in namespace_tools {
+                        if let Some(name) = function_tool_name(namespace_tool) {
+                            kinds.insert(name, ResponsesToolCallKind::Function);
+                        }
                     }
-                    Some((name, kind))
-                })
-                .collect()
-        })
-        .unwrap_or_default()
+                }
+                continue;
+            }
+
+            let kind = match tool_type {
+                "function" => ResponsesToolCallKind::Function,
+                "custom" => ResponsesToolCallKind::Custom,
+                _ => continue,
+            };
+            if let Some(name) = function_tool_name(tool) {
+                kinds.insert(name, kind);
+            }
+        }
+    }
+
+    kinds
+}
+
+fn function_tool_name(tool: &Value) -> Option<String> {
+    let name = tool
+        .get("function")
+        .and_then(Value::as_object)
+        .and_then(|f| f.get("name"))
+        .and_then(Value::as_str)
+        .or_else(|| tool.get("name").and_then(Value::as_str))?
+        .trim()
+        .to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 pub(crate) fn responses_tool_call_item(
@@ -1974,141 +1988,202 @@ pub(crate) fn normalize_chat_tools(
     drop_tool_types: &HashSet<String>,
     tool_transform_mode: ToolTransformMode,
 ) -> Vec<Value> {
-    tools
-        .into_iter()
-        .filter_map(|tool| {
-            let tool_type = tool.get("type").and_then(Value::as_str);
-            if tool_type.is_some_and(|t| drop_tool_types.contains(t)) {
-                return None;
-            }
+    let mut normalized = Vec::new();
 
-            if tool_type == Some("function") {
-                return normalize_chat_function_tool_shape(tool);
-            }
+    for tool in tools {
+        let tool_type = tool.get("type").and_then(Value::as_str);
+        if tool_type.is_some_and(|t| drop_tool_types.contains(t)) {
+            continue;
+        }
 
-            if tool_type.is_none() && tool.get("name").is_some() {
-                return normalize_chat_function_tool_shape(tool);
+        if tool_type == Some("function") {
+            if let Some(tool) = normalize_chat_function_tool_shape(tool) {
+                normalized.push(tool);
             }
+            continue;
+        }
 
-            if tool_type == Some("custom") {
-                if tool_transform_mode == ToolTransformMode::Passthrough {
-                    return Some(tool);
+        if tool_type.is_none() && tool.get("name").is_some() {
+            if let Some(tool) = normalize_chat_function_tool_shape(tool) {
+                normalized.push(tool);
+            }
+            continue;
+        }
+
+        if tool_type == Some("custom") {
+            if tool_transform_mode == ToolTransformMode::Passthrough {
+                normalized.push(tool);
+                continue;
+            }
+            if let Some(function) = tool.get("function").cloned() {
+                let mut converted = tool;
+                if let Some(obj) = converted.as_object_mut() {
+                    obj.insert("type".to_string(), Value::String("function".to_string()));
+                    obj.insert("function".to_string(), function);
                 }
-                if let Some(function) = tool.get("function").cloned() {
-                    let mut converted = tool;
-                    if let Some(obj) = converted.as_object_mut() {
-                        obj.insert("type".to_string(), Value::String("function".to_string()));
-                        obj.insert("function".to_string(), function);
-                    }
-                    return Some(normalize_wrapped_function_tool_parameters(converted));
-                }
+                normalized.push(normalize_wrapped_function_tool_parameters(converted));
+                continue;
+            }
 
-                let name = tool.get("name")?.as_str()?.to_string();
-                let description = tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                let parameters = normalize_custom_tool_parameters(
-                    tool.get("parameters")
+            let Some(name) = tool.get("name").and_then(Value::as_str).map(str::to_string) else {
+                continue;
+            };
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+            let parameters = normalize_custom_tool_parameters(
+                tool.get("parameters")
+                    .cloned()
+                    .or_else(|| tool.get("input_schema").cloned()),
+            );
+
+            normalized.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }));
+            continue;
+        }
+
+        if tool_type == Some("namespace") {
+            normalized.extend(normalize_namespace_tool_to_chat_functions(&tool));
+            continue;
+        }
+
+        if tool_type == Some("mcp") {
+            if tool_transform_mode == ToolTransformMode::Passthrough {
+                normalized.push(tool);
+                continue;
+            }
+            let server_label = tool
+                .get("server_label")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or("mcp_server");
+            let function_name = format!("mcp__{server_label}");
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("MCP tool proxy");
+            let parameters = tool
+                .get("parameters")
+                .cloned()
+                .or_else(|| tool.get("input_schema").cloned())
+                .unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "arguments": {
+                                "type": "object",
+                                "additionalProperties": true
+                            }
+                        },
+                        "additionalProperties": true
+                    })
+                });
+            let parameters = normalize_tool_parameters(parameters);
+            normalized.push(json!({
+                "type": "function",
+                "function": {
+                    "name": function_name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }));
+            continue;
+        }
+
+        if matches!(tool_type, Some("web_search") | Some("web_search_preview")) {
+            if tool_transform_mode == ToolTransformMode::Passthrough {
+                normalized.push(tool);
+                continue;
+            }
+            let name = tool
+                .get("name")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .unwrap_or(tool_type.unwrap_or("web_search"));
+            let description = tool
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or("Web search tool");
+            let parameters = tool
+                .get("parameters")
+                .cloned()
+                .or_else(|| tool.get("input_schema").cloned())
+                .unwrap_or_else(|| {
+                    json!({
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string"}
+                        },
+                        "required": ["query"],
+                        "additionalProperties": true
+                    })
+                });
+            let parameters = normalize_tool_parameters(parameters);
+            normalized.push(json!({
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": description,
+                    "parameters": parameters,
+                }
+            }));
+            continue;
+        }
+
+        normalized.push(tool);
+    }
+
+    normalized
+}
+
+fn normalize_namespace_tool_to_chat_functions(tool: &Value) -> Vec<Value> {
+    let namespace_description = tool.get("description").and_then(Value::as_str);
+
+    tool.get("tools")
+        .and_then(Value::as_array)
+        .map(|tools| {
+            tools
+                .iter()
+                .filter_map(|namespace_tool| {
+                    let name = function_tool_name(namespace_tool)?;
+                    let function = namespace_tool.get("function").and_then(Value::as_object);
+                    let description = function
+                        .and_then(|obj| obj.get("description"))
+                        .or_else(|| namespace_tool.get("description"))
+                        .and_then(Value::as_str)
+                        .or(namespace_description)
+                        .unwrap_or_default()
+                        .to_string();
+                    let parameters = function
+                        .and_then(|obj| obj.get("parameters"))
+                        .or_else(|| namespace_tool.get("parameters"))
+                        .or_else(|| namespace_tool.get("input_schema"))
                         .cloned()
-                        .or_else(|| tool.get("input_schema").cloned()),
-                );
+                        .unwrap_or_else(default_function_tool_parameters);
+                    let parameters = normalize_tool_parameters(parameters);
 
-                return Some(json!({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": parameters,
-                    }
-                }));
-            }
-
-            if tool_type == Some("mcp") {
-                if tool_transform_mode == ToolTransformMode::Passthrough {
-                    return Some(tool);
-                }
-                let server_label = tool
-                    .get("server_label")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or("mcp_server");
-                let function_name = format!("mcp__{server_label}");
-                let description = tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("MCP tool proxy");
-                let parameters = tool
-                    .get("parameters")
-                    .cloned()
-                    .or_else(|| tool.get("input_schema").cloned())
-                    .unwrap_or_else(|| {
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "arguments": {
-                                    "type": "object",
-                                    "additionalProperties": true
-                                }
-                            },
-                            "additionalProperties": true
-                        })
-                    });
-                let parameters = normalize_tool_parameters(parameters);
-                return Some(json!({
-                    "type": "function",
-                    "function": {
-                        "name": function_name,
-                        "description": description,
-                        "parameters": parameters,
-                    }
-                }));
-            }
-
-            if matches!(tool_type, Some("web_search") | Some("web_search_preview")) {
-                if tool_transform_mode == ToolTransformMode::Passthrough {
-                    return Some(tool);
-                }
-                let name = tool
-                    .get("name")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|v| !v.is_empty())
-                    .unwrap_or(tool_type.unwrap_or("web_search"));
-                let description = tool
-                    .get("description")
-                    .and_then(Value::as_str)
-                    .unwrap_or("Web search tool");
-                let parameters = tool
-                    .get("parameters")
-                    .cloned()
-                    .or_else(|| tool.get("input_schema").cloned())
-                    .unwrap_or_else(|| {
-                        json!({
-                            "type": "object",
-                            "properties": {
-                                "query": {"type": "string"}
-                            },
-                            "required": ["query"],
-                            "additionalProperties": true
-                        })
-                    });
-                let parameters = normalize_tool_parameters(parameters);
-                return Some(json!({
-                    "type": "function",
-                    "function": {
-                        "name": name,
-                        "description": description,
-                        "parameters": parameters,
-                    }
-                }));
-            }
-
-            Some(tool)
+                    Some(json!({
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "description": description,
+                            "parameters": parameters,
+                        }
+                    }))
+                })
+                .collect()
         })
-        .collect()
+        .unwrap_or_default()
 }
 
 pub(crate) fn normalize_tool_choice(
