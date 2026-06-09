@@ -486,6 +486,37 @@ fn map_supports_function_call_to_assistant_tool_call() {
 }
 
 #[test]
+fn map_repairs_invalid_function_call_arguments_to_empty_object() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "function_call",
+                "call_id": "call_1",
+                "name": "exec_command",
+                "arguments": "{"
+            }
+        ],
+        "tools": []
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+    let messages = req
+        .chat_request
+        .get("messages")
+        .and_then(Value::as_array)
+        .expect("messages");
+    assert_eq!(messages[0]["tool_calls"][0]["function"]["arguments"], "{}");
+}
+
+#[test]
 fn map_supports_custom_tool_call_to_assistant_tool_call() {
     let input = json!({
         "model": "gpt-4.1",
@@ -1579,6 +1610,31 @@ fn chat_json_to_responses_json_maps_custom_tool_call_type() {
     assert_eq!(output[0]["type"], "custom_tool_call");
     assert_eq!(output[0]["call_id"], "call_custom_1");
     assert_eq!(output[0]["input"], "echo hello");
+}
+
+#[test]
+fn chat_json_to_responses_json_repairs_invalid_function_tool_arguments() {
+    let chat = json!({
+        "choices": [{
+            "message": {
+                "tool_calls": [{
+                    "id": "call_1",
+                    "function": {
+                        "name": "exec_command",
+                        "arguments": "{"
+                    }
+                }]
+            }
+        }]
+    });
+    let mut kinds = HashMap::new();
+    kinds.insert("exec_command".to_string(), ResponsesToolCallKind::Function);
+    let out = chat_json_to_responses_json(chat, "resp_1".to_string(), &kinds, false);
+    let output = out["output"].as_array().expect("output array");
+    assert_eq!(output[0]["type"], "function_call");
+    assert_eq!(output[0]["call_id"], "call_1");
+    assert_eq!(output[0]["name"], "exec_command");
+    assert_eq!(output[0]["arguments"], "{}");
 }
 
 #[test]
@@ -2929,6 +2985,37 @@ fn map_chat_to_responses_request_preserves_assistant_tool_calls() {
     assert_eq!(item["call_id"], "call_1");
     assert_eq!(item["name"], "get_weather");
     assert_eq!(item["arguments"], "{\"city\":\"seoul\"}");
+}
+
+#[test]
+fn map_chat_to_responses_request_repairs_invalid_assistant_tool_call_arguments() {
+    let chat = json!({
+        "model": "gpt-4.1",
+        "messages": [
+            {
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "exec_command",
+                            "arguments": "{"
+                        }
+                    }
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let out = map_chat_to_responses_request(&chat, false).expect("ok");
+    let items = responses_input_items(&out);
+    let item = responses_input_item(items, "function_call").expect("function_call item");
+    assert_eq!(item["call_id"], "call_1");
+    assert_eq!(item["name"], "exec_command");
+    assert_eq!(item["arguments"], "{}");
 }
 
 #[test]

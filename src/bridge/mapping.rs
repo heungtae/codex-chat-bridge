@@ -1064,10 +1064,14 @@ pub(crate) fn chat_json_to_responses_json(
                         .get("name")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown_function");
-                    let arguments = function
+                    let raw_arguments = function
                         .get("arguments")
                         .map(function_arguments_to_text)
                         .unwrap_or_else(|| "{}".to_string());
+                    let arguments = match tool_call_kinds_by_name.get(name) {
+                        Some(ResponsesToolCallKind::Custom) => raw_arguments,
+                        _ => function_arguments_text_with_json_repair(&raw_arguments, Some(name)),
+                    };
 
                     let mut item = responses_tool_call_item(
                         name,
@@ -1154,11 +1158,17 @@ pub(crate) fn responses_json_to_chat_json(response: Value, fallback_model: &str)
                         .get("name")
                         .and_then(Value::as_str)
                         .unwrap_or("unknown_function");
-                    let arguments = item
+                    let raw_arguments = item
                         .get("arguments")
                         .or_else(|| item.get("input"))
                         .map(function_arguments_to_text)
                         .unwrap_or_else(|| "{}".to_string());
+                    let arguments =
+                        if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+                            raw_arguments
+                        } else {
+                            function_arguments_text_with_json_repair(&raw_arguments, Some(name))
+                        };
                     tool_calls.push(json!({
                         "id": id,
                         "type": "function",
@@ -1516,7 +1526,7 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     .unwrap_or_else(|| format!("call_{}", Uuid::now_v7()));
                 let arguments = item
                     .get("arguments")
-                    .map(function_arguments_to_text)
+                    .map(function_arguments_to_json_repaired_text)
                     .unwrap_or_else(|| "{}".to_string());
 
                 messages.push(json!({
@@ -1971,7 +1981,7 @@ fn chat_tool_call_to_responses_input_item(
         .unwrap_or_else(|| format!("call_m{message_index}_t{tool_index}"));
     let arguments = function
         .get("arguments")
-        .map(function_arguments_to_text)
+        .map(function_arguments_to_json_repaired_text)
         .unwrap_or_else(|| "{}".to_string());
 
     Some(json!({
@@ -2171,6 +2181,35 @@ pub(crate) fn function_arguments_to_text(value: &Value) -> String {
         Value::String(s) => s.clone(),
         other => other.to_string(),
     }
+}
+
+fn function_arguments_to_json_repaired_text(value: &Value) -> String {
+    let text = function_arguments_to_text(value);
+    function_arguments_text_with_json_repair(&text, None)
+}
+
+fn function_arguments_text_with_json_repair(arguments: &str, tool_name: Option<&str>) -> String {
+    let trimmed = arguments.trim();
+    if serde_json::from_str::<Value>(arguments).is_ok() {
+        return arguments.to_string();
+    }
+
+    if !trimmed.starts_with('{') && !trimmed.starts_with('[') {
+        return arguments.to_string();
+    }
+
+    if let Some(tool_name) = tool_name {
+        warn!(
+            "replacing invalid json-like function arguments with empty object: tool={}, arguments={}",
+            tool_name, arguments
+        );
+    } else {
+        warn!(
+            "replacing invalid json-like function arguments with empty object: arguments={}",
+            arguments
+        );
+    }
+    "{}".to_string()
 }
 
 pub(crate) fn normalize_chat_tools(
