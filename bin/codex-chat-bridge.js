@@ -121,17 +121,21 @@ function runUpdateCommand(updateArgs, latest) {
   return true;
 }
 
+function formatNpmCommand(args) {
+  return `npm ${args.join(" ")}`;
+}
+
 function askQuestion(rl, prompt) {
   return new Promise((resolveAnswer) => {
     rl.question(prompt, (answer) => resolveAnswer(answer));
   });
 }
 
-async function promptUpdateChoice(currentVersion, latestVersion) {
+async function promptUpdateChoice(currentVersion, latestVersion, updateArgs) {
   console.error("");
   console.error(`✨ Update available! ${currentVersion} -> ${latestVersion}`);
   console.error("");
-  console.error(`  1. Update now and exit (runs \`npm install -g ${packageName}\`)`);
+  console.error(`  1. Update now and exit (runs \`${formatNpmCommand(updateArgs)}\`)`);
   console.error("  2. Skip this run");
   console.error("  3. Skip this version");
   console.error("");
@@ -171,11 +175,11 @@ async function autoUpdateIfOutdated() {
   console.error(
     `warn: ${packageName} has a newer version (${packageVersion} -> ${latest}).`
   );
-  console.error(`warn: recommended command: npm install -g ${packageName}@latest`);
 
   const updateArgs = isGlobalInstallPath()
     ? ["install", "-g", `${packageName}@latest`]
     : ["install", `${packageName}@latest`];
+  console.error(`warn: recommended command: ${formatNpmCommand(updateArgs)}`);
 
   const pref = loadUpdatePreference();
   if (pref.skipUntilVersion === latest) {
@@ -187,7 +191,7 @@ async function autoUpdateIfOutdated() {
     return;
   }
 
-  const choice = await promptUpdateChoice(packageVersion, latest);
+  const choice = await promptUpdateChoice(packageVersion, latest, updateArgs);
   if (choice === "update") {
     const ok = runUpdateCommand(updateArgs, latest);
     process.exit(ok ? 0 : 1);
