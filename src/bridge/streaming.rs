@@ -599,7 +599,6 @@ where
                                         let (
                                             call_id,
                                             name,
-                                            all_arguments,
                                             delta_arguments,
                                             emit_added,
                                         ) = {
@@ -635,7 +634,6 @@ where
                                                     .name
                                                     .clone()
                                                     .unwrap_or_else(|| "unknown_function".to_string()),
-                                                entry.arguments.clone(),
                                                 delta_arguments,
                                                 emit_added,
                                             )
@@ -644,7 +642,7 @@ where
                                         if emit_added {
                                             let item = responses_tool_call_item(
                                                 &name,
-                                                &all_arguments,
+                                                "",
                                                 &call_id,
                                                 &tool_call_kinds_by_name,
                                             );

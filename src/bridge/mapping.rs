@@ -1436,11 +1436,6 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
         .unwrap_or_default()
         .to_string();
 
-    let input_items = request
-        .get("input")
-        .and_then(Value::as_array)
-        .ok_or_else(|| anyhow!("missing `input` array"))?;
-
     let tools = request
         .get("tools")
         .and_then(Value::as_array)
@@ -1467,6 +1462,24 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
         }));
     }
 
+    let input = request
+        .get("input")
+        .ok_or_else(|| anyhow!("missing `input`"))?;
+
+    let input_items = match input {
+        Value::String(text) => {
+            if !text.trim().is_empty() {
+                messages.push(json!({
+                    "role": "user",
+                    "content": text,
+                }));
+            }
+            &[][..]
+        }
+        Value::Array(input_items) => input_items.as_slice(),
+        _ => return Err(anyhow!("`input` must be a string or array")),
+    };
+
     for item in input_items {
         let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
 
@@ -1477,15 +1490,10 @@ pub(crate) fn map_responses_to_chat_request_with_stream(
                     .and_then(Value::as_str)
                     .map(responses_message_role_to_chat_role)
                     .unwrap_or("user");
-                let content = item
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .map(Vec::as_slice)
-                    .map_or_else(String::new, |items| {
-                        flatten_content_items(items, enable_extended_input_types)
-                    });
-
-                if !content.trim().is_empty() {
+                if let Some(content) = responses_message_content_to_chat_content(
+                    item.get("content"),
+                    enable_extended_input_types,
+                ) {
                     messages.push(json!({
                         "role": role,
                         "content": content,
@@ -1690,6 +1698,188 @@ fn responses_message_role_to_chat_role(role: &str) -> &str {
     match role {
         "developer" => "system",
         role => role,
+    }
+}
+
+fn responses_message_content_to_chat_content(
+    content: Option<&Value>,
+    enable_extended_input_types: bool,
+) -> Option<Value> {
+    match content {
+        Some(Value::String(text)) => {
+            if text.trim().is_empty() {
+                None
+            } else {
+                Some(Value::String(text.to_string()))
+            }
+        }
+        Some(Value::Array(items)) => {
+            responses_content_items_to_chat_content(items, enable_extended_input_types)
+        }
+        _ => None,
+    }
+}
+
+fn responses_content_items_to_chat_content(
+    items: &[Value],
+    enable_extended_input_types: bool,
+) -> Option<Value> {
+    let mut parts = Vec::new();
+    let mut has_non_text_part = false;
+
+    for item in items {
+        let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+
+        if matches!(item_type, "input_text" | "output_text" | "summary_text")
+            && let Some(text) = item.get("text").and_then(Value::as_str)
+        {
+            if !text.is_empty() {
+                parts.push(json!({
+                    "type": "text",
+                    "text": text,
+                }));
+            }
+            continue;
+        }
+
+        if !enable_extended_input_types {
+            continue;
+        }
+
+        if item_type == "input_image" {
+            if let Some(part) = responses_input_image_to_chat_content_part(item) {
+                has_non_text_part = true;
+                parts.push(part);
+            } else if let Some(marker) = responses_content_item_fallback_text(item) {
+                parts.push(json!({
+                    "type": "text",
+                    "text": marker,
+                }));
+            }
+            continue;
+        }
+
+        if item_type == "input_file" {
+            if let Some(part) = responses_input_file_to_chat_content_part(item) {
+                has_non_text_part = true;
+                parts.push(part);
+            } else if let Some(marker) = responses_content_item_fallback_text(item) {
+                parts.push(json!({
+                    "type": "text",
+                    "text": marker,
+                }));
+            }
+        }
+    }
+
+    if parts.is_empty() {
+        return None;
+    }
+
+    if !has_non_text_part {
+        let text = parts
+            .iter()
+            .filter_map(|part| part.get("text").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if text.trim().is_empty() {
+            None
+        } else {
+            Some(Value::String(text))
+        }
+    } else {
+        Some(Value::Array(parts))
+    }
+}
+
+fn responses_input_image_to_chat_content_part(item: &Value) -> Option<Value> {
+    let image_url = item
+        .get("image_url")
+        .and_then(|value| {
+            value.as_str().map(ToString::to_string).or_else(|| {
+                value
+                    .get("url")
+                    .and_then(Value::as_str)
+                    .map(ToString::to_string)
+            })
+        })
+        .map(|url| url.trim().to_string())
+        .filter(|url| !url.is_empty())?;
+
+    Some(json!({
+        "type": "image_url",
+        "image_url": {
+            "url": image_url,
+        }
+    }))
+}
+
+fn responses_input_file_to_chat_content_part(item: &Value) -> Option<Value> {
+    let filename = item
+        .get("filename")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let file_id = item
+        .get("file_id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+    let file_data = item
+        .get("file_data")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string);
+
+    if file_id.is_none() && file_data.is_none() {
+        return None;
+    }
+
+    let mut file = serde_json::Map::new();
+    if let Some(file_id) = file_id {
+        file.insert("file_id".to_string(), Value::String(file_id));
+    }
+    if let Some(file_data) = file_data {
+        file.insert("file_data".to_string(), Value::String(file_data));
+    }
+    if let Some(filename) = filename {
+        file.insert("filename".to_string(), Value::String(filename));
+    }
+
+    Some(json!({
+        "type": "file",
+        "file": Value::Object(file),
+    }))
+}
+
+fn responses_content_item_fallback_text(item: &Value) -> Option<String> {
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+
+    match item_type {
+        "input_image" => Some(
+            item.get("image_url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| format!("[input_image] {}", url.trim()))
+                .unwrap_or_else(|| "[input_image]".to_string()),
+        ),
+        "input_file" => Some(
+            item.get("file_id")
+                .and_then(Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(|value| format!("[input_file] file_id={}", value.trim()))
+                .or_else(|| {
+                    item.get("file_data")
+                        .and_then(Value::as_str)
+                        .filter(|value| !value.trim().is_empty())
+                        .map(|value| format!("[input_file] file_data={}", value.trim()))
+                })
+                .unwrap_or_else(|| "[input_file]".to_string()),
+        ),
+        _ => None,
     }
 }
 

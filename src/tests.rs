@@ -201,6 +201,23 @@ fn sse_parser_collects_data_events() {
     assert_eq!(events[0], "{\"a\":1}");
 }
 
+fn sse_payloads_for_event(payload: &str, event_name: &str) -> Vec<Value> {
+    payload
+        .split("\n\n")
+        .filter(|event| {
+            event
+                .lines()
+                .any(|line| line == format!("event: {event_name}"))
+        })
+        .filter_map(|event| {
+            event
+                .lines()
+                .find_map(|line| line.strip_prefix("data: "))
+                .and_then(|data| serde_json::from_str::<Value>(data).ok())
+        })
+        .collect()
+}
+
 #[test]
 fn chat_delta_treats_empty_tool_calls_as_absent() {
     let delta: ChatDelta =
@@ -652,6 +669,27 @@ fn map_preserves_user_messages_while_dropping_reasoning_items() {
 }
 
 #[test]
+fn map_accepts_string_input_as_user_message() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": "hello from string input"
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        false,
+        false,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+    let messages = req.chat_request["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "user");
+    assert_eq!(messages[0]["content"], "hello from string input");
+}
+
+#[test]
 fn map_responses_developer_message_to_chat_system_message() {
     let input = json!({
         "model": "gpt-4.1",
@@ -686,6 +724,104 @@ fn map_responses_developer_message_to_chat_system_message() {
     assert_eq!(messages[0]["role"], "system");
     assert_eq!(messages[0]["content"], "<permissions instructions>...");
     assert_eq!(messages[1]["role"], "user");
+}
+
+#[test]
+fn map_responses_developer_string_content_to_chat_system_message() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "developer",
+                "content": "stay in bounds"
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        false,
+        false,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+    let messages = req.chat_request["messages"].as_array().expect("messages");
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0]["role"], "system");
+    assert_eq!(messages[0]["content"], "stay in bounds");
+}
+
+#[test]
+fn map_preserves_responses_image_and_file_parts_in_chat_content() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type":"input_text","text":"see attached"},
+                    {"type":"input_image","image_url":"https://example.com/cat.png"},
+                    {"type":"input_file","file_id":"file_123","filename":"notes.pdf"}
+                ]
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        false,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+    let messages = req.chat_request["messages"].as_array().expect("messages");
+    let content = messages[0]["content"].as_array().expect("content array");
+    assert_eq!(content[0]["type"], "text");
+    assert_eq!(content[0]["text"], "see attached");
+    assert_eq!(content[1]["type"], "image_url");
+    assert_eq!(
+        content[1]["image_url"]["url"],
+        "https://example.com/cat.png"
+    );
+    assert_eq!(content[2]["type"], "file");
+    assert_eq!(content[2]["file"]["file_id"], "file_123");
+    assert_eq!(content[2]["file"]["filename"], "notes.pdf");
+}
+
+#[test]
+fn map_falls_back_to_text_markers_when_image_or_file_part_cannot_be_preserved() {
+    let input = json!({
+        "model": "gpt-4.1",
+        "input": [
+            {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {"type":"input_text","text":"see attached"},
+                    {"type":"input_image"},
+                    {"type":"input_file"}
+                ]
+            }
+        ]
+    });
+
+    let req = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        false,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect("should map");
+    let messages = req.chat_request["messages"].as_array().expect("messages");
+    assert_eq!(
+        messages[0]["content"],
+        "see attached\n[input_image]\n[input_file]"
+    );
 }
 
 #[test]
@@ -780,7 +916,7 @@ fn map_defaults_tool_choice_when_invalid() {
 }
 
 #[test]
-fn map_requires_input_array() {
+fn map_requires_input() {
     let input = json!({"model":"gpt-4.1"});
     let err = map_responses_to_chat_request_with_stream(
         &input,
@@ -790,7 +926,21 @@ fn map_requires_input_array() {
         ToolTransformMode::LegacyConvert,
     )
     .expect_err("must fail");
-    assert!(err.to_string().contains("missing `input` array"));
+    assert!(err.to_string().contains("missing `input`"));
+}
+
+#[test]
+fn map_rejects_non_string_or_array_input() {
+    let input = json!({"model":"gpt-4.1","input":123});
+    let err = map_responses_to_chat_request_with_stream(
+        &input,
+        &HashSet::new(),
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+    )
+    .expect_err("must fail");
+    assert!(err.to_string().contains("string or array"));
 }
 
 #[test]
@@ -3714,6 +3864,42 @@ async fn stream_emits_added_and_done_for_tool_calls() {
     assert!(payload.contains("event: response.function_call_arguments.delta"));
     assert!(payload.contains("event: response.function_call_arguments.done"));
     assert!(payload.contains("\"arguments\":\"echo hi\""));
+}
+
+#[tokio::test]
+async fn stream_tool_call_added_event_does_not_include_partial_arguments() {
+    let upstream = stream::iter(vec![Ok::<Bytes, reqwest::Error>(Bytes::from(
+        "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_1\",\"function\":{\"name\":\"exec_command\",\"arguments\":\"{\"}}]}}]}\n\n\
+             data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"\\\"cmd\\\":\\\"pwd\\\"}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n\
+             data: [DONE]\n\n",
+    ))]);
+    let mut output = Box::pin(translate_chat_stream(
+        upstream,
+        "resp_1".to_string(),
+        "test_router".to_string(),
+        false,
+        HashMap::new(),
+        FeatureFlags::default(),
+    ));
+    let mut payload = String::new();
+
+    while let Some(event) = output.next().await {
+        payload.push_str(&String::from_utf8_lossy(&event.expect("stream event")));
+    }
+
+    let added = sse_payloads_for_event(&payload, "response.output_item.added");
+    assert_eq!(added.len(), 1);
+    assert_eq!(added[0]["item"]["type"], "function_call");
+    assert_eq!(added[0]["item"]["name"], "exec_command");
+    assert_eq!(added[0]["item"]["arguments"], "");
+
+    let done = sse_payloads_for_event(&payload, "response.output_item.done");
+    assert_eq!(done.len(), 1);
+    assert_eq!(done[0]["item"]["arguments"], "{\"cmd\":\"pwd\"}");
+
+    let argument_done = sse_payloads_for_event(&payload, "response.function_call_arguments.done");
+    assert_eq!(argument_done.len(), 1);
+    assert_eq!(argument_done[0]["arguments"], "{\"cmd\":\"pwd\"}");
 }
 
 #[tokio::test]
