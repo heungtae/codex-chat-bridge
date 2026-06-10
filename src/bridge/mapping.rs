@@ -1,7 +1,7 @@
 use anyhow::{Result, anyhow};
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet, VecDeque};
-use tracing::warn;
+use tracing::{debug, warn};
 use uuid::Uuid;
 
 use crate::bridge::apply_patch::normalize_apply_patch_input_with_repairs;
@@ -2199,12 +2199,12 @@ fn function_arguments_text_with_json_repair(arguments: &str, tool_name: Option<&
     }
 
     if let Some(tool_name) = tool_name {
-        warn!(
+        debug!(
             "replacing invalid json-like function arguments with empty object: tool={}, arguments={}",
             tool_name, arguments
         );
     } else {
-        warn!(
+        debug!(
             "replacing invalid json-like function arguments with empty object: arguments={}",
             arguments
         );
