@@ -95,6 +95,48 @@ where
     }
 }
 
+pub(crate) fn passthrough_messages_stream<S>(
+    upstream_stream: S,
+    router_name: String,
+    verbose_logging: bool,
+) -> impl Stream<Item = Result<Bytes, std::convert::Infallible>> + Send + 'static
+where
+    S: Stream<Item = Result<Bytes, reqwest::Error>> + Send + 'static,
+{
+    stream! {
+        let mut upstream_stream = Box::pin(upstream_stream);
+        while let Some(chunk_result) = upstream_stream.next().await {
+            match chunk_result {
+                Ok(chunk) => {
+                    if verbose_logging {
+                        debug_large_log(
+                            &format!(
+                                "upstream response payload stream chunk (router={}, messages passthrough)",
+                                router_name
+                            ),
+                            String::from_utf8_lossy(&chunk).as_ref(),
+                        );
+                    }
+                    yield Ok(chunk)
+                },
+                Err(err) => {
+                    yield Ok(anthropic_sse_event(
+                        "error",
+                        &json!({
+                            "type": "error",
+                            "error": {
+                                "type": "upstream_stream_error",
+                                "message": err.to_string(),
+                            }
+                        }),
+                    ));
+                    return;
+                }
+            }
+        }
+    }
+}
+
 pub(crate) fn translate_responses_stream_to_chat<S>(
     upstream_stream: S,
     router_name: String,

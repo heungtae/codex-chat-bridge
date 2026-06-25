@@ -4,7 +4,7 @@ use crate::bridge_types::ChatDelta;
 use axum::Json;
 use axum::body::{Body, Bytes, to_bytes};
 use axum::extract::State as AxumState;
-use axum::http::Request;
+use axum::http::{HeaderMap, Request};
 use axum::routing::post;
 use futures::StreamExt;
 use futures::stream;
@@ -1166,6 +1166,64 @@ fn map_anthropic_messages_to_chat_request_supports_tools_and_thinking() {
 }
 
 #[test]
+fn build_upstream_payload_bypasses_anthropic_messages_without_mutation() {
+    let input = json!({
+        "model": "claude-sonnet",
+        "system": [{"type":"text","text":"system prompt"}],
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {"type":"thinking","thinking":"internal"},
+                {"type":"text","text":"hello"}
+            ],
+            "thinking": "legacy-field",
+            "reasoning_content": "provider-field"
+        }],
+        "tools": [{
+            "name": "shell",
+            "description": "run shell",
+            "input_schema": {"type":"object"}
+        }]
+    });
+
+    let out = build_upstream_payload(
+        &input,
+        IncomingApi::Anthropic,
+        WireApi::Messages,
+        true,
+        true,
+        ToolTransformMode::LegacyConvert,
+        false,
+    )
+    .expect("ok");
+
+    assert_eq!(out, input);
+    assert!(out.get("stream").is_none());
+    assert_eq!(out["messages"][0]["content"][0]["thinking"], "internal");
+    assert_eq!(out["messages"][0]["thinking"], "legacy-field");
+    assert_eq!(out["messages"][0]["reasoning_content"], "provider-field");
+}
+
+#[test]
+fn build_upstream_payload_rejects_non_anthropic_messages_wire() {
+    let err = build_upstream_payload(
+        &json!({"model":"gpt-4.1","messages":[]}),
+        IncomingApi::Chat,
+        WireApi::Messages,
+        false,
+        true,
+        ToolTransformMode::LegacyConvert,
+        false,
+    )
+    .expect_err("must fail");
+
+    assert!(
+        err.to_string()
+            .contains("chat->messages bridge is not supported")
+    );
+}
+
+#[test]
 fn map_anthropic_messages_to_chat_request_normalizes_empty_additional_properties() {
     let input = json!({
         "model": "claude-sonnet",
@@ -2035,6 +2093,31 @@ fn resolve_config_defaults_upstream_url_by_wire() {
 }
 
 #[test]
+fn resolve_config_defaults_upstream_url_by_messages_wire() {
+    let args = Args {
+        config: None,
+        upstream_url: None,
+        upstream_wire: Some(WireApi::Messages),
+        upstream_http_headers: vec![],
+        forward_incoming_headers: vec![],
+        api_key_env: None,
+        server_info: None,
+        http_shutdown: false,
+        verbose_logging: false,
+        drop_tool_types: vec![],
+        router: None,
+        list_routers: false,
+    };
+
+    let resolved = resolve_config(args, None).expect("ok");
+    assert_eq!(resolved.upstream_wire, WireApi::Messages);
+    assert_eq!(
+        resolved.upstream_url,
+        "https://api.anthropic.com/v1/messages"
+    );
+}
+
+#[test]
 fn resolve_config_infers_upstream_wire_from_upstream_url() {
     let args = Args {
         config: None,
@@ -2057,6 +2140,31 @@ fn resolve_config_infers_upstream_wire_from_upstream_url() {
 
     let resolved = resolve_config(args, Some(file)).expect("ok");
     assert_eq!(resolved.upstream_wire, WireApi::Responses);
+}
+
+#[test]
+fn resolve_config_infers_messages_upstream_wire_from_upstream_url() {
+    let args = Args {
+        config: None,
+        upstream_url: None,
+        upstream_wire: None,
+        upstream_http_headers: vec![],
+        forward_incoming_headers: vec![],
+        api_key_env: None,
+        server_info: None,
+        http_shutdown: false,
+        verbose_logging: false,
+        drop_tool_types: vec![],
+        router: None,
+        list_routers: false,
+    };
+    let file = FileConfig {
+        upstream_url: Some("https://api.anthropic.com/v1/messages".to_string()),
+        ..Default::default()
+    };
+
+    let resolved = resolve_config(args, Some(file)).expect("ok");
+    assert_eq!(resolved.upstream_wire, WireApi::Messages);
 }
 
 #[test]
@@ -3579,6 +3687,7 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
         &route_target,
         &incoming_headers,
         &json!({"model":"gpt-4.1","messages":[]}),
+        None,
     )
     .build()
     .expect("request");
@@ -3593,6 +3702,113 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
             .get("x-client-request-id")
             .and_then(|value| value.to_str().ok()),
         Some("client-trace-123")
+    );
+}
+
+#[test]
+fn upstream_url_for_messages_count_tokens_appends_subpath() {
+    let route_target = RouteTarget {
+        router_name: "messages".to_string(),
+        upstream_url: "https://api.anthropic.com/v1/messages".to_string(),
+        upstream_wire: WireApi::Messages,
+        upstream_model: Some("ignored-model".to_string()),
+        upstream_model_opus: None,
+        upstream_model_sonnet: None,
+        upstream_model_haiku: None,
+        upstream_http_headers: Vec::new(),
+        forward_incoming_headers: Vec::new(),
+        drop_tool_types: HashSet::new(),
+        drop_request_fields: HashSet::new(),
+        feature_flags: FeatureFlags::default(),
+        anthropic_preserve_thinking: false,
+        anthropic_enable_openrouter_reasoning: false,
+    };
+
+    assert_eq!(
+        upstream_url_for_request(&route_target, Some("/v1/messages/count_tokens")),
+        "https://api.anthropic.com/v1/messages/count_tokens"
+    );
+    assert_eq!(
+        upstream_url_for_request(&route_target, Some("/v1/messages")),
+        "https://api.anthropic.com/v1/messages"
+    );
+}
+
+#[test]
+fn build_upstream_request_uses_messages_count_tokens_url_and_existing_headers() {
+    let router_manager = RouterManager::new(
+        BTreeMap::new(),
+        "http://localhost:8080/v1/chat/completions".to_string(),
+        WireApi::Chat,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        FeatureFlags::default(),
+    )
+    .expect("router manager");
+    let state = Arc::new(AppState {
+        client: Client::new(),
+        api_key: "test-key".to_string(),
+        http_shutdown: false,
+        verbose_logging: false,
+        routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
+        sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
+    });
+    let route_target = RouteTarget {
+        router_name: "messages".to_string(),
+        upstream_url: "https://api.anthropic.com/v1/messages".to_string(),
+        upstream_wire: WireApi::Messages,
+        upstream_model: None,
+        upstream_model_opus: None,
+        upstream_model_sonnet: None,
+        upstream_model_haiku: None,
+        upstream_http_headers: vec![UpstreamHeader {
+            name: "x-request-id".to_string(),
+            value: "from-upstream-http-headers".to_string(),
+        }],
+        forward_incoming_headers: vec!["x-request-id".to_string(), "anthropic-version".to_string()],
+        drop_tool_types: HashSet::new(),
+        drop_request_fields: HashSet::new(),
+        feature_flags: FeatureFlags::default(),
+        anthropic_preserve_thinking: false,
+        anthropic_enable_openrouter_reasoning: false,
+    };
+    let mut incoming_headers = HeaderMap::new();
+    incoming_headers.insert(
+        "x-request-id",
+        HeaderValue::from_static("from-forward-incoming-headers"),
+    );
+    incoming_headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+
+    let request = build_upstream_request(
+        &state,
+        &route_target,
+        &incoming_headers,
+        &json!({"model":"claude","messages":[]}),
+        Some("/v1/messages/count_tokens"),
+    )
+    .build()
+    .expect("request");
+
+    assert_eq!(
+        request.url().as_str(),
+        "https://api.anthropic.com/v1/messages/count_tokens"
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("from-upstream-http-headers")
+    );
+    assert_eq!(
+        request
+            .headers()
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
     );
 }
 
@@ -3674,6 +3890,53 @@ async fn spawn_mock_json_upstream(
     (format!("http://{addr}{path}"), handle, captured_request)
 }
 
+#[derive(Clone, Debug)]
+struct CapturedJsonRequest {
+    headers: HeaderMap,
+    body: Value,
+}
+
+#[derive(Clone)]
+struct MockJsonUpstreamWithHeadersState {
+    response: Value,
+    captured_request: Arc<tokio::sync::Mutex<Option<CapturedJsonRequest>>>,
+}
+
+async fn mock_json_upstream_with_headers_handler(
+    AxumState(state): AxumState<MockJsonUpstreamWithHeadersState>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Json<Value> {
+    *state.captured_request.lock().await = Some(CapturedJsonRequest { headers, body });
+    Json(state.response)
+}
+
+async fn spawn_mock_json_upstream_with_headers(
+    path: &str,
+    response: Value,
+) -> (
+    String,
+    tokio::task::JoinHandle<()>,
+    Arc<tokio::sync::Mutex<Option<CapturedJsonRequest>>>,
+) {
+    let captured_request = Arc::new(tokio::sync::Mutex::new(None));
+    let state = MockJsonUpstreamWithHeadersState {
+        response,
+        captured_request: captured_request.clone(),
+    };
+    let app = axum::Router::new()
+        .route(path, post(mock_json_upstream_with_headers_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let addr = listener.local_addr().expect("mock upstream address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}{path}"), handle, captured_request)
+}
+
 #[tokio::test]
 async fn direct_anthropic_endpoint_routes_using_request_path() {
     let app = build_app(test_state_with_router(
@@ -3705,6 +3968,185 @@ async fn direct_anthropic_endpoint_routes_using_request_path() {
 
     assert_eq!(json["type"], "error");
     assert_eq!(json["error"]["type"], "upstream_transport_error");
+}
+
+#[tokio::test]
+#[ignore = "requires binding a local TCP listener"]
+async fn messages_wire_bypasses_payload_and_preserves_header_behavior() {
+    let upstream_response = json!({
+        "id": "msg_1",
+        "type": "message",
+        "role": "assistant",
+        "model": "claude-native",
+        "content": [{"type":"text","text":"hello"}],
+        "usage": {"input_tokens": 1, "output_tokens": 2}
+    });
+    let (upstream_url, upstream_handle, captured_request) =
+        spawn_mock_json_upstream_with_headers("/v1/messages", upstream_response.clone()).await;
+    let mut routers = BTreeMap::new();
+    routers.insert(
+        "native_messages".to_string(),
+        RouterConfig {
+            incoming_url: Some("http://127.0.0.1:8787/v1/messages".to_string()),
+            upstream_url: Some(upstream_url),
+            upstream_wire: Some(WireApi::Messages),
+            upstream_model: Some("must-not-override".to_string()),
+            upstream_http_headers: Some(BTreeMap::from([
+                ("x-request-id".to_string(), "static-request-id".to_string()),
+                ("x-static".to_string(), "static-value".to_string()),
+            ])),
+            forward_incoming_headers: Some(vec![
+                "x-request-id".to_string(),
+                "x-client-request-id".to_string(),
+                "anthropic-version".to_string(),
+            ]),
+            ..Default::default()
+        },
+    );
+    let router_manager = RouterManager::new(
+        routers,
+        "https://api.openai.com/v1/chat/completions".to_string(),
+        WireApi::Chat,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        FeatureFlags::default(),
+    )
+    .expect("router manager");
+    let app = build_app(Arc::new(AppState {
+        client: Client::new(),
+        api_key: "test-key".to_string(),
+        http_shutdown: false,
+        verbose_logging: false,
+        routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
+        sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
+    }));
+    let request_body = json!({
+        "model": "claude-original",
+        "messages": [{
+            "role": "assistant",
+            "content": [
+                {"type":"thinking","thinking":"internal"},
+                {"type":"text","text":"hi"}
+            ],
+            "reasoning_content": "provider-field"
+        }],
+        "tools": [{"name":"shell","input_schema":{"type":"object"}}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .header("x-request-id", "incoming-request-id")
+                .header("x-client-request-id", "client-trace-123")
+                .header("anthropic-version", "2023-06-01")
+                .body(Body::from(request_body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    upstream_handle.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    let captured = captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("captured request");
+
+    assert_eq!(captured.body, request_body);
+    assert_eq!(json, upstream_response);
+    assert_eq!(
+        captured
+            .headers
+            .get("x-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("static-request-id")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("x-client-request-id")
+            .and_then(|value| value.to_str().ok()),
+        Some("client-trace-123")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("anthropic-version")
+            .and_then(|value| value.to_str().ok()),
+        Some("2023-06-01")
+    );
+    assert_eq!(
+        captured
+            .headers
+            .get("x-static")
+            .and_then(|value| value.to_str().ok()),
+        Some("static-value")
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires binding a local TCP listener"]
+async fn messages_wire_bypasses_count_tokens_to_upstream() {
+    let upstream_response = json!({"input_tokens": 42});
+    let (upstream_base_url, upstream_handle, captured_request) =
+        spawn_mock_json_upstream_with_headers(
+            "/v1/messages/count_tokens",
+            upstream_response.clone(),
+        )
+        .await;
+    let upstream_url = upstream_base_url
+        .strip_suffix("/count_tokens")
+        .expect("count_tokens suffix")
+        .to_string();
+    let app = build_app(test_state_with_router(
+        "http://127.0.0.1:8787/v1/messages",
+        &upstream_url,
+        WireApi::Messages,
+    ));
+    let request_body = json!({
+        "model": "claude-sonnet",
+        "messages": [{"role":"user","content":"hello there"}]
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/messages/count_tokens")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(request_body.to_string()))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    upstream_handle.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("body");
+    let json: Value = serde_json::from_slice(&body).expect("json");
+    let captured = captured_request
+        .lock()
+        .await
+        .clone()
+        .expect("captured request");
+
+    assert_eq!(json, upstream_response);
+    assert_eq!(captured.body, request_body);
 }
 
 #[tokio::test]

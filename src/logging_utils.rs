@@ -87,6 +87,7 @@ pub(crate) fn upstream_messages_for_logging(
 ) -> Option<Value> {
     match upstream_wire {
         WireApi::Chat => payload.get("messages").cloned(),
+        WireApi::Messages => payload.get("messages").cloned(),
         WireApi::Responses => payload.get("input").and_then(Value::as_array).map(|items| {
             let messages = items
                 .iter()

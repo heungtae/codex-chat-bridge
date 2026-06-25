@@ -7,6 +7,7 @@ use serde::Serialize;
 pub(crate) enum WireApi {
     Chat,
     Responses,
+    Messages,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]

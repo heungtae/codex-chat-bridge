@@ -144,8 +144,18 @@ pub(crate) fn build_upstream_payload(
             )?
             .chat_request
         }
+        (IncomingApi::Responses, WireApi::Messages) => {
+            return Err(anyhow!(
+                "responses->messages bridge is not supported; use `upstream_wire = \"chat\"` or `\"responses\"`"
+            ));
+        }
         (IncomingApi::Chat, WireApi::Chat) => request.clone(),
         (IncomingApi::Chat, WireApi::Responses) => map_chat_to_responses_request(request, stream)?,
+        (IncomingApi::Chat, WireApi::Messages) => {
+            return Err(anyhow!(
+                "chat->messages bridge is not supported; use `upstream_wire = \"chat\"` or `\"responses\"`"
+            ));
+        }
         (IncomingApi::Anthropic, WireApi::Chat) => {
             map_anthropic_messages_to_chat_request(request, anthropic_preserve_thinking)?
         }
@@ -154,11 +164,14 @@ pub(crate) fn build_upstream_payload(
                 map_anthropic_messages_to_chat_request(request, anthropic_preserve_thinking);
             map_chat_to_responses_request(&chat_request?, stream)?
         }
+        (IncomingApi::Anthropic, WireApi::Messages) => request.clone(),
     };
-    if incoming_api == IncomingApi::Anthropic {
+    if incoming_api == IncomingApi::Anthropic && upstream_wire != WireApi::Messages {
         strip_anthropic_reasoning_fields(&mut payload);
     }
-    set_stream_flag(&mut payload, stream);
+    if upstream_wire != WireApi::Messages {
+        set_stream_flag(&mut payload, stream);
+    }
     Ok(payload)
 }
 

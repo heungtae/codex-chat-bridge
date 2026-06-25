@@ -142,7 +142,7 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # Priority: CLI flags > config file > built-in defaults
 
 # upstream_url = "https://api.openai.com/v1/chat/completions"
-# upstream_wire = "chat" # chat | responses
+# upstream_wire = "chat" # chat | responses | messages
 # upstream_http_headers = { "openai-organization" = "org_123", "x-custom-header" = "value" }
 # forward_incoming_headers = ["x-codex-turn-state"]
 # api_key_env = "OPENAI_API_KEY"
@@ -373,6 +373,7 @@ fn default_upstream_url(upstream_wire: WireApi) -> String {
     match upstream_wire {
         WireApi::Chat => "https://api.openai.com/v1/chat/completions".to_string(),
         WireApi::Responses => "https://api.openai.com/v1/responses".to_string(),
+        WireApi::Messages => "https://api.anthropic.com/v1/messages".to_string(),
     }
 }
 
@@ -392,6 +393,8 @@ fn infer_upstream_wire_from_url(raw: &str) -> Option<WireApi> {
         Some(WireApi::Chat)
     } else if normalized.ends_with("/v1/responses") {
         Some(WireApi::Responses)
+    } else if normalized.ends_with("/v1/messages") {
+        Some(WireApi::Messages)
     } else {
         None
     }

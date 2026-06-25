@@ -3,7 +3,7 @@
 
 # Global defaults
 upstream_url = "https://api.openai.com/v1/chat/completions"
-upstream_wire = "chat" # chat | responses
+upstream_wire = "chat" # chat | responses | messages
 upstream_http_headers = {
   "openai-organization" = "org_123",
   "x-custom-header" = "value"
@@ -81,3 +81,9 @@ tool_transform_mode = "legacy_convert"
 incoming_url = "http://127.0.0.1:8787/chat/v1/chat/completions"
 upstream_url = "https://api.openai.com/v1/responses"
 upstream_wire = "responses"
+
+[routers.native_messages]
+incoming_url = "http://127.0.0.1:8787/claude/v1/messages"
+upstream_url = "https://api.anthropic.com/v1/messages"
+upstream_wire = "messages"
+forward_incoming_headers = ["x-request-id", "anthropic-version", "anthropic-beta"]

@@ -6,7 +6,7 @@ Tiny local bridge for running Codex and Claude Code against OpenAI-compatible up
 
 - Codex: OpenAI's local coding agent. It is configured through Codex profile config files and can call a custom `model_provider`.
 - Claude Code: Anthropic's coding agent. It sends Anthropic `/v1/messages` traffic.
-- codex-chat-bridge: A local adapter that accepts Responses, Chat Completions, and Anthropic Messages requests, then forwards them to a configured upstream as `/v1/responses` or `/v1/chat/completions`.
+- codex-chat-bridge: A local adapter that accepts Responses, Chat Completions, and Anthropic Messages requests, then forwards them to a configured upstream as `/v1/responses`, `/v1/chat/completions`, or `/v1/messages`.
 
 ## Install
 
@@ -50,6 +50,7 @@ Full setup:
 - `responses -> chat`: maps Codex Responses traffic to Chat Completions upstreams.
 - `chat -> responses`: maps Chat Completions clients to Responses upstreams.
 - `anthropic -> chat`: maps Claude Code `/v1/messages` traffic to Chat Completions upstreams.
+- `messages -> messages`: bypasses Anthropic Messages traffic to native `/v1/messages` upstreams without payload conversion while keeping configured upstream headers and forwarded incoming headers.
 - `namespace`, `custom`, `mcp`, and `web_search*` tools can be converted into chat `function` tools when `tool_transform_mode = "legacy_convert"`.
 
 ## Minimal Router

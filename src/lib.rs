@@ -662,7 +662,11 @@ fn parse_and_prepare_request(
 
     let incoming_api =
         infer_incoming_api_from_hint_or_path(incoming_api_hint, incoming_path, &request_value);
-    let wants_stream = stream_flag_for_request(incoming_api, &request_value);
+    let wants_stream = if is_anthropic_count_tokens_path(incoming_path) {
+        false
+    } else {
+        stream_flag_for_request(incoming_api, &request_value)
+    };
     apply_request_filters(
         incoming_api,
         &mut request_value,
@@ -731,11 +735,14 @@ async fn build_upstream_payload_with_session(
             ));
         }
     };
-    apply_upstream_model_override(&mut upstream_payload, route_target);
-    if incoming_api == IncomingApi::Anthropic {
+    if route_target.upstream_wire != WireApi::Messages {
+        apply_upstream_model_override(&mut upstream_payload, route_target);
+    }
+    if incoming_api == IncomingApi::Anthropic && route_target.upstream_wire != WireApi::Messages {
         strip_anthropic_reasoning_fields(&mut upstream_payload);
     }
-    if route_target.anthropic_enable_openrouter_reasoning
+    if route_target.upstream_wire != WireApi::Messages
+        && route_target.anthropic_enable_openrouter_reasoning
         && anthropic_request_enables_thinking(request_value)
     {
         inject_openrouter_reasoning(&mut upstream_payload);
@@ -861,6 +868,7 @@ fn build_upstream_request(
     route_target: &RouteTarget,
     headers: &HeaderMap,
     upstream_payload: &Value,
+    incoming_path: Option<&str>,
 ) -> reqwest::RequestBuilder {
     let mut merged_headers = HeaderMap::new();
     for header_name in &route_target.forward_incoming_headers {
@@ -879,9 +887,10 @@ fn build_upstream_request(
         }
     }
 
+    let upstream_url = upstream_url_for_request(route_target, incoming_path);
     let mut upstream_request = state
         .client
-        .post(&route_target.upstream_url)
+        .post(upstream_url)
         .bearer_auth(&state.api_key)
         .header(CONTENT_TYPE, "application/json")
         .json(upstream_payload);
@@ -890,6 +899,17 @@ fn build_upstream_request(
         upstream_request = upstream_request.headers(merged_headers);
     }
     upstream_request
+}
+
+fn upstream_url_for_request(route_target: &RouteTarget, incoming_path: Option<&str>) -> String {
+    let trimmed_upstream_url = route_target.upstream_url.trim_end_matches('/');
+    if route_target.upstream_wire == WireApi::Messages
+        && is_anthropic_count_tokens_path(incoming_path)
+        && trimmed_upstream_url.ends_with("/v1/messages")
+    {
+        return format!("{trimmed_upstream_url}/count_tokens");
+    }
+    route_target.upstream_url.clone()
 }
 
 async fn finalize_upstream_response(
@@ -973,7 +993,7 @@ async fn finalize_upstream_response(
                 incoming_api,
                 true,
                 "unsupported_feature",
-                "anthropic `/v1/messages` streaming currently requires `upstream_wire = \"chat\"`",
+                "anthropic `/v1/messages` streaming currently requires `upstream_wire = \"chat\"` or `\"messages\"`",
             );
         }
         let body = match route_target.upstream_wire {
@@ -1017,6 +1037,22 @@ async fn finalize_upstream_response(
                         route_target.router_name.clone(),
                         verbose_logging,
                     ))
+                }
+            }
+            WireApi::Messages => {
+                if incoming_api == IncomingApi::Anthropic {
+                    Body::from_stream(passthrough_messages_stream(
+                        upstream_response.bytes_stream(),
+                        route_target.router_name.clone(),
+                        verbose_logging,
+                    ))
+                } else {
+                    return error_response_for_api(
+                        incoming_api,
+                        true,
+                        "unsupported_feature",
+                        "`upstream_wire = \"messages\"` only supports Anthropic `/v1/messages` clients",
+                    );
                 }
             }
         };
@@ -1079,6 +1115,18 @@ async fn finalize_upstream_response(
                 responses_json_to_chat_json(upstream_json, &upstream_model)
             } else {
                 upstream_json
+            }
+        }
+        WireApi::Messages => {
+            if incoming_api == IncomingApi::Anthropic {
+                upstream_json
+            } else {
+                return error_response_for_api(
+                    incoming_api,
+                    false,
+                    "unsupported_feature",
+                    "`upstream_wire = \"messages\"` only supports Anthropic `/v1/messages` clients",
+                );
             }
         }
     };
@@ -1160,6 +1208,7 @@ pub(crate) async fn handle_incoming(
 
     if incoming_api == IncomingApi::Anthropic
         && is_anthropic_count_tokens_path(incoming_path.as_deref())
+        && route_target.upstream_wire != WireApi::Messages
     {
         let input_tokens = estimate_anthropic_count_tokens(&request_value);
         if verbose_logging {
@@ -1242,8 +1291,13 @@ pub(crate) async fn handle_incoming(
         );
     }
 
-    let upstream_request =
-        build_upstream_request(&state, &route_target, &headers, &upstream_payload);
+    let upstream_request = build_upstream_request(
+        &state,
+        &route_target,
+        &headers,
+        &upstream_payload,
+        incoming_path.as_deref(),
+    );
     let upstream_model = upstream_payload_model(&upstream_payload);
     let anthropic_input_tokens = if incoming_api == IncomingApi::Anthropic {
         estimate_anthropic_count_tokens(&request_value)
