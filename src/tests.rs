@@ -3972,7 +3972,7 @@ async fn direct_anthropic_endpoint_routes_using_request_path() {
 
 #[tokio::test]
 #[ignore = "requires binding a local TCP listener"]
-async fn messages_wire_bypasses_payload_and_preserves_header_behavior() {
+async fn messages_wire_overrides_model_and_preserves_header_behavior() {
     let upstream_response = json!({
         "id": "msg_1",
         "type": "message",
@@ -3990,7 +3990,7 @@ async fn messages_wire_bypasses_payload_and_preserves_header_behavior() {
             incoming_url: Some("http://127.0.0.1:8787/v1/messages".to_string()),
             upstream_url: Some(upstream_url),
             upstream_wire: Some(WireApi::Messages),
-            upstream_model: Some("must-not-override".to_string()),
+            upstream_model: Some("upstream-claude-model".to_string()),
             upstream_http_headers: Some(BTreeMap::from([
                 ("x-request-id".to_string(), "static-request-id".to_string()),
                 ("x-static".to_string(), "static-value".to_string()),
@@ -4064,7 +4064,9 @@ async fn messages_wire_bypasses_payload_and_preserves_header_behavior() {
         .clone()
         .expect("captured request");
 
-    assert_eq!(captured.body, request_body);
+    let mut expected_body = request_body.clone();
+    expected_body["model"] = json!("upstream-claude-model");
+    assert_eq!(captured.body, expected_body);
     assert_eq!(json, upstream_response);
     assert_eq!(
         captured

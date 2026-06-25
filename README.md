@@ -50,7 +50,7 @@ Full setup:
 - `responses -> chat`: maps Codex Responses traffic to Chat Completions upstreams.
 - `chat -> responses`: maps Chat Completions clients to Responses upstreams.
 - `anthropic -> chat`: maps Claude Code `/v1/messages` traffic to Chat Completions upstreams.
-- `messages -> messages`: bypasses Anthropic Messages traffic to native `/v1/messages` upstreams without payload conversion while keeping configured upstream headers and forwarded incoming headers.
+- `messages -> messages`: bypasses Anthropic Messages traffic to native `/v1/messages` upstreams without payload conversion while keeping configured upstream headers, forwarded incoming headers, and configured upstream model overrides.
 - `namespace`, `custom`, `mcp`, and `web_search*` tools can be converted into chat `function` tools when `tool_transform_mode = "legacy_convert"`.
 
 ## Minimal Router

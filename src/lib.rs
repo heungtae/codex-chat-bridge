@@ -735,9 +735,7 @@ async fn build_upstream_payload_with_session(
             ));
         }
     };
-    if route_target.upstream_wire != WireApi::Messages {
-        apply_upstream_model_override(&mut upstream_payload, route_target);
-    }
+    apply_upstream_model_override(&mut upstream_payload, route_target);
     if incoming_api == IncomingApi::Anthropic && route_target.upstream_wire != WireApi::Messages {
         strip_anthropic_reasoning_fields(&mut upstream_payload);
     }
