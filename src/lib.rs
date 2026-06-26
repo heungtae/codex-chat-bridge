@@ -53,7 +53,6 @@ use response_utils::*;
 use routing::*;
 use session::*;
 use state::AppState;
-use state::UpstreamSuccessLogSnapshot;
 
 #[derive(Serialize)]
 struct ServerInfo {
@@ -297,7 +296,6 @@ pub async fn run() -> Result<()> {
         verbose_logging: config.verbose_logging,
         routers: Arc::new(RwLock::new(router_manager)),
         sessions: Arc::new(RwLock::new(SessionStore::default())),
-        last_successful_upstream_log: Arc::new(RwLock::new(None)),
     });
 
     let app = build_app(state.clone());
@@ -911,7 +909,6 @@ fn upstream_url_for_request(route_target: &RouteTarget, incoming_path: Option<&s
 }
 
 async fn finalize_upstream_response(
-    state: &Arc<AppState>,
     upstream_response: reqwest::Response,
     route_target: &RouteTarget,
     incoming_api: IncomingApi,
@@ -923,22 +920,6 @@ async fn finalize_upstream_response(
     verbose_logging: bool,
 ) -> Response {
     if !upstream_response.status().is_success() {
-        if let Some(snapshot) = state.last_successful_upstream_log.read().await.clone() {
-            warn!(
-                "last successful upstream response status: router={}, incoming_api={:?}, upstream_wire={:?}, status={}",
-                snapshot.router_name,
-                snapshot.incoming_api,
-                snapshot.upstream_wire,
-                snapshot.status
-            );
-            warn!(
-                "last successful upstream response headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
-                snapshot.router_name,
-                snapshot.incoming_api,
-                snapshot.upstream_wire,
-                snapshot.headers
-            );
-        }
         let status = upstream_response.status();
         let headers = headers_for_logging(upstream_response.headers());
         let body = upstream_response
@@ -1334,19 +1315,7 @@ pub(crate) async fn handle_incoming(
         );
     }
 
-    {
-        let mut snapshot = state.last_successful_upstream_log.write().await;
-        *snapshot = Some(UpstreamSuccessLogSnapshot {
-            router_name: route_target.router_name.clone(),
-            incoming_api,
-            upstream_wire: route_target.upstream_wire,
-            status: upstream_response.status(),
-            headers: headers_for_logging(upstream_response.headers()),
-        });
-    }
-
     finalize_upstream_response(
-        &state,
         upstream_response,
         &route_target,
         incoming_api,

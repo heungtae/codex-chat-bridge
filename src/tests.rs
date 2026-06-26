@@ -3648,7 +3648,6 @@ fn build_upstream_request_prefers_static_header_on_duplicate_key() {
         verbose_logging: false,
         routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
-        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
     });
     let route_target = RouteTarget {
         router_name: "default".to_string(),
@@ -3754,7 +3753,6 @@ fn build_upstream_request_uses_messages_count_tokens_url_and_existing_headers() 
         verbose_logging: false,
         routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
-        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
     });
     let route_target = RouteTarget {
         router_name: "messages".to_string(),
@@ -3846,7 +3844,6 @@ fn test_state_with_router(
         verbose_logging: true,
         routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
-        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
     })
 }
 
@@ -4021,7 +4018,6 @@ async fn messages_wire_overrides_model_and_preserves_header_behavior() {
         verbose_logging: false,
         routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
         sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
-        last_successful_upstream_log: Arc::new(tokio::sync::RwLock::new(None)),
     }));
     let request_body = json!({
         "model": "claude-original",
