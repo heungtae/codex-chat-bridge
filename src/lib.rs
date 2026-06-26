@@ -912,6 +912,10 @@ async fn finalize_upstream_response(
     upstream_response: reqwest::Response,
     route_target: &RouteTarget,
     incoming_api: IncomingApi,
+    incoming_headers: &HeaderMap,
+    incoming_body: &str,
+    upstream_request_headers: &Value,
+    upstream_payload: &Value,
     wants_stream: bool,
     upstream_model: String,
     anthropic_input_tokens: i64,
@@ -921,32 +925,23 @@ async fn finalize_upstream_response(
 ) -> Response {
     if !upstream_response.status().is_success() {
         let status = upstream_response.status();
-        let headers = headers_for_logging(upstream_response.headers());
-        let body = upstream_response
+        let upstream_response_headers = headers_for_logging(upstream_response.headers());
+        let upstream_response_body = upstream_response
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
-        warn!(
-            "upstream error response headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
-            route_target.router_name, incoming_api, route_target.upstream_wire, headers
-        );
-        warn_large_log(
-            &format!(
-                "upstream error response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}",
-                route_target.router_name, incoming_api, route_target.upstream_wire, status
-            ),
-            &body,
-        );
-        if verbose_logging {
-            debug_large_log(
-                &format!(
-                    "upstream response payload error (router={}, {:?}<-{:?})",
-                    route_target.router_name, incoming_api, route_target.upstream_wire
-                ),
-                &body,
-            );
-        }
-        let normalized = normalize_upstream_error_payload(status, &body);
+        warn_llm_error_exchange(LlmErrorExchangeLog {
+            route_target,
+            incoming_api,
+            incoming_headers,
+            incoming_body,
+            upstream_request_headers,
+            upstream_payload,
+            upstream_response_status: status,
+            upstream_response_headers: &upstream_response_headers,
+            upstream_response_body: &upstream_response_body,
+        });
+        let normalized = normalize_upstream_error_payload(status, &upstream_response_body);
         warn!(
             "upstream error: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, code={}, message={}",
             route_target.router_name,
@@ -1113,6 +1108,67 @@ async fn finalize_upstream_response(
     json_success_response(response_json)
 }
 
+struct LlmErrorExchangeLog<'a> {
+    route_target: &'a RouteTarget,
+    incoming_api: IncomingApi,
+    incoming_headers: &'a HeaderMap,
+    incoming_body: &'a str,
+    upstream_request_headers: &'a Value,
+    upstream_payload: &'a Value,
+    upstream_response_status: StatusCode,
+    upstream_response_headers: &'a Value,
+    upstream_response_body: &'a str,
+}
+
+fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>) {
+    warn!(
+        "llm error incoming request headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
+        log.route_target.router_name,
+        log.incoming_api,
+        log.route_target.upstream_wire,
+        headers_for_logging(log.incoming_headers)
+    );
+    warn_large_log(
+        &format!(
+            "llm error incoming request body: router={}, incoming_api={:?}, upstream_wire={:?}",
+            log.route_target.router_name, log.incoming_api, log.route_target.upstream_wire
+        ),
+        log.incoming_body,
+    );
+    warn!(
+        "llm error upstream request headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
+        log.route_target.router_name,
+        log.incoming_api,
+        log.route_target.upstream_wire,
+        log.upstream_request_headers
+    );
+    warn_large_log(
+        &format!(
+            "llm error upstream request body: router={}, incoming_api={:?}, upstream_wire={:?}",
+            log.route_target.router_name, log.incoming_api, log.route_target.upstream_wire
+        ),
+        &log.upstream_payload.to_string(),
+    );
+    warn!(
+        "llm error upstream response headers: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, headers={}",
+        log.route_target.router_name,
+        log.incoming_api,
+        log.route_target.upstream_wire,
+        log.upstream_response_status,
+        log.upstream_response_headers
+    );
+    warn_large_log(
+        &format!(
+            "llm error upstream response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}",
+            log.route_target.router_name,
+            log.incoming_api,
+            log.route_target.upstream_wire,
+            log.upstream_response_status
+        ),
+        log.upstream_response_body,
+    );
+}
+
 fn upstream_payload_model(payload: &Value) -> String {
     payload
         .get("model")
@@ -1214,6 +1270,13 @@ pub(crate) async fn handle_incoming(
         Err(response) => return response,
     };
 
+    let upstream_request_headers = upstream_headers_for_logging(
+        &headers,
+        &state.api_key,
+        &route_target.upstream_http_headers,
+        &route_target.forward_incoming_headers,
+    );
+
     if verbose_logging {
         if let Some(messages) =
             upstream_messages_for_logging(route_target.upstream_wire, &upstream_payload)
@@ -1232,12 +1295,7 @@ pub(crate) async fn handle_incoming(
             route_target.router_name,
             incoming_api,
             route_target.upstream_wire,
-            upstream_headers_for_logging(
-                &headers,
-                &state.api_key,
-                &route_target.upstream_http_headers,
-                &route_target.forward_incoming_headers,
-            )
+            upstream_request_headers
         );
 
         debug_large_log(
@@ -1319,6 +1377,10 @@ pub(crate) async fn handle_incoming(
         upstream_response,
         &route_target,
         incoming_api,
+        &headers,
+        &body,
+        &upstream_request_headers,
+        &upstream_payload,
         wants_stream,
         upstream_model,
         anthropic_input_tokens,
