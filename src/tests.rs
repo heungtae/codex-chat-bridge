@@ -10,7 +10,10 @@ use futures::StreamExt;
 use futures::stream;
 use serde_json::json;
 use std::collections::HashSet;
+use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
 use tower::ServiceExt;
 
 #[test]
@@ -3629,6 +3632,18 @@ fn normalize_upstream_error_maps_known_codes() {
 }
 
 #[test]
+fn bad_request_retry_is_disabled_by_default_and_requires_explicit_opt_in() {
+    assert!(!FeatureFlags::default().retry_bad_request_once);
+
+    let flags = FeatureFlags::default().with_overrides(Some(&FeatureFlagsConfig {
+        retry_bad_request_once: Some(true),
+        ..Default::default()
+    }));
+
+    assert!(flags.retry_bad_request_once);
+}
+
+#[test]
 fn build_upstream_request_prefers_static_header_on_duplicate_key() {
     let router_manager = RouterManager::new(
         BTreeMap::new(),
@@ -3932,6 +3947,134 @@ async fn spawn_mock_json_upstream_with_headers(
         let _ = axum::serve(listener, app).await;
     });
     (format!("http://{addr}{path}"), handle, captured_request)
+}
+
+#[derive(Clone)]
+struct SequencedMockUpstreamState {
+    responses: Arc<tokio::sync::Mutex<VecDeque<(StatusCode, Value)>>>,
+    request_count: Arc<AtomicUsize>,
+}
+
+async fn sequenced_mock_upstream_handler(
+    AxumState(state): AxumState<SequencedMockUpstreamState>,
+    Json(_body): Json<Value>,
+) -> axum::response::Response {
+    state.request_count.fetch_add(1, Ordering::SeqCst);
+    let (status, body) = state
+        .responses
+        .lock()
+        .await
+        .pop_front()
+        .expect("mock response");
+    (status, Json(body)).into_response()
+}
+
+async fn spawn_sequenced_mock_upstream(
+    path: &str,
+    responses: Vec<(StatusCode, Value)>,
+) -> (String, tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    let request_count = Arc::new(AtomicUsize::new(0));
+    let state = SequencedMockUpstreamState {
+        responses: Arc::new(tokio::sync::Mutex::new(responses.into())),
+        request_count: request_count.clone(),
+    };
+    let app = axum::Router::new()
+        .route(path, post(sequenced_mock_upstream_handler))
+        .with_state(state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock upstream");
+    let addr = listener.local_addr().expect("mock upstream address");
+    let handle = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+    (format!("http://{addr}{path}"), handle, request_count)
+}
+
+fn test_state_with_router_and_bad_request_retry(
+    incoming_url: &str,
+    upstream_url: &str,
+    upstream_wire: WireApi,
+    retry_bad_request_once: bool,
+) -> Arc<AppState> {
+    let mut routers = BTreeMap::new();
+    routers.insert(
+        "default".to_string(),
+        RouterConfig {
+            incoming_url: Some(incoming_url.to_string()),
+            upstream_url: Some(upstream_url.to_string()),
+            upstream_wire: Some(upstream_wire),
+            features: Some(FeatureFlagsConfig {
+                retry_bad_request_once: Some(retry_bad_request_once),
+                ..Default::default()
+            }),
+            ..Default::default()
+        },
+    );
+    let router_manager = RouterManager::new(
+        routers,
+        "https://api.openai.com/v1/chat/completions".to_string(),
+        WireApi::Chat,
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        Vec::new(),
+        FeatureFlags::default(),
+    )
+    .expect("router manager");
+
+    Arc::new(AppState {
+        client: Client::new(),
+        api_key: "test-key".to_string(),
+        http_shutdown: false,
+        verbose_logging: false,
+        routers: Arc::new(tokio::sync::RwLock::new(router_manager)),
+        sessions: Arc::new(tokio::sync::RwLock::new(SessionStore::default())),
+    })
+}
+
+#[tokio::test]
+#[ignore = "requires binding a local TCP listener"]
+async fn retries_one_opted_in_bad_request_before_returning_a_chat_response() {
+    let (upstream_url, upstream_handle, request_count) = spawn_sequenced_mock_upstream(
+        "/v1/chat/completions",
+        vec![
+            (
+                StatusCode::BAD_REQUEST,
+                json!({"error":{"message":"temporary gateway rejection"}}),
+            ),
+            (
+                StatusCode::OK,
+                json!({"id":"chatcmpl_1","choices":[{"message":{"role":"assistant","content":"hello"}}]}),
+            ),
+        ],
+    )
+    .await;
+    let app = build_app(test_state_with_router_and_bad_request_retry(
+        "http://127.0.0.1:8787/v1/chat/completions",
+        &upstream_url,
+        WireApi::Chat,
+        true,
+    ));
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header("host", "127.0.0.1:8787")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    r#"{"model":"gpt-4.1","messages":[{"role":"user","content":"hi"}],"stream":false}"#,
+                ))
+                .expect("request"),
+        )
+        .await
+        .expect("response");
+
+    upstream_handle.abort();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(request_count.load(Ordering::SeqCst), 2);
 }
 
 #[tokio::test]

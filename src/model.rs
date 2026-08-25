@@ -47,6 +47,7 @@ pub(crate) struct FeatureFlagsConfig {
     pub(crate) enable_reasoning_stream_events: Option<bool>,
     pub(crate) enable_provider_specific_fields: Option<bool>,
     pub(crate) enable_extended_input_types: Option<bool>,
+    pub(crate) retry_bad_request_once: Option<bool>,
     pub(crate) tool_transform_mode: Option<ToolTransformMode>,
 }
 
@@ -58,6 +59,7 @@ pub(crate) struct FeatureFlags {
     pub(crate) enable_reasoning_stream_events: bool,
     pub(crate) enable_provider_specific_fields: bool,
     pub(crate) enable_extended_input_types: bool,
+    pub(crate) retry_bad_request_once: bool,
     pub(crate) tool_transform_mode: ToolTransformMode,
 }
 
@@ -70,6 +72,7 @@ impl Default for FeatureFlags {
             enable_reasoning_stream_events: true,
             enable_provider_specific_fields: true,
             enable_extended_input_types: true,
+            retry_bad_request_once: false,
             tool_transform_mode: ToolTransformMode::LegacyConvert,
         }
     }
@@ -97,6 +100,9 @@ impl FeatureFlags {
         }
         if let Some(v) = overrides.enable_extended_input_types {
             self.enable_extended_input_types = v;
+        }
+        if let Some(v) = overrides.retry_bad_request_once {
+            self.retry_bad_request_once = v;
         }
         if let Some(v) = overrides.tool_transform_mode {
             self.tool_transform_mode = v;

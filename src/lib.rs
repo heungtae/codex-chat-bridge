@@ -24,6 +24,7 @@ use std::fs::{self};
 use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::RwLock;
 use tracing::debug;
 use tracing::info;
@@ -787,17 +788,30 @@ async fn build_upstream_payload_with_session(
         normalize_unsupported_chat_message_roles(&mut upstream_payload);
     }
 
-    if should_store_previous_response_messages {
-        let chat_messages = upstream_payload
-            .get("messages")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let mut sessions = state.sessions.write().await;
-        sessions.insert_messages(response_id.clone(), chat_messages);
+    Ok((response_id, upstream_payload))
+}
+
+async fn store_previous_response_messages(
+    state: &Arc<AppState>,
+    response_id: &str,
+    upstream_payload: &Value,
+    incoming_api: IncomingApi,
+    route_target: &RouteTarget,
+) {
+    if !route_target.feature_flags.enable_previous_response_id
+        || incoming_api != IncomingApi::Responses
+        || route_target.upstream_wire != WireApi::Chat
+    {
+        return;
     }
 
-    Ok((response_id, upstream_payload))
+    let chat_messages = upstream_payload
+        .get("messages")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut sessions = state.sessions.write().await;
+    sessions.insert_messages(response_id.to_string(), chat_messages);
 }
 
 fn normalize_unsupported_chat_message_roles(payload: &mut Value) {
@@ -910,6 +924,7 @@ fn upstream_url_for_request(route_target: &RouteTarget, incoming_path: Option<&s
 
 async fn finalize_upstream_response(
     upstream_response: reqwest::Response,
+    state: &Arc<AppState>,
     route_target: &RouteTarget,
     incoming_api: IncomingApi,
     incoming_headers: &HeaderMap,
@@ -922,6 +937,7 @@ async fn finalize_upstream_response(
     response_id: String,
     tool_call_kinds_by_name: HashMap<String, ResponsesToolCallKind>,
     verbose_logging: bool,
+    upstream_attempt: u8,
 ) -> Response {
     if !upstream_response.status().is_success() {
         let status = upstream_response.status();
@@ -940,13 +956,15 @@ async fn finalize_upstream_response(
             upstream_response_status: status,
             upstream_response_headers: &upstream_response_headers,
             upstream_response_body: &upstream_response_body,
+            attempt: upstream_attempt,
         });
         let normalized = normalize_upstream_error_payload(status, &upstream_response_body);
         warn!(
-            "upstream error: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, code={}, message={}",
+            "upstream error: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, status={}, code={}, message={}",
             route_target.router_name,
             incoming_api,
             route_target.upstream_wire,
+            upstream_attempt,
             status,
             normalized.code,
             normalized.message
@@ -970,6 +988,14 @@ async fn finalize_upstream_response(
                 "anthropic `/v1/messages` streaming currently requires `upstream_wire = \"chat\"` or `\"messages\"`",
             );
         }
+        store_previous_response_messages(
+            state,
+            &response_id,
+            upstream_payload,
+            incoming_api,
+            route_target,
+        )
+        .await;
         let body = match route_target.upstream_wire {
             WireApi::Chat => {
                 if incoming_api == IncomingApi::Anthropic {
@@ -1067,6 +1093,15 @@ async fn finalize_upstream_response(
         );
     }
 
+    store_previous_response_messages(
+        state,
+        &response_id,
+        upstream_payload,
+        incoming_api,
+        route_target,
+    )
+    .await;
+
     let response_json = match route_target.upstream_wire {
         WireApi::Chat => {
             if incoming_api == IncomingApi::Anthropic {
@@ -1118,51 +1153,62 @@ struct LlmErrorExchangeLog<'a> {
     upstream_response_status: StatusCode,
     upstream_response_headers: &'a Value,
     upstream_response_body: &'a str,
+    attempt: u8,
 }
 
 fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>) {
     warn!(
-        "llm error incoming request headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
+        "llm error incoming request headers: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, headers={}",
         log.route_target.router_name,
         log.incoming_api,
         log.route_target.upstream_wire,
+        log.attempt,
         headers_for_logging(log.incoming_headers)
     );
     warn_large_log(
         &format!(
-            "llm error incoming request body: router={}, incoming_api={:?}, upstream_wire={:?}",
-            log.route_target.router_name, log.incoming_api, log.route_target.upstream_wire
+            "llm error incoming request body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}",
+            log.route_target.router_name,
+            log.incoming_api,
+            log.route_target.upstream_wire,
+            log.attempt
         ),
         log.incoming_body,
     );
     warn!(
-        "llm error upstream request headers: router={}, incoming_api={:?}, upstream_wire={:?}, headers={}",
+        "llm error upstream request headers: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, headers={}",
         log.route_target.router_name,
         log.incoming_api,
         log.route_target.upstream_wire,
+        log.attempt,
         log.upstream_request_headers
     );
     warn_large_log(
         &format!(
-            "llm error upstream request body: router={}, incoming_api={:?}, upstream_wire={:?}",
-            log.route_target.router_name, log.incoming_api, log.route_target.upstream_wire
+            "llm error upstream request body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}",
+            log.route_target.router_name,
+            log.incoming_api,
+            log.route_target.upstream_wire,
+            log.attempt
         ),
         &log.upstream_payload.to_string(),
     );
     warn!(
-        "llm error upstream response headers: router={}, incoming_api={:?}, upstream_wire={:?}, status={}, headers={}",
+        "llm error upstream response headers: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, status={}, headers={}",
         log.route_target.router_name,
         log.incoming_api,
         log.route_target.upstream_wire,
+        log.attempt,
         log.upstream_response_status,
         log.upstream_response_headers
     );
     warn_large_log(
         &format!(
-            "llm error upstream response body: router={}, incoming_api={:?}, upstream_wire={:?}, status={}",
+            "llm error upstream response body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, status={}",
             log.route_target.router_name,
             log.incoming_api,
             log.route_target.upstream_wire,
+            log.attempt,
             log.upstream_response_status
         ),
         log.upstream_response_body,
@@ -1328,25 +1374,32 @@ pub(crate) async fn handle_incoming(
         );
     }
 
-    let upstream_request = build_upstream_request(
-        &state,
-        &route_target,
-        &headers,
-        &upstream_payload,
-        incoming_path.as_deref(),
-    );
     let upstream_model = upstream_payload_model(&upstream_payload);
     let anthropic_input_tokens = if incoming_api == IncomingApi::Anthropic {
         estimate_anthropic_count_tokens(&request_value)
     } else {
         0
     };
-    let upstream_response = match upstream_request.send().await {
+    let mut upstream_attempt = 1;
+    let first_upstream_response = match build_upstream_request(
+        &state,
+        &route_target,
+        &headers,
+        &upstream_payload,
+        incoming_path.as_deref(),
+    )
+    .send()
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
             warn!(
-                "upstream transport failed: router={}, incoming_route={}, upstream_url={}, error={}",
-                route_target.router_name, incoming_route, route_target.upstream_url, err
+                "upstream transport failed: router={}, incoming_route={}, upstream_url={}, attempt={}, error={}",
+                route_target.router_name,
+                incoming_route,
+                route_target.upstream_url,
+                upstream_attempt,
+                err
             );
             return error_response_for_api(
                 incoming_api,
@@ -1355,6 +1408,67 @@ pub(crate) async fn handle_incoming(
                 &format!("failed to call upstream endpoint: {err}"),
             );
         }
+    };
+    let upstream_response = if route_target.feature_flags.retry_bad_request_once
+        && first_upstream_response.status() == StatusCode::BAD_REQUEST
+    {
+        let upstream_response_headers = headers_for_logging(first_upstream_response.headers());
+        let upstream_response_body = first_upstream_response
+            .text()
+            .await
+            .unwrap_or_else(|_| "<failed to read error body>".to_string());
+        warn_llm_error_exchange(LlmErrorExchangeLog {
+            route_target: &route_target,
+            incoming_api,
+            incoming_headers: &headers,
+            incoming_body: &body,
+            upstream_request_headers: &upstream_request_headers,
+            upstream_payload: &upstream_payload,
+            upstream_response_status: StatusCode::BAD_REQUEST,
+            upstream_response_headers: &upstream_response_headers,
+            upstream_response_body: &upstream_response_body,
+            attempt: upstream_attempt,
+        });
+        warn!(
+            "retrying upstream bad request once: router={}, incoming_route={}, upstream_url={}, attempt={}=>{}",
+            route_target.router_name,
+            incoming_route,
+            route_target.upstream_url,
+            upstream_attempt,
+            upstream_attempt + 1
+        );
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        upstream_attempt += 1;
+        match build_upstream_request(
+            &state,
+            &route_target,
+            &headers,
+            &upstream_payload,
+            incoming_path.as_deref(),
+        )
+        .send()
+        .await
+        {
+            Ok(response) => response,
+            Err(err) => {
+                warn!(
+                    "upstream transport failed after bad-request retry: router={}, incoming_route={}, upstream_url={}, attempt={}, error={}",
+                    route_target.router_name,
+                    incoming_route,
+                    route_target.upstream_url,
+                    upstream_attempt,
+                    err
+                );
+                return error_response_for_api(
+                    incoming_api,
+                    wants_stream,
+                    "upstream_transport_error",
+                    &format!("failed to call upstream endpoint after retry: {err}"),
+                );
+            }
+        }
+    } else {
+        first_upstream_response
     };
 
     if verbose_logging {
@@ -1375,6 +1489,7 @@ pub(crate) async fn handle_incoming(
 
     finalize_upstream_response(
         upstream_response,
+        &state,
         &route_target,
         incoming_api,
         &headers,
@@ -1387,6 +1502,7 @@ pub(crate) async fn handle_incoming(
         response_id,
         tool_call_kinds_by_name,
         verbose_logging,
+        upstream_attempt,
     )
     .await
 }

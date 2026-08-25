@@ -159,6 +159,7 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # enable_reasoning_stream_events = true
 # enable_provider_specific_fields = true
 # enable_extended_input_types = true
+# retry_bad_request_once = false # opt-in: retry one upstream HTTP 400 before streaming starts
 # tool_transform_mode = "legacy_convert" # passthrough | legacy_convert
 
 # [routers.default]
