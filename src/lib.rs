@@ -1185,6 +1185,44 @@ fn log_error_body(level: ErrorBodyLogLevel, label: &str, body: &str) {
     }
 }
 
+fn html_body_for_warn(body: &str) -> Option<String> {
+    let lowercase = body.to_ascii_lowercase();
+    let opening_start = lowercase.match_indices("<body").find_map(|(index, _)| {
+        let suffix = &lowercase[index + "<body".len()..];
+        matches!(
+            suffix.chars().next(),
+            Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')
+        )
+        .then_some(index)
+    })?;
+    let opening_end = opening_start + lowercase[opening_start..].find('>')?;
+    let closing_start = lowercase[opening_end + 1..]
+        .match_indices("</body")
+        .find_map(|(offset, _)| {
+            let index = opening_end + 1 + offset;
+            let suffix = &lowercase[index + "</body".len()..];
+            matches!(
+                suffix.chars().next(),
+                Some('>') | Some(' ') | Some('\t') | Some('\r') | Some('\n')
+            )
+            .then_some(index)
+        })?;
+    let closing_end = closing_start + lowercase[closing_start..].find('>')?;
+
+    Some(
+        body[opening_start..=closing_end]
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" "),
+    )
+}
+
+fn warn_html_body_for_debug_error(label: &str, body: &str) {
+    if let Some(html_body) = html_body_for_warn(body) {
+        warn_large_log(label, &html_body);
+    }
+}
+
 fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>, body_log_level: ErrorBodyLogLevel) {
     warn!(
         "llm error incoming request headers: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, headers={}",
@@ -1245,6 +1283,19 @@ fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>, body_log_level: ErrorBo
         ),
         log.upstream_response_body,
     );
+    if matches!(body_log_level, ErrorBodyLogLevel::Debug) {
+        warn_html_body_for_debug_error(
+            &format!(
+                "llm error upstream response html body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, status={}",
+                log.route_target.router_name,
+                log.incoming_api,
+                log.route_target.upstream_wire,
+                log.attempt,
+                log.upstream_response_status
+            ),
+            log.upstream_response_body,
+        );
+    }
 }
 
 fn upstream_payload_model(payload: &Value) -> String {

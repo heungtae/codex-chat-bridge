@@ -3689,6 +3689,23 @@ fn configured_retry_status_errors_log_bodies_at_debug() {
 }
 
 #[test]
+fn html_body_for_warn_keeps_only_the_body_as_one_line() {
+    let html = "<html>\n<head><title>ignored</title></head>\n<BODY class=\"error\">\n  <h1>Bad request</h1>\n  <p>Try again.</p>\n</BODY>\n</html>";
+
+    assert_eq!(
+        html_body_for_warn(html).as_deref(),
+        Some("<BODY class=\"error\"> <h1>Bad request</h1> <p>Try again.</p> </BODY>")
+    );
+}
+
+#[test]
+fn html_body_for_warn_ignores_non_html_and_incomplete_documents() {
+    assert_eq!(html_body_for_warn("{\"error\":\"bad request\"}"), None);
+    assert_eq!(html_body_for_warn("<body>not closed"), None);
+    assert_eq!(html_body_for_warn("<bodycopy>not a body</bodycopy>"), None);
+}
+
+#[test]
 fn build_upstream_request_prefers_static_header_on_duplicate_key() {
     let router_manager = RouterManager::new(
         BTreeMap::new(),
