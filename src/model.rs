@@ -47,11 +47,13 @@ pub(crate) struct FeatureFlagsConfig {
     pub(crate) enable_reasoning_stream_events: Option<bool>,
     pub(crate) enable_provider_specific_fields: Option<bool>,
     pub(crate) enable_extended_input_types: Option<bool>,
+    pub(crate) retry_status_once: Option<bool>,
     pub(crate) retry_bad_request_once: Option<bool>,
+    pub(crate) retry_status_codes: Option<Vec<u16>>,
     pub(crate) tool_transform_mode: Option<ToolTransformMode>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct FeatureFlags {
     pub(crate) enable_previous_response_id: bool,
     pub(crate) enable_tool_argument_stream_events: bool,
@@ -59,7 +61,8 @@ pub(crate) struct FeatureFlags {
     pub(crate) enable_reasoning_stream_events: bool,
     pub(crate) enable_provider_specific_fields: bool,
     pub(crate) enable_extended_input_types: bool,
-    pub(crate) retry_bad_request_once: bool,
+    pub(crate) retry_status_once: bool,
+    pub(crate) retry_status_codes: Vec<u16>,
     pub(crate) tool_transform_mode: ToolTransformMode,
 }
 
@@ -72,7 +75,8 @@ impl Default for FeatureFlags {
             enable_reasoning_stream_events: true,
             enable_provider_specific_fields: true,
             enable_extended_input_types: true,
-            retry_bad_request_once: false,
+            retry_status_once: false,
+            retry_status_codes: vec![400],
             tool_transform_mode: ToolTransformMode::LegacyConvert,
         }
     }
@@ -102,7 +106,13 @@ impl FeatureFlags {
             self.enable_extended_input_types = v;
         }
         if let Some(v) = overrides.retry_bad_request_once {
-            self.retry_bad_request_once = v;
+            self.retry_status_once = v;
+        }
+        if let Some(v) = overrides.retry_status_once {
+            self.retry_status_once = v;
+        }
+        if let Some(v) = &overrides.retry_status_codes {
+            self.retry_status_codes = v.clone();
         }
         if let Some(v) = overrides.tool_transform_mode {
             self.tool_transform_mode = v;

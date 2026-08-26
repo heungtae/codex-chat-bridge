@@ -10,6 +10,7 @@ use std::net::IpAddr;
 use crate::config::RouterConfig;
 use crate::config::resolve_upstream_wire;
 use crate::config::upsert_upstream_http_header;
+use crate::config::validate_feature_flags_config;
 use crate::config::validate_forward_incoming_header;
 use crate::model::DEFAULT_FORWARDED_UPSTREAM_HEADERS;
 use crate::model::FeatureFlags;
@@ -115,6 +116,10 @@ impl RouterManager {
         let mut incoming_route_to_router = BTreeMap::new();
         let mut listen_addrs = BTreeSet::new();
         for (router_name, router_config) in &routers {
+            validate_feature_flags_config(
+                router_config.features.as_ref(),
+                &format!("[routers.{router_name}.features]"),
+            )?;
             let incoming_url = router_config.incoming_url.as_ref().ok_or_else(|| {
                 anyhow!(
                     "missing required incoming_url for [routers.{router_name}]. default(active-router) routing is disabled"
@@ -463,6 +468,7 @@ impl RouterManager {
         }
         let feature_flags = self
             .default_feature_flags
+            .clone()
             .with_overrides(router.and_then(|r| r.features.as_ref()));
 
         Ok(RouteTarget {

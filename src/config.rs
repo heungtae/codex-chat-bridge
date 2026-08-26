@@ -159,7 +159,8 @@ pub(crate) const DEFAULT_CONFIG_TEMPLATE: &str = r#"# codex-chat-bridge runtime 
 # enable_reasoning_stream_events = true
 # enable_provider_specific_fields = true
 # enable_extended_input_types = true
-# retry_bad_request_once = false # opt-in: retry one upstream HTTP 400 before streaming starts
+# retry_status_once = false # opt-in: retry one configured upstream status before streaming starts
+# retry_status_codes = [400] # default when omitted; e.g. [400, 429, 503]
 # tool_transform_mode = "legacy_convert" # passthrough | legacy_convert
 
 # [routers.default]
@@ -236,6 +237,7 @@ pub(crate) fn resolve_config(
     file_config: Option<FileConfig>,
 ) -> Result<ResolvedConfig> {
     let file_config = file_config.unwrap_or_default();
+    validate_feature_flags_config(file_config.features.as_ref(), "[features]")?;
     let feature_flags = FeatureFlags::default().with_overrides(file_config.features.as_ref());
     let mut drop_tool_types = file_config.drop_tool_types.unwrap_or_default();
     drop_tool_types.extend(args.drop_tool_types);
@@ -294,6 +296,27 @@ pub(crate) fn resolve_config(
         drop_request_fields,
         feature_flags,
     })
+}
+
+pub(crate) fn validate_feature_flags_config(
+    features: Option<&FeatureFlagsConfig>,
+    context: &str,
+) -> Result<()> {
+    let Some(status_codes) = features.and_then(|features| features.retry_status_codes.as_ref())
+    else {
+        return Ok(());
+    };
+    if status_codes.is_empty() {
+        return Err(anyhow!("{context}.retry_status_codes must not be empty"));
+    }
+    for status_code in status_codes {
+        if !(100..=599).contains(status_code) {
+            return Err(anyhow!(
+                "{context}.retry_status_codes contains invalid HTTP status code {status_code}"
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn normalize_drop_request_fields(fields: Vec<String>) -> Vec<String> {

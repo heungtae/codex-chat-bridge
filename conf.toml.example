@@ -24,7 +24,8 @@ enable_extended_stream_events = true
 enable_reasoning_stream_events = true
 enable_provider_specific_fields = true
 enable_extended_input_types = true
-retry_bad_request_once = false # opt-in: retry one upstream HTTP 400 before streaming starts
+retry_status_once = false # opt-in: retry one configured upstream status before streaming starts
+retry_status_codes = [400] # default when omitted; e.g. [400, 429, 503]
 tool_transform_mode = "legacy_convert" # passthrough | legacy_convert
 
 # Routers (required for multi-route mode)
@@ -54,7 +55,8 @@ enable_extended_stream_events = true
 enable_reasoning_stream_events = true
 enable_provider_specific_fields = true
 enable_extended_input_types = true
-retry_bad_request_once = false # opt-in: retry one upstream HTTP 400 before streaming starts
+retry_status_once = false # opt-in: retry one configured upstream status before streaming starts
+retry_status_codes = [400] # default when omitted; e.g. [400, 429, 503]
 tool_transform_mode = "legacy_convert"
 
 [routers.research]

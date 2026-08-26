@@ -117,7 +117,7 @@ fn build_router_manager(
         config.forward_incoming_headers.clone(),
         config.drop_tool_types.clone(),
         config.drop_request_fields.clone(),
-        config.feature_flags,
+        config.feature_flags.clone(),
     )
 }
 
@@ -941,24 +941,36 @@ async fn finalize_upstream_response(
 ) -> Response {
     if !upstream_response.status().is_success() {
         let status = upstream_response.status();
+        let body_log_level = if retryable_error_body_is_debug(&route_target.feature_flags, status) {
+            ErrorBodyLogLevel::Debug
+        } else {
+            ErrorBodyLogLevel::Warn
+        };
         let upstream_response_headers = headers_for_logging(upstream_response.headers());
         let upstream_response_body = upstream_response
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
-        warn_llm_error_exchange(LlmErrorExchangeLog {
-            route_target,
-            incoming_api,
-            incoming_headers,
-            incoming_body,
-            upstream_request_headers,
-            upstream_payload,
-            upstream_response_status: status,
-            upstream_response_headers: &upstream_response_headers,
-            upstream_response_body: &upstream_response_body,
-            attempt: upstream_attempt,
-        });
+        warn_llm_error_exchange(
+            LlmErrorExchangeLog {
+                route_target,
+                incoming_api,
+                incoming_headers,
+                incoming_body,
+                upstream_request_headers,
+                upstream_payload,
+                upstream_response_status: status,
+                upstream_response_headers: &upstream_response_headers,
+                upstream_response_body: &upstream_response_body,
+                attempt: upstream_attempt,
+            },
+            body_log_level,
+        );
         let normalized = normalize_upstream_error_payload(status, &upstream_response_body);
+        let logged_message = match body_log_level {
+            ErrorBodyLogLevel::Warn => normalized.message.as_str(),
+            ErrorBodyLogLevel::Debug => "<suppressed; see debug body log>",
+        };
         warn!(
             "upstream error: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, status={}, code={}, message={}",
             route_target.router_name,
@@ -967,7 +979,7 @@ async fn finalize_upstream_response(
             upstream_attempt,
             status,
             normalized.code,
-            normalized.message
+            logged_message
         );
         return error_response_for_api(
             incoming_api,
@@ -1019,7 +1031,7 @@ async fn finalize_upstream_response(
                         route_target.router_name.clone(),
                         verbose_logging,
                         tool_call_kinds_by_name,
-                        route_target.feature_flags,
+                        route_target.feature_flags.clone(),
                     ))
                 }
             }
@@ -1156,7 +1168,24 @@ struct LlmErrorExchangeLog<'a> {
     attempt: u8,
 }
 
-fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>) {
+#[derive(Clone, Copy)]
+enum ErrorBodyLogLevel {
+    Warn,
+    Debug,
+}
+
+fn retryable_error_body_is_debug(feature_flags: &FeatureFlags, status: StatusCode) -> bool {
+    feature_flags.retry_status_once && feature_flags.retry_status_codes.contains(&status.as_u16())
+}
+
+fn log_error_body(level: ErrorBodyLogLevel, label: &str, body: &str) {
+    match level {
+        ErrorBodyLogLevel::Warn => warn_large_log(label, body),
+        ErrorBodyLogLevel::Debug => debug_large_log(label, body),
+    }
+}
+
+fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>, body_log_level: ErrorBodyLogLevel) {
     warn!(
         "llm error incoming request headers: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, headers={}",
         log.route_target.router_name,
@@ -1165,7 +1194,8 @@ fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>) {
         log.attempt,
         headers_for_logging(log.incoming_headers)
     );
-    warn_large_log(
+    log_error_body(
+        body_log_level,
         &format!(
             "llm error incoming request body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}",
             log.route_target.router_name,
@@ -1183,7 +1213,8 @@ fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>) {
         log.attempt,
         log.upstream_request_headers
     );
-    warn_large_log(
+    log_error_body(
+        body_log_level,
         &format!(
             "llm error upstream request body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}",
             log.route_target.router_name,
@@ -1202,7 +1233,8 @@ fn warn_llm_error_exchange(log: LlmErrorExchangeLog<'_>) {
         log.upstream_response_status,
         log.upstream_response_headers
     );
-    warn_large_log(
+    log_error_body(
+        body_log_level,
         &format!(
             "llm error upstream response body: router={}, incoming_api={:?}, upstream_wire={:?}, attempt={}, status={}",
             log.route_target.router_name,
@@ -1409,31 +1441,40 @@ pub(crate) async fn handle_incoming(
             );
         }
     };
-    let upstream_response = if route_target.feature_flags.retry_bad_request_once
-        && first_upstream_response.status() == StatusCode::BAD_REQUEST
+    let first_upstream_status = first_upstream_response.status();
+    let retry_status = first_upstream_status.as_u16();
+    let upstream_response = if route_target.feature_flags.retry_status_once
+        && route_target
+            .feature_flags
+            .retry_status_codes
+            .contains(&retry_status)
     {
         let upstream_response_headers = headers_for_logging(first_upstream_response.headers());
         let upstream_response_body = first_upstream_response
             .text()
             .await
             .unwrap_or_else(|_| "<failed to read error body>".to_string());
-        warn_llm_error_exchange(LlmErrorExchangeLog {
-            route_target: &route_target,
-            incoming_api,
-            incoming_headers: &headers,
-            incoming_body: &body,
-            upstream_request_headers: &upstream_request_headers,
-            upstream_payload: &upstream_payload,
-            upstream_response_status: StatusCode::BAD_REQUEST,
-            upstream_response_headers: &upstream_response_headers,
-            upstream_response_body: &upstream_response_body,
-            attempt: upstream_attempt,
-        });
+        warn_llm_error_exchange(
+            LlmErrorExchangeLog {
+                route_target: &route_target,
+                incoming_api,
+                incoming_headers: &headers,
+                incoming_body: &body,
+                upstream_request_headers: &upstream_request_headers,
+                upstream_payload: &upstream_payload,
+                upstream_response_status: first_upstream_status,
+                upstream_response_headers: &upstream_response_headers,
+                upstream_response_body: &upstream_response_body,
+                attempt: upstream_attempt,
+            },
+            ErrorBodyLogLevel::Debug,
+        );
         warn!(
-            "retrying upstream bad request once: router={}, incoming_route={}, upstream_url={}, attempt={}=>{}",
+            "retrying configured upstream status once: router={}, incoming_route={}, upstream_url={}, status={}, attempt={}=>{}",
             route_target.router_name,
             incoming_route,
             route_target.upstream_url,
+            retry_status,
             upstream_attempt,
             upstream_attempt + 1
         );
@@ -1452,10 +1493,11 @@ pub(crate) async fn handle_incoming(
             Ok(response) => response,
             Err(err) => {
                 warn!(
-                    "upstream transport failed after bad-request retry: router={}, incoming_route={}, upstream_url={}, attempt={}, error={}",
+                    "upstream transport failed after status retry: router={}, incoming_route={}, upstream_url={}, status={}, attempt={}, error={}",
                     route_target.router_name,
                     incoming_route,
                     route_target.upstream_url,
+                    retry_status,
                     upstream_attempt,
                     err
                 );

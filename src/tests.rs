@@ -3632,15 +3632,60 @@ fn normalize_upstream_error_maps_known_codes() {
 }
 
 #[test]
-fn bad_request_retry_is_disabled_by_default_and_requires_explicit_opt_in() {
-    assert!(!FeatureFlags::default().retry_bad_request_once);
+fn configured_status_retry_defaults_to_400_and_requires_explicit_opt_in() {
+    let default_flags = FeatureFlags::default();
+    assert!(!default_flags.retry_status_once);
+    assert_eq!(default_flags.retry_status_codes, vec![400]);
 
     let flags = FeatureFlags::default().with_overrides(Some(&FeatureFlagsConfig {
         retry_bad_request_once: Some(true),
         ..Default::default()
     }));
 
-    assert!(flags.retry_bad_request_once);
+    assert!(flags.retry_status_once);
+    assert_eq!(flags.retry_status_codes, vec![400]);
+
+    let flags = FeatureFlags::default().with_overrides(Some(&FeatureFlagsConfig {
+        retry_status_once: Some(true),
+        retry_status_codes: Some(vec![429, 503]),
+        ..Default::default()
+    }));
+
+    assert!(flags.retry_status_once);
+    assert_eq!(flags.retry_status_codes, vec![429, 503]);
+}
+
+#[test]
+fn retry_status_codes_reject_empty_and_invalid_http_statuses() {
+    let empty = FeatureFlagsConfig {
+        retry_status_codes: Some(Vec::new()),
+        ..Default::default()
+    };
+    assert!(validate_feature_flags_config(Some(&empty), "[features]").is_err());
+
+    let invalid = FeatureFlagsConfig {
+        retry_status_codes: Some(vec![99, 600]),
+        ..Default::default()
+    };
+    assert!(validate_feature_flags_config(Some(&invalid), "[features]").is_err());
+}
+
+#[test]
+fn configured_retry_status_errors_log_bodies_at_debug() {
+    let flags = FeatureFlags::default().with_overrides(Some(&FeatureFlagsConfig {
+        retry_status_once: Some(true),
+        retry_status_codes: Some(vec![429]),
+        ..Default::default()
+    }));
+
+    assert!(retryable_error_body_is_debug(
+        &flags,
+        StatusCode::TOO_MANY_REQUESTS
+    ));
+    assert!(!retryable_error_body_is_debug(
+        &flags,
+        StatusCode::BAD_REQUEST
+    ));
 }
 
 #[test]
@@ -3991,11 +4036,11 @@ async fn spawn_sequenced_mock_upstream(
     (format!("http://{addr}{path}"), handle, request_count)
 }
 
-fn test_state_with_router_and_bad_request_retry(
+fn test_state_with_router_and_status_retry(
     incoming_url: &str,
     upstream_url: &str,
     upstream_wire: WireApi,
-    retry_bad_request_once: bool,
+    retry_status_codes: Vec<u16>,
 ) -> Arc<AppState> {
     let mut routers = BTreeMap::new();
     routers.insert(
@@ -4005,7 +4050,8 @@ fn test_state_with_router_and_bad_request_retry(
             upstream_url: Some(upstream_url.to_string()),
             upstream_wire: Some(upstream_wire),
             features: Some(FeatureFlagsConfig {
-                retry_bad_request_once: Some(retry_bad_request_once),
+                retry_status_once: Some(true),
+                retry_status_codes: Some(retry_status_codes),
                 ..Default::default()
             }),
             ..Default::default()
@@ -4035,13 +4081,13 @@ fn test_state_with_router_and_bad_request_retry(
 
 #[tokio::test]
 #[ignore = "requires binding a local TCP listener"]
-async fn retries_one_opted_in_bad_request_before_returning_a_chat_response() {
+async fn retries_one_opted_in_configured_status_before_returning_a_chat_response() {
     let (upstream_url, upstream_handle, request_count) = spawn_sequenced_mock_upstream(
         "/v1/chat/completions",
         vec![
             (
-                StatusCode::BAD_REQUEST,
-                json!({"error":{"message":"temporary gateway rejection"}}),
+                StatusCode::TOO_MANY_REQUESTS,
+                json!({"error":{"message":"temporary upstream overload"}}),
             ),
             (
                 StatusCode::OK,
@@ -4050,11 +4096,11 @@ async fn retries_one_opted_in_bad_request_before_returning_a_chat_response() {
         ],
     )
     .await;
-    let app = build_app(test_state_with_router_and_bad_request_retry(
+    let app = build_app(test_state_with_router_and_status_retry(
         "http://127.0.0.1:8787/v1/chat/completions",
         &upstream_url,
         WireApi::Chat,
-        true,
+        vec![429],
     ));
 
     let response = app
